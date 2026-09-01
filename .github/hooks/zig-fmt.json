@@ -1,0 +1,11 @@
+{
+	"hooks": {
+		"PostToolUse": [
+			{
+				"type": "command",
+				"command": "./.github/hooks/zig-fmt.sh",
+				"timeout": 30
+			}
+		]
+	}
+}

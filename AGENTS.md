@@ -1,0 +1,69 @@
+# AGENTS.md
+
+Guidance for AI coding agents working in this repository.
+
+## Project
+
+`vlmzsd` is a modern-Zig reimplementation of the [vlmcsd](https://github.com/Wind4/vlmcsd) KMS (Key Management Service) emulator. The original C sources in `src/` are kept strictly as a **read-only reference** for wire-format and algorithm behavior; they are never built.
+
+Goals:
+- Idiomatic, modern Zig that leverages the Zig ecosystem (`std.crypto`, `std.net`, `std.unicode`, …) rather than transliterating C.
+- A redesigned CLI (single binary, subcommands, modern argument parsing) — not a port of the C getopt/INI surface.
+- Zig build system only — no `make`/`gmake`.
+
+- **Toolchain**: Zig `>= 0.16.0` (see `build.zig.zon`). The Zig code uses the WIP `std.process.Init` / `std.Io` APIs — do not regress to the older `std.process.argsAlloc` style.
+- **Package**: module `vlmzsd` (root `src/root.zig`), executable `src/main.zig`.
+
+## Build / test
+
+- `zig build` — build the `vlmzsd` executable into `zig-out/`
+- `zig build run -- <args>` — build and run
+- `zig build test` — run unit tests (module + executable)
+- `build.zig` is the **only** build entrypoint. Never invoke `make`/`gmake` or `src/GNUmakefile`; the C sources are reference-only and are not compiled.
+
+## Architecture
+
+The original C component boundaries define the reimplementation surface — reimplement these in Zig, do not transliterate:
+
+| Layer | C source | Role |
+|-------|----------|------|
+| KMS protocol | `src/kms.c` / `src/kms.h` | REQUEST/RESPONSE v4/v5/v6 binary structs, ePID generation, product GUID tables |
+| RPC transport | `src/rpc.c` | Hand-written DCE/RPC (BIND, NDR32/NDR64, fragmentation) |
+| Windows RPC | `src/msrpc-*.c`, `KMSServer_*` | Native MS-RPC via rpcrt4 — **not** part of the Zig port |
+| Network | `src/network.c` | Cross-platform sockets |
+| Crypto | `src/crypto*.c` | AES/CMAC + SHA-256/HMAC-SHA256 (internal/OpenSSL/PolarSSL/Windows backends) |
+| Data | `src/kmsdata*.c`, `src/helpers.c` (`loadKmsData`) | Embedded/external `.kmd` binary data |
+| Server/CLI | `src/vlmcsd.c`, `src/vlmcs.c`, `src/vlmcsdmulti.c` | CLI, config, daemon, client |
+| Library | `src/libkms.c` / `src/libkms.h` | Public C API for embedding |
+
+The C build outputs (`bin/vlmcsd`, `bin/vlmcs`, `bin/vlmcsdmulti`, `lib/libkms.*`) are legacy artifacts — the Zig project does not reproduce that build layout.
+
+## Migration conventions
+
+- The C code in `src/` is the **reference**, not the target. Write idiomatic Zig; use the standard library before reaching for C-style logic:
+  - Crypto: `std.crypto` (AES, SHA-256, HMAC-SHA256) instead of porting `crypto_internal.c`.
+  - Network: `std.net` instead of `network.c`.
+  - Text/unicode: `std.unicode` instead of the UCS-2 converters in `helpers.c`.
+  - Byte access: `std.mem.readInt(..., .little)` / `std.mem.writeInt` instead of the `endian.h` macros.
+- Preserve wire/binary compatibility (inherent to interoperating with Windows KMS clients):
+  - All KMS protocol structs are packed little-endian — use `extern struct` or field-by-field de/serialization with `std.mem.readInt(..., .little)`. Never `@ptrCast` bytes to a Zig struct with padding.
+  - `etc/vlmcsd.kmd` binary format must stay compatible (reimplement `loadKmsData` parsing).
+  - v4 uses 160-bit AES CMAC; v6 uses a non-standard HMAC with timestamp tolerance (`CreateV6Hmac`). Reimplement their *behavior* with `std.crypto` primitives so output matches byte-for-byte — do not transliterate `crypto_internal.c`.
+  - DCE/RPC wire format in `src/rpc.c` must match (BIND negotiation, fragmentation, opnums).
+- Replace `shared_globals.c` global state with explicit context/allocator passing.
+- **CLI redesign**: a single `vlmzsd` binary with subcommands (server/client) and standard argument parsing — do not port the C getopt/INI surface. Configuration format is a design decision to make in Zig; do not copy the INI parser.
+- Target macOS/Linux first (the `rpc.c` + `network.c` path); skip the `USE_MSRPC` Windows path initially.
+
+## Key files
+
+- Feature switches (what the C build's `FEATURES=full` enables): `src/config.h`
+- Reference behavior (protocol semantics, legacy CLI options): `man/vlmcsd.8`, `man/vlmcs.1`, `man/vlmcsdmulti.1`, `man/vlmcsd.ini.5`
+- Sample data: `etc/vlmcsd.kmd`; legacy sample config (reference only, not the target format): `etc/vlmcsd.ini`
+- Zig entry points: `src/root.zig` (module), `src/main.zig` (executable/CLI), `build.zig`
+
+## Pitfalls
+
+- No test coverage exists yet. Add tests as you go; verify wire compatibility against captured reference bytes or a real KMS client — do not rely on building the C code.
+- `std.Io` / `std.process.Init` are WIP in 0.16 — consult current stdlib source rather than older tutorials.
+- `minimum_zig_version` is `0.16.0`; keep `build.zig` APIs in line with that version.
+- Do not add `make`/`gmake` targets or shell out to the C toolchain; keep everything in `build.zig`.
