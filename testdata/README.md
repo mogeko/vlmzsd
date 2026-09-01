@@ -36,6 +36,10 @@ outputs:
 | `cmac_v4_zeros_32.hex` | `AesCmacV4` | 32 zero bytes |
 | `cmac_v4_zeros_16.hex` | `AesCmacV4` | 16 zero bytes |
 | `aes_v6_encrypt_zero_block.hex` | `AesInitKey(AesKeyV6, IsV6=1)` + `AesEncryptBlock` | zero block |
+| `aes_v5_encrypt_zero_block.hex` | `AesInitKey(AesKeyV5, IsV6=0)` + `AesEncryptBlock` | zero block |
+| `aes_v6_decrypt_zero_block.hex` | `AesInitKey(AesKeyV6, IsV6=1)` + `AesDecryptBlock` | ciphertext of zero block |
+| `aes_cbc_encrypt_zeros32_v6.hex` | `AesEncryptCbc` (v6 key, zero IV) | 32 zero bytes (PKCS#7-padded to 48) |
+| `aes_cbc_decrypt_zeros32_v6.hex` | `AesDecryptCbc` (v6 key, zero IV) | 48 ciphertext bytes |
 | `hmac_sha256_zeros_32.hex` | `Sha256Hmac` (16-byte key hardcoded) | zero key, 32 zero bytes |
 
 ## Generating a fixture from captured bytes

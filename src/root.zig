@@ -3,6 +3,8 @@
 const std = @import("std");
 const testutil = @import("testutil.zig");
 
+pub const crypto = @import("crypto.zig");
+
 test "testdata pipeline: load etc/vlmcsd.kmd" {
     const alloc = std.testing.allocator;
 
@@ -20,4 +22,9 @@ test "testdata pipeline: load etc/vlmcsd.kmd" {
     try testutil.expectBytes(kmd[4..6], "\x00\x00");
     try testutil.expectBytes(kmd[6..8], "\x02\x00");
     try std.testing.expectEqual(@as(usize, 15079), kmd.len);
+}
+
+test {
+    // Force analysis of submodules so `zig build test` collects their tests.
+    _ = crypto;
 }

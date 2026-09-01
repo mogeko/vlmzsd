@@ -45,10 +45,12 @@ int main(void) {
     }
 
     // v6 non-standard AES key schedule (IsV6 = TRUE) applied to a zero block.
-    AesInitKey(&ctx, AesKeyV6, TRUE, 16);
-    memset(mac, 0, 16);
-    AesEncryptBlock(&ctx, mac);
-    dump_hex("aes_v6_encrypt_zero_block", mac, 16);
+    {
+        AesInitKey(&ctx, AesKeyV6, TRUE, 16);
+        memset(mac, 0, 16);
+        AesEncryptBlock(&ctx, mac);
+        dump_hex("aes_v6_encrypt_zero_block", mac, 16);
+    }
 
     // HMAC-SHA256 with a 16-byte key over a fresh 32-byte zero buffer.
     {
@@ -58,6 +60,50 @@ int main(void) {
         memset(data, 0, sizeof(data));
         Sha256Hmac(key, data, 32, hmac);
         dump_hex("hmac_sha256_zeros_32", hmac, 32);
+    }
+
+    // v5 (standard 128-bit AES, IsV6 = FALSE) applied to a zero block.
+    {
+        AesInitKey(&ctx, AesKeyV5, FALSE, 16);
+        memset(mac, 0, 16);
+        AesEncryptBlock(&ctx, mac);
+        dump_hex("aes_v5_encrypt_zero_block", mac, 16);
+    }
+
+    // v6 decrypt: decrypt the known ciphertext of the zero block back to zero.
+    {
+        AesInitKey(&ctx, AesKeyV6, TRUE, 16);
+        memset(mac, 0, 16);
+        AesEncryptBlock(&ctx, mac);
+        AesDecryptBlock(&ctx, mac);
+        dump_hex("aes_v6_decrypt_zero_block", mac, 16);
+    }
+
+    // v6 CBC encrypt: zero IV, 32 zero bytes (padded to 48) — in place.
+    {
+        BYTE data[64];
+        BYTE iv[16];
+        size_t len;
+        AesInitKey(&ctx, AesKeyV6, TRUE, 16);
+        memset(data, 0, sizeof(data));
+        memset(iv, 0, sizeof(iv));
+        len = 32;
+        AesEncryptCbc(&ctx, iv, data, &len);
+        dump_hex("aes_cbc_encrypt_zeros32_v6", data, len);
+    }
+
+    // v6 CBC decrypt round-trip: decrypt the ciphertext above (in place).
+    {
+        BYTE data[64];
+        BYTE iv[16];
+        size_t len;
+        AesInitKey(&ctx, AesKeyV6, TRUE, 16);
+        memset(data, 0, sizeof(data));
+        memset(iv, 0, sizeof(iv));
+        len = 32;
+        AesEncryptCbc(&ctx, iv, data, &len);
+        AesDecryptCbc(&ctx, iv, data, len);
+        dump_hex("aes_cbc_decrypt_zeros32_v6", data, len);
     }
 
     return 0;
