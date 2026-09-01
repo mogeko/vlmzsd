@@ -170,13 +170,13 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
     };
 }
 
-test "parse etc/vlmcsd.kmd" {
+test "parse reference/vlmcsd.kmd" {
     const alloc = std.testing.allocator;
 
     var threaded = std.Io.Threaded.init(alloc, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const raw = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, "etc/vlmcsd.kmd", alloc, .unlimited);
+    const raw = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, "reference/vlmcsd.kmd", alloc, .unlimited);
     defer alloc.free(raw);
 
     var data = try parse(alloc, raw);

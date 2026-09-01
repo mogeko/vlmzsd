@@ -14,7 +14,7 @@ The original C sources in `reference/vlmcsd-src/` are the **read-only reference*
 - Use them ONLY as reference for:
   - Wire/binary formats: packed little-endian KMS structs, DCE/RPC framing.
   - Algorithm behavior: v4 160-bit AES CMAC, v6 non-standard HMAC with timestamp tolerance.
-  - Binary data layout: `etc/vlmcsd.kmd` parsing (`loadKmsData`).
+  - Binary data layout: `reference/vlmcsd.kmd` parsing (`loadKmsData`).
 - When porting a component, create NEW Zig files under `src/`; do not transliterate or rewrite the C.
 
 See `AGENTS.md` for architecture, build commands, and migration conventions.

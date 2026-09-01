@@ -12,14 +12,14 @@ documented provenance so byte-for-byte assertions can be trusted.
 
 ## Data fixture
 
-The canonical KMS data file is `etc/vlmcsd.kmd` (15,079 bytes). Tests load it
+The canonical KMS data file is `reference/vlmcsd.kmd` (15,079 bytes). Tests load it
 at runtime via `std.Io.Dir.readFileAlloc` relative to the build root, to avoid
 duplicating the binary (`@embedFile` cannot reference files outside the package
 path).
 
 ## Provenance
 
-- `etc/vlmcsd.kmd` — original vlmcsd data file, shipped with the C reference.
+- `reference/vlmcsd.kmd` — original vlmcsd data file, shipped with the C reference.
   Header: magic `"KMD\0"`, version DWORD little-endian (`MajorVer == 2`).
 - Protocol/crypto golden bytes — captured from the C reference (one-time
   bootstrap, **outside this repo**) or from a real Windows KMS client capture.

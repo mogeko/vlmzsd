@@ -6,7 +6,7 @@ pub const kmsdata = @import("kmsdata.zig");
 const std = @import("std");
 const testutil = @import("testutil.zig");
 
-test "testdata pipeline: load etc/vlmcsd.kmd" {
+test "testdata pipeline: load reference/vlmcsd.kmd" {
     const alloc = std.testing.allocator;
 
     // 0.16: file I/O goes through an `Io` instance (thread-pool backend here).
@@ -15,7 +15,7 @@ test "testdata pipeline: load etc/vlmcsd.kmd" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const kmd = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, "etc/vlmcsd.kmd", alloc, .unlimited);
+    const kmd = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, "reference/vlmcsd.kmd", alloc, .unlimited);
     defer alloc.free(kmd);
 
     try testutil.expectBytes(kmd[0..3], "KMD");

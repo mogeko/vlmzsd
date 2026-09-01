@@ -47,7 +47,7 @@ The C build outputs (`bin/vlmcsd`, `bin/vlmcs`, `bin/vlmcsdmulti`, `lib/libkms.*
   - Byte access: `std.mem.readInt(..., .little)` / `std.mem.writeInt` instead of the `endian.h` macros.
 - Preserve wire/binary compatibility (inherent to interoperating with Windows KMS clients):
   - All KMS protocol structs are packed little-endian — use `extern struct` or field-by-field de/serialization with `std.mem.readInt(..., .little)`. Never `@ptrCast` bytes to a Zig struct with padding.
-  - `etc/vlmcsd.kmd` binary format must stay compatible (reimplement `loadKmsData` parsing). Embed the default via `@embedFile` and also support loading an external file at runtime (parity with the C embedded/external modes).
+  - `reference/vlmcsd.kmd` binary format must stay compatible (reimplement `loadKmsData` parsing). Embed the default via `@embedFile` and also support loading an external file at runtime (parity with the C embedded/external modes).
   - v4 uses 160-bit AES CMAC; v6 uses a non-standard HMAC with timestamp tolerance (`CreateV6Hmac`). Reimplement their *behavior* with `std.crypto` primitives so output matches byte-for-byte — do not transliterate `crypto_internal.c`.
   - DCE/RPC wire format in `reference/vlmcsd-src/rpc.c` must match (BIND negotiation, fragmentation, opnums).
 - Replace `shared_globals.c` global state with explicit context/allocator passing.
@@ -59,7 +59,7 @@ The C build outputs (`bin/vlmcsd`, `bin/vlmcs`, `bin/vlmcsdmulti`, `lib/libkms.*
 
 - Feature switches (what the C build's `FEATURES=full` enables): `reference/vlmcsd-src/config.h`
 - Reference behavior (protocol semantics, legacy CLI options): `man/vlmcsd.8`, `man/vlmcs.1`, `man/vlmcsdmulti.1`, `man/vlmcsd.ini.5`
-- Sample data: `etc/vlmcsd.kmd`; legacy sample config (reference only, not the target format): `etc/vlmcsd.ini`
+- Sample data: `reference/vlmcsd.kmd`
 - Zig entry points: `src/root.zig` (module), `src/main.zig` (executable/CLI), `build.zig`
 
 ## Pitfalls
