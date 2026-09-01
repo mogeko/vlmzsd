@@ -1,12 +1,12 @@
 ---
 name: migrate-c-module
-description: 'Migrate one vlmcsd C component (kms, rpc, crypto, network, helpers, kmsdata, vlmcsd, vlmcs) to idiomatic Zig for the vlmzsd project. Use when porting a module from the read-only reference C code in src/ to modern Zig, reimplementing wire/binary-compatible behavior with the Zig standard library (std.crypto, std.net, std.mem, std.unicode) instead of transliterating C, and verifying byte-for-byte compatibility. Keywords: C to Zig migration, port module, KMS protocol, DCE/RPC, wire compatibility, packed structs, endianness.'
+description: 'Migrate one vlmcsd C component (kms, rpc, crypto, network, helpers, kmsdata, vlmcsd, vlmcs) to idiomatic Zig for the vlmzsd project. Use when porting a module from the read-only reference C code in reference/vlmcsd-src/ to modern Zig, reimplementing wire/binary-compatible behavior with the Zig standard library (std.crypto, std.net, std.mem, std.unicode) instead of transliterating C, and verifying byte-for-byte compatibility. Keywords: C to Zig migration, port module, KMS protocol, DCE/RPC, wire compatibility, packed structs, endianness.'
 argument-hint: '<component: kms|rpc|crypto|network|helpers|kmsdata|vlmcsd|vlmcs>'
 ---
 
 # Migrate C Module to Zig
 
-Migrate a single vlmcsd C component into idiomatic Zig. The C sources in `src/` are a **read-only reference** for wire format and algorithm behavior — never edit or build them.
+Migrate a single vlmcsd C component into idiomatic Zig. The C sources in `reference/vlmcsd-src/` are a **read-only reference** for wire format and algorithm behavior — never edit or build them.
 
 ## When to Use
 
@@ -17,18 +17,20 @@ Migrate a single vlmcsd C component into idiomatic Zig. The C sources in `src/` 
 ## Preconditions
 
 - Read `AGENTS.md` first (build commands, architecture table, migration conventions).
-- Zig `>= 0.16.0`; code uses `std.process.Init` / `std.Io`. Build only via `build.zig` — never `make`/`gmake` or `src/GNUmakefile`.
+- Zig `>= 0.16.0`; code uses `std.process.Init` / `std.Io`. Build only via `build.zig` — never `make`/`gmake` or `reference/vlmcsd-src/GNUmakefile`.
 
 ## Component Map
 
+C reference files live under `reference/vlmcsd-src/`:
+
 | Component | C reference | Zig standard-library mapping |
 |-----------|-------------|------------------------------|
-| KMS protocol | `src/kms.c` / `src/kms.h` | `std.mem.readInt`/`writeInt` (little), `extern struct` or field-by-field de/serialization |
-| RPC transport | `src/rpc.c` / `src/rpc.h` | `std.net`, manual DCE/RPC framing |
-| Crypto | `src/crypto*.c` | `std.crypto` (AES, SHA-256, HMAC-SHA256) |
-| Network | `src/network.c` | `std.net` |
-| Data loading | `src/kmsdata*.c`, `src/helpers.c` (`loadKmsData`) | `std.fs.File`, `std.mem.readInt`, explicit structs |
-| Server/client | `src/vlmcsd.c`, `src/vlmcs.c`, `src/vlmcsdmulti.c` | redesigned CLI (subcommands), `std.process` arg parsing |
+| KMS protocol | `kms.c` / `kms.h` | `std.mem.readInt`/`writeInt` (little), `extern struct` or field-by-field de/serialization |
+| RPC transport | `rpc.c` / `rpc.h` | `std.net`, manual DCE/RPC framing |
+| Crypto | `crypto*.c` | `std.crypto` (AES, SHA-256, HMAC-SHA256) |
+| Network | `network.c` | `std.net` |
+| Data loading | `kmsdata*.c`, `helpers.c` (`loadKmsData`) | `std.fs.File`, `std.mem.readInt`, explicit structs |
+| Server/client | `vlmcsd.c`, `vlmcs.c`, `vlmcsdmulti.c` | redesigned CLI (subcommands), `std.process` arg parsing |
 
 ## Procedure
 
@@ -67,6 +69,6 @@ Migrate a single vlmcsd C component into idiomatic Zig. The C sources in `src/` 
 ## References
 
 - Project conventions and architecture: `AGENTS.md`
-- Feature switches enabled by `FEATURES=full`: `src/config.h`
+- Feature switches enabled by `FEATURES=full`: `reference/vlmcsd-src/config.h`
 - Protocol semantics and legacy CLI behavior: `man/vlmcsd.8`, `man/vlmcs.1`, `man/vlmcsdmulti.1`, `man/vlmcsd.ini.5`
 - Sample data: `etc/vlmcsd.kmd`; legacy sample config (reference only): `etc/vlmcsd.ini`
