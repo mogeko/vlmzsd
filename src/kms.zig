@@ -307,9 +307,7 @@ pub const ServerConfig = struct {
 };
 
 pub const BuildError = error{
-    Rejected,
     PidTooLong,
-    OutputTooSmall,
 };
 
 /// Write the ePID (UCS-2) and its byte length into `response`.
@@ -410,17 +408,18 @@ fn compactEpid(out: []u8, pid_size: usize, post_epid_size: usize) void {
     }
 }
 
-/// Create a v4 response. Returns the response byte length.
+/// Create a v4 response. Returns the response byte length, or a negative
+/// HRESULT when the request is rejected (mirrors the C `CreateResponseV4`).
 pub fn createResponseV4(
     request: *const RequestV4,
     out: *align(@alignOf(ResponseV4)) [max_response_size]u8,
     cfg: *const ServerConfig,
     now_unix: i64,
-) BuildError!usize {
+) i32 {
     const response: *ResponseV4 = @ptrCast(out);
 
     const hresult_code = createResponseBase(cfg, &request.base, &response.base, now_unix);
-    if (hresult_code != hresult.ok) return error.Rejected;
+    if (hresult_code != hresult.ok) return hresult_code;
 
     const pid_size = response.base.pid_size;
 
@@ -436,17 +435,18 @@ pub fn createResponseV4(
     crypto.aesCmacV4(out[0..encrypt_size], &mac);
     @memcpy(out[encrypt_size..][0..16], &mac);
 
-    return encrypt_size + @sizeOf([16]u8);
+    return @intCast(encrypt_size + @sizeOf([16]u8));
 }
 
-/// Create a v5 or v6 response. Returns the response byte length.
+/// Create a v5 or v6 response. Returns the response byte length, or a negative
+/// HRESULT when the request is rejected (mirrors the C `CreateResponseV6`).
 pub fn createResponseV6(
     request: *RequestV6,
     out: *align(@alignOf(ResponseV6)) [max_response_size]u8,
     cfg: *const ServerConfig,
     rng: std.Random,
     now_unix: i64,
-) BuildError!usize {
+) i32 {
     const is_v6 = majorVersion(request.version) > 5;
     const key: []const u8 = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
 
@@ -477,7 +477,7 @@ pub fn createResponseV6(
 
     // 4. Base response.
     const hresult_code = createResponseBase(cfg, &request.base, &response.base, now_unix);
-    if (hresult_code != hresult.ok) return error.Rejected;
+    if (hresult_code != hresult.ok) return hresult_code;
 
     // 5. Compact the variable-length ePID.
     const pid_size = response.base.pid_size;
@@ -491,7 +491,7 @@ pub fn createResponseV6(
 
     encrypt_size = crypto.aesCbcEncrypt(key, is_v6, null, out[version_size..], encrypt_size);
 
-    return encrypt_size + version_size;
+    return @intCast(encrypt_size + version_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -758,7 +758,8 @@ test "v4 request/response round-trip" {
     createRequestV4(&request, &base);
 
     var out: [max_response_size]u8 align(4) = undefined;
-    const resp_len = try createResponseV4(&request, &out, &cfg, 1_700_000_000);
+    const resp_len: usize = @intCast(createResponseV4(&request, &out, &cfg, 1_700_000_000));
+    try std.testing.expect(resp_len > 0);
 
     var resp: ResponseV4 = undefined;
     const result = decryptResponseV4(&resp, resp_len, out[0..resp_len], &request);
@@ -785,7 +786,8 @@ test "v5 request/response round-trip" {
     var request_client = request_sent;
 
     var out: [max_response_size]u8 align(4) = undefined;
-    const resp_len = try createResponseV6(&request_server, &out, &cfg, rng, 1_700_000_000);
+    const resp_len: usize = @intCast(createResponseV6(&request_server, &out, &cfg, rng, 1_700_000_000));
+    try std.testing.expect(resp_len > 0);
 
     var resp: ResponseV6 = undefined;
     const result = decryptResponseV6(&resp, resp_len, out[0..resp_len], &request_client, null);
@@ -810,7 +812,8 @@ test "v6 request/response round-trip" {
     var request_client = request_sent;
 
     var out: [max_response_size]u8 align(4) = undefined;
-    const resp_len = try createResponseV6(&request_server, &out, &cfg, rng, 1_700_000_000);
+    const resp_len: usize = @intCast(createResponseV6(&request_server, &out, &cfg, rng, 1_700_000_000));
+    try std.testing.expect(resp_len > 0);
 
     var resp: ResponseV6 = undefined;
     var hwid: [8]u8 = undefined;
