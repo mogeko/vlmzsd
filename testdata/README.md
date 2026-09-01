@@ -5,10 +5,17 @@ documented provenance so byte-for-byte assertions can be trusted.
 
 ## Layout
 
-- `kms/` — KMS REQUEST/RESPONSE v4/v5/v6 golden bytes (Phase 3).
 - `crypto/` — AES-CMAC v4 / HMAC-SHA256 v6 vectors (Phase 1).
-- `rpc/` — DCE/RPC BIND/REQUEST/RESPONSE frames (Phase 4).
-- `kmsdata/` — parsed `.kmd` expectations (Phase 2).
+
+The remaining layers are verified without committed golden-byte files:
+
+- **KMS protocol** — `src/kms.zig` is exercised via
+  request→response→decrypt round-trips plus compile-time layout assertions; the
+  underlying primitives are pinned by the `crypto/` vectors.
+- **`.kmd` parsing** — `src/kmsdata.zig` loads `reference/vlmcsd.kmd`
+  at runtime and asserts header/field values directly.
+- **DCE/RPC** — not yet implemented; frames will be added under
+  `rpc/` when available.
 
 ## Data fixture
 
@@ -35,6 +42,8 @@ outputs:
 |---------|------------------------|-------|
 | `cmac_v4_zeros_32.hex` | `AesCmacV4` | 32 zero bytes |
 | `cmac_v4_zeros_16.hex` | `AesCmacV4` | 16 zero bytes |
+| `cmac_v4_zeros_20.hex` | `AesCmacV4` | 20 zero bytes |
+| `cmac_v4_zeros_34.hex` | `AesCmacV4` | 34 zero bytes |
 | `aes_v6_encrypt_zero_block.hex` | `AesInitKey(AesKeyV6, IsV6=1)` + `AesEncryptBlock` | zero block |
 | `aes_v5_encrypt_zero_block.hex` | `AesInitKey(AesKeyV5, IsV6=0)` + `AesEncryptBlock` | zero block |
 | `aes_v6_decrypt_zero_block.hex` | `AesInitKey(AesKeyV6, IsV6=1)` + `AesDecryptBlock` | ciphertext of zero block |
