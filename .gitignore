@@ -16,3 +16,6 @@ src/VisualStudio-Linux-Remote/
 *.html
 *.pdf
 *.txt
+
+# reference-vector bootstrap tool (compiled binary)
+tools/reference/dump_vectors

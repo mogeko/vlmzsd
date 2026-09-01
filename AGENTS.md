@@ -47,11 +47,12 @@ The C build outputs (`bin/vlmcsd`, `bin/vlmcs`, `bin/vlmcsdmulti`, `lib/libkms.*
   - Byte access: `std.mem.readInt(..., .little)` / `std.mem.writeInt` instead of the `endian.h` macros.
 - Preserve wire/binary compatibility (inherent to interoperating with Windows KMS clients):
   - All KMS protocol structs are packed little-endian — use `extern struct` or field-by-field de/serialization with `std.mem.readInt(..., .little)`. Never `@ptrCast` bytes to a Zig struct with padding.
-  - `etc/vlmcsd.kmd` binary format must stay compatible (reimplement `loadKmsData` parsing).
+  - `etc/vlmcsd.kmd` binary format must stay compatible (reimplement `loadKmsData` parsing). Embed the default via `@embedFile` and also support loading an external file at runtime (parity with the C embedded/external modes).
   - v4 uses 160-bit AES CMAC; v6 uses a non-standard HMAC with timestamp tolerance (`CreateV6Hmac`). Reimplement their *behavior* with `std.crypto` primitives so output matches byte-for-byte — do not transliterate `crypto_internal.c`.
   - DCE/RPC wire format in `src/rpc.c` must match (BIND negotiation, fragmentation, opnums).
 - Replace `shared_globals.c` global state with explicit context/allocator passing.
 - **CLI redesign**: a single `vlmzsd` binary with subcommands (server/client) and standard argument parsing — do not port the C getopt/INI surface. Configuration format is a design decision to make in Zig; do not copy the INI parser.
+- **Testing**: byte-level fixtures live in `testdata/`; compare with `src/testutil.zig` (`expectBytes`, hex diff). The `.kmd` header is `"KMD\0"` followed by a little-endian version DWORD (`MajorVer == 2`).
 - Target macOS/Linux first (the `rpc.c` + `network.c` path); skip the `USE_MSRPC` Windows path initially.
 
 ## Key files
@@ -63,7 +64,9 @@ The C build outputs (`bin/vlmcsd`, `bin/vlmcs`, `bin/vlmcsdmulti`, `lib/libkms.*
 
 ## Pitfalls
 
-- No test coverage exists yet. Add tests as you go; verify wire compatibility against captured reference bytes or a real KMS client — do not rely on building the C code.
+- Test coverage is minimal (a `.kmd` fixture smoke test in `src/root.zig`). Add tests as you go; verify wire compatibility against captured reference bytes or a real KMS client — do not rely on building the C code.
 - `std.Io` / `std.process.Init` are WIP in 0.16 — consult current stdlib source rather than older tutorials.
+  - In 0.16 `std.fs.cwd` is gone; file I/O goes through an `Io` instance: `std.Io.Threaded.init(alloc, .{})` → `.io()`, then `std.Io.Dir.openFile` / `std.Io.Dir.readFileAlloc` (the latter takes `(dir, io, path, gpa, .unlimited)`).
+  - `@embedFile` can only reference files inside the module's package path (`src/`); for fixtures under `etc/`/`testdata/` load them at runtime via `std.Io.Dir`.
 - `minimum_zig_version` is `0.16.0`; keep `build.zig` APIs in line with that version.
 - Do not add `make`/`gmake` targets or shell out to the C toolchain; keep everything in `build.zig`.
