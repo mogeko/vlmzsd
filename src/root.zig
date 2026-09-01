@@ -2,6 +2,7 @@
 
 pub const crypto = @import("crypto.zig");
 pub const kmsdata = @import("kmsdata.zig");
+pub const kms = @import("kms.zig");
 
 const std = @import("std");
 const testutil = @import("testutil.zig");
@@ -29,4 +30,5 @@ test {
     // Force analysis of submodules so `zig build test` collects their tests.
     _ = crypto;
     _ = kmsdata;
+    _ = kms;
 }

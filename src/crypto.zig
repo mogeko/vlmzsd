@@ -55,8 +55,8 @@ const sbox_inv = [256]u8{
 const rcon = [11]u8{ 0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36 };
 
 const aes_key_v4 = [20]u8{ 0x05, 0x3d, 0x83, 0x07, 0xf9, 0xe5, 0xf0, 0x88, 0xeb, 0x5e, 0xa6, 0x68, 0x6c, 0xf0, 0x37, 0xc7, 0xe4, 0xef, 0xd2, 0xd6 };
-const aes_key_v5 = [16]u8{ 0xcd, 0x7e, 0x79, 0x6f, 0x2a, 0xb2, 0x5d, 0xcb, 0x55, 0xff, 0xc8, 0xef, 0x83, 0x64, 0xc4, 0x70 };
-const aes_key_v6 = [16]u8{ 0xa9, 0x4a, 0x41, 0x95, 0xe2, 0x01, 0x43, 0x2d, 0x9b, 0xcb, 0x46, 0x04, 0x05, 0xd8, 0x4a, 0x21 };
+pub const aes_key_v5 = [16]u8{ 0xcd, 0x7e, 0x79, 0x6f, 0x2a, 0xb2, 0x5d, 0xcb, 0x55, 0xff, 0xc8, 0xef, 0x83, 0x64, 0xc4, 0x70 };
+pub const aes_key_v6 = [16]u8{ 0xa9, 0x4a, 0x41, 0x95, 0xe2, 0x01, 0x43, 0x2d, 0x9b, 0xcb, 0x46, 0x04, 0x05, 0xd8, 0x4a, 0x21 };
 
 fn beWord(b: []const u8) u32 {
     return (@as(u32, b[0]) << 24) | (@as(u32, b[1]) << 16) | (@as(u32, b[2]) << 8) | b[3];
@@ -239,24 +239,28 @@ fn aesDecrypt(comptime nk: usize, block: Block, rk: []const u8) Block {
     return state;
 }
 
-/// v4 MAC: CBC-MAC with a zero IV and ISO 9797-1 padding (0x80...) under
-/// AES with the 160-bit `AesKeyV4`. `message.len` must be a multiple of 16.
+/// v4 MAC: CBC-MAC with a zero IV and ISO 9797-1 padding (0x80…) under
+/// AES with the 160-bit `AesKeyV4`. `message` may be any length; the
+/// reference (`AesCmacV4` in crypto.c) appends 0x80 followed by zeros up to
+/// the next block boundary (a full padding block when already aligned).
 pub fn aesCmacV4(message: []const u8, out: *Block) void {
-    std.debug.assert(message.len % 16 == 0);
-
     const rk = expandKey(5, &aes_key_v4, false);
     var mac: Block = [_]u8{0} ** 16;
 
+    // Absorb every full 16-byte block.
     var offset: usize = 0;
-    while (offset < message.len) : (offset += 16) {
+    while (offset + 16 <= message.len) : (offset += 16) {
         var block: Block = undefined;
         @memcpy(block[0..], message[offset..][0..16]);
         for (0..16) |i| mac[i] ^= block[i];
         mac = aesEncrypt(5, mac, &rk);
     }
 
+    // Final block: remaining bytes, 0x80, then zeros (ISO 9797-1 method 2).
     var pad: Block = [_]u8{0} ** 16;
-    pad[0] = 0x80;
+    const remaining = message.len - offset;
+    @memcpy(pad[0..remaining], message[offset..]);
+    pad[remaining] = 0x80;
     for (0..16) |i| mac[i] ^= pad[i];
     mac = aesEncrypt(5, mac, &rk);
 
@@ -390,6 +394,7 @@ test "v4 CMAC reference vectors" {
     const alloc = std.testing.allocator;
 
     var msg32 = [_]u8{0} ** 32;
+    var msg64 = [_]u8{0} ** 64;
     var mac: Block = undefined;
 
     aesCmacV4(&msg32, &mac);
@@ -401,6 +406,16 @@ test "v4 CMAC reference vectors" {
     const hex16 = try testutil.hexDump(alloc, &mac);
     defer alloc.free(hex16);
     try testutil.expectBytes(hex16, "2a090d7c1155251ab86445447d060335");
+
+    aesCmacV4(msg64[0..20], &mac);
+    const hex20 = try testutil.hexDump(alloc, &mac);
+    defer alloc.free(hex20);
+    try testutil.expectBytes(hex20, "268a68935873a958f7d05c7f3699fb82");
+
+    aesCmacV4(msg64[0..34], &mac);
+    const hex34 = try testutil.hexDump(alloc, &mac);
+    defer alloc.free(hex34);
+    try testutil.expectBytes(hex34, "ba177194ba0223ab1f4441bfe8a3d782");
 }
 
 test "v6 AES reference vector" {

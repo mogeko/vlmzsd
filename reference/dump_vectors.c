@@ -44,6 +44,20 @@ int main(void) {
         dump_hex("cmac_v4_zeros_16", mac, 16);
     }
 
+    // Non-block-aligned v4 MAC lengths (ISO 9797-1 method 2 padding).
+    {
+        BYTE msg[64];
+        memset(msg, 0, sizeof(msg));
+        AesCmacV4(msg, 20, mac);
+        dump_hex("cmac_v4_zeros_20", mac, 16);
+    }
+    {
+        BYTE msg[64];
+        memset(msg, 0, sizeof(msg));
+        AesCmacV4(msg, 34, mac);
+        dump_hex("cmac_v4_zeros_34", mac, 16);
+    }
+
     // v6 non-standard AES key schedule (IsV6 = TRUE) applied to a zero block.
     {
         AesInitKey(&ctx, AesKeyV6, TRUE, 16);
