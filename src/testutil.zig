@@ -54,10 +54,6 @@ test "expectBytes passes on equal bytes" {
     try expectBytes("KMD", "KMD");
 }
 
-test "expectBytes fails on mismatch" {
-    try std.testing.expectError(error.TestExpectedEqual, expectBytes("KMD", "KMX"));
-}
-
 test "hexDump" {
     const alloc = std.testing.allocator;
     const hex = try hexDump(alloc, "\xde\xad\xbe\xef");

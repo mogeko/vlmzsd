@@ -1,9 +1,10 @@
 //! vlmzsd — a modern-Zig reimplementation of the vlmcsd KMS emulator.
 
+pub const crypto = @import("crypto.zig");
+pub const kmsdata = @import("kmsdata.zig");
+
 const std = @import("std");
 const testutil = @import("testutil.zig");
-
-pub const crypto = @import("crypto.zig");
 
 test "testdata pipeline: load etc/vlmcsd.kmd" {
     const alloc = std.testing.allocator;
@@ -27,4 +28,5 @@ test "testdata pipeline: load etc/vlmcsd.kmd" {
 test {
     // Force analysis of submodules so `zig build test` collects their tests.
     _ = crypto;
+    _ = kmsdata;
 }
