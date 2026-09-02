@@ -1,3 +1,21 @@
+# zig
 .zig-cache/
 zig-out/
 *.o
+
+# c
+VisualStudio/
+bin/
+build/
+buildroot-configs/
+floppy/
+hotbird64-mass-build/
+lib/
+src/VisualStudio-Linux-Remote/
+*.vcxproj*
+*.html
+*.pdf
+*.txt
+
+# reference-vector bootstrap tool (compiled binary)
+reference/dump_vectors
