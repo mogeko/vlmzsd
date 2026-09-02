@@ -4,6 +4,7 @@ pub const crypto = @import("crypto.zig");
 pub const kmsdata = @import("kmsdata.zig");
 pub const kms = @import("kms.zig");
 pub const rpc = @import("rpc.zig");
+pub const network = @import("network.zig");
 
 const std = @import("std");
 const testutil = @import("testutil.zig");
@@ -33,4 +34,5 @@ test {
     _ = kmsdata;
     _ = kms;
     _ = rpc;
+    _ = network;
 }

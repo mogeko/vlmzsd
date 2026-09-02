@@ -261,12 +261,20 @@ pub fn buildBindResponse(
 // Server side: request dispatch
 // ---------------------------------------------------------------------------
 
-/// Build a FAULT response body (32 bytes) for an NCA error.
-fn buildFault(allocator: Allocator, nca_error: u32) ![]u8 {
-    const buf = try allocator.alloc(u8, 32);
-    @memset(buf, 0);
-    writeLe(u32, buf, 0, 32); // AllocHint
-    writeLe(u32, buf, 8, nca_error); // Error.Code (NDR32 union offset)
+/// Result of dispatching an RPC request.
+pub const DispatchResult = union(enum) {
+    /// NCA fault (unknown context or unsupported KMS version).
+    fault: u32,
+    /// Normal RPC response body (allocator-allocated).
+    response: []u8,
+};
+
+/// Build the 16-byte FAULT response body for an NCA error. The caller pairs it
+/// with a FAULT header whose `FragLength` is `header_size + 16 = 32`.
+pub fn buildFault(nca_error: u32) [16]u8 {
+    var buf = [_]u8{0} ** 16;
+    writeLe(u32, &buf, 0, 32); // AllocHint
+    writeLe(u32, &buf, 8, nca_error); // Error.Code
     return buf;
 }
 
@@ -279,20 +287,20 @@ pub fn dispatchKmsRequest(
     cfg: *const kms.ServerConfig,
     rng: std.Random,
     now_unix: i64,
-) ![]u8 {
+) !DispatchResult {
     if (request_body.len < request32_fixed_size) return error.InvalidRequest;
 
     const context_id = readLe(u16, request_body, 4);
     const is_ndr64 = context_id == negotiation.ndr64_ctx;
     const is_ndr32 = context_id == negotiation.ndr_ctx;
-    if (!is_ndr32 and !is_ndr64) return buildFault(allocator, nca_unk_if);
+    if (!is_ndr32 and !is_ndr64) return .{ .fault = nca_unk_if };
 
     const data_offset: usize = if (is_ndr64) request64_fixed_size else request32_fixed_size;
     if (request_body.len < data_offset + 4) return error.InvalidRequest;
 
     // KMS major version (second WORD of the KMS payload).
     const major_ver = readLe(u16, request_body, data_offset + 2);
-    if (major_ver < 4 or major_ver > 6) return buildFault(allocator, nca_proto_error);
+    if (major_ver < 4 or major_ver > 6) return .{ .fault = nca_proto_error };
 
     const kms_request_size: usize = if (major_ver == 4) kms_request_v4_size else kms_request_v6_size;
     if (request_body.len < data_offset + kms_request_size) return error.InvalidRequest;
@@ -355,7 +363,7 @@ pub fn dispatchKmsRequest(
     writeLe(u16, body, 4, context_id);
     // CancelCount + Pad1 are already zero.
 
-    return body;
+    return .{ .response = body };
 }
 
 // ---------------------------------------------------------------------------
@@ -675,7 +683,11 @@ test "dispatch v6 request end-to-end" {
     const rpc_request = try wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), false, 2);
     defer alloc.free(rpc_request);
 
-    const resp_body = try dispatchKmsRequest(alloc, rpc_request[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
+    const dispatch = try dispatchKmsRequest(alloc, rpc_request[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
+    const resp_body = switch (dispatch) {
+        .fault => return error.TestUnexpectedResult,
+        .response => |body| body,
+    };
     defer alloc.free(resp_body);
 
     const parsed = parseKmsResponse(resp_body, false);
