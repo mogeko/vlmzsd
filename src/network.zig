@@ -68,12 +68,11 @@ pub fn serveRpc(
     var negotiation = rpc.BindNegotiation{};
 
     while (true) {
-        var header_bytes: [rpc.header_size]u8 = undefined;
-        readAll(reader, &header_bytes) catch |err| switch (err) {
+        var header: rpc.RpcHeader = undefined;
+        readAll(reader, std.mem.asBytes(&header)) catch |err| switch (err) {
             error.EndOfStream => return,
             else => return err,
         };
-        const header: *const rpc.RpcHeader = @ptrCast(@alignCast(&header_bytes));
 
         const action: usize = switch (header.packet_type) {
             rpc.packet_type.bind_req => 0,
@@ -190,9 +189,8 @@ pub fn clientSendRequest(
 
 /// Read one RPC packet (header + body) and return its body bytes.
 fn readPacket(allocator: Allocator, reader: *Io.Reader) ![]u8 {
-    var header_bytes: [rpc.header_size]u8 = undefined;
-    try readAll(reader, &header_bytes);
-    const header: *const rpc.RpcHeader = @ptrCast(@alignCast(&header_bytes));
+    var header: rpc.RpcHeader = undefined;
+    try readAll(reader, std.mem.asBytes(&header));
 
     const frag_len: usize = header.frag_length;
     if (frag_len < rpc.header_size) return error.InvalidPacket;

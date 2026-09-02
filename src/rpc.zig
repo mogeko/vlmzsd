@@ -395,10 +395,11 @@ pub fn buildBindRequest(
     const buf = try allocator.alloc(u8, total);
     @memset(buf, 0);
 
-    const header: *RpcHeader = @ptrCast(@alignCast(buf.ptr));
+    var header: RpcHeader = undefined;
     var flags: u8 = packet_flags.first | packet_flags.last;
     if (options.multiplexed) flags |= packet_flags.multiplex;
-    createRpcHeader(header, packet_type_value, @intCast(total), call_id, flags);
+    createRpcHeader(&header, packet_type_value, @intCast(total), call_id, flags);
+    @memcpy(buf[0..header_size], std.mem.asBytes(&header));
 
     const body = buf[header_size..];
     writeLe(u16, body, 0, 5840); // MaxXmitFrag
@@ -485,8 +486,9 @@ pub fn wrapKmsRequest(
     const buf = try allocator.alloc(u8, total);
     @memset(buf, 0);
 
-    const header: *RpcHeader = @ptrCast(@alignCast(buf.ptr));
-    createRpcHeader(header, packet_type.request, @intCast(total), call_id, packet_flags.first | packet_flags.last);
+    var header: RpcHeader = undefined;
+    createRpcHeader(&header, packet_type.request, @intCast(total), call_id, packet_flags.first | packet_flags.last);
+    @memcpy(buf[0..header_size], std.mem.asBytes(&header));
 
     const body = buf[header_size..];
     writeLe(u32, body, 0, @intCast(kms_request.len + ndr_tail)); // AllocHint
@@ -603,7 +605,8 @@ test "kms request wrap (NDR32)" {
     const wrapped = try wrapKmsRequest(alloc, &payload, false, 2);
     defer alloc.free(wrapped);
 
-    const header: *const RpcHeader = @ptrCast(@alignCast(wrapped.ptr));
+    var header: RpcHeader = undefined;
+    @memcpy(std.mem.asBytes(&header), wrapped[0..header_size]);
     try std.testing.expectEqual(packet_type.request, header.packet_type);
     try std.testing.expectEqual(data_representation_le, header.data_representation);
     try std.testing.expectEqual(@as(u32, 2), header.call_id);
