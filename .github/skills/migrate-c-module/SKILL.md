@@ -30,7 +30,7 @@ C reference files live under `reference/vlmcsd-src/`:
 | Crypto | `crypto*.c` | `std.crypto` (AES, SHA-256, HMAC-SHA256) |
 | Network | `network.c` | `std.net` |
 | Data loading | `kmsdata*.c`, `helpers.c` (`loadKmsData`) | `std.fs.File`, `std.mem.readInt`, explicit structs |
-| Server/client | `vlmcsd.c`, `vlmcs.c`, `vlmcsdmulti.c` | redesigned CLI (subcommands), `std.process` arg parsing |
+| Server/client | `vlmcsd.c`, `vlmcs.c`, `vlmcsdmulti.c` | two binaries (`vlmzsd` server / `vlmzs` client), `std.process` + zig-clap arg parsing |
 
 ## Procedure
 

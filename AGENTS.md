@@ -8,11 +8,12 @@ Guidance for AI coding agents working in this repository.
 
 Goals:
 - Idiomatic, modern Zig that leverages the Zig ecosystem (`std.crypto`, `std.net`, `std.unicode`, …) rather than transliterating C.
-- A redesigned CLI (single binary, subcommands, modern argument parsing) — not a port of the C getopt/INI surface.
+- A redesigned CLI (two binaries — `vlmzsd` server + `vlmzs` client — with modern argument parsing) — not a port of the C getopt/INI surface.
 - Zig build system only — no `make`/`gmake`.
 
 - **Toolchain**: Zig `>= 0.16.0` (see `build.zig.zon`). The Zig code uses the WIP `std.process.Init` / `std.Io` APIs — do not regress to the older `std.process.argsAlloc` style.
-- **Package**: module `vlmzsd` (root `src/root.zig`), executable `src/main.zig`.
+- **Package**: module `vlmzsd` (root `src/root.zig`), executables `src/main.zig` (`vlmzsd` server) and `src/vlmzs.zig` (`vlmzs` client).
+- **Dependencies**: `zig-clap` (Hejsil/zig-clap) — the only external dependency, used for CLI parsing. Pin the tag that supports Zig `0.16.0`.
 
 ## Build / test
 
@@ -51,7 +52,7 @@ The C build outputs (`bin/vlmcsd`, `bin/vlmcs`, `bin/vlmcsdmulti`, `lib/libkms.*
   - v4 uses 160-bit AES CMAC; v6 uses a non-standard HMAC with timestamp tolerance (`CreateV6Hmac`). Reimplement their *behavior* with `std.crypto` primitives so output matches byte-for-byte — do not transliterate `crypto_internal.c`.
   - DCE/RPC wire format in `reference/vlmcsd-src/rpc.c` must match (BIND negotiation, fragmentation, opnums).
 - Replace `shared_globals.c` global state with explicit context/allocator passing.
-- **CLI redesign**: a single `vlmzsd` binary with subcommands (server/client) and standard argument parsing — do not port the C getopt/INI surface. Configuration format is a design decision to make in Zig; do not copy the INI parser.
+- **CLI redesign**: two binaries — `vlmzsd` (KMS server) and `vlmzs` (activation client) — do not port the C getopt/INI surface. No config file: configuration comes from CLI arguments + `VLMZSD_*` environment variables (three-tier precedence: default < env < CLI). Argument parsing uses the **zig-clap** dependency; logging is a fixed format written to stdout only (no `--log`/`--log-timestamp`; file logging is the supervisor's job). The authoritative CLI spec is `docs/cli.md` — implement against it.
 - **Testing**: byte-level fixtures live in `testdata/`; compare with `src/testutil.zig` (`expectBytes`, hex diff). The `.kmd` header is `"KMD\0"` followed by a little-endian version DWORD (`MajorVer == 2`).
 - Target macOS/Linux first (the `rpc.c` + `network.c` path); skip the `USE_MSRPC` Windows path initially.
 
@@ -60,7 +61,8 @@ The C build outputs (`bin/vlmcsd`, `bin/vlmcs`, `bin/vlmcsdmulti`, `lib/libkms.*
 - Feature switches (what the C build's `FEATURES=full` enables): `reference/vlmcsd-src/config.h`
 - Reference behavior (protocol semantics, legacy CLI options): `reference/vlmcsd-src/*.c` / `*.h`
 - Sample data: `reference/vlmcsd.kmd`
-- Zig entry points: `src/root.zig` (module), `src/main.zig` (executable/CLI), `build.zig`
+- Zig entry points: `src/root.zig` (module), `src/main.zig` (`vlmzsd` server), `src/vlmzs.zig` (`vlmzs` client), `build.zig`
+- CLI specification (options, env vars, precedence): `docs/cli.md`
 
 ## Pitfalls
 
@@ -69,4 +71,5 @@ The C build outputs (`bin/vlmcsd`, `bin/vlmcs`, `bin/vlmcsdmulti`, `lib/libkms.*
   - In 0.16 `std.fs.cwd` is gone; file I/O goes through an `Io` instance: `std.Io.Threaded.init(alloc, .{})` → `.io()`, then `std.Io.Dir.openFile` / `std.Io.Dir.readFileAlloc` (the latter takes `(dir, io, path, gpa, .unlimited)`).
   - `@embedFile` can only reference files inside the module's package path (`src/`); for fixtures under `etc/`/`testdata/` load them at runtime via `std.Io.Dir`.
 - `minimum_zig_version` is `0.16.0`; keep `build.zig` APIs in line with that version.
+- `zig-clap`'s `master` tracks Zig master — pin the release tag compatible with `0.16.0` when adding it to `build.zig.zon`.
 - Do not add `make`/`gmake` targets or shell out to the C toolchain; keep everything in `build.zig`.
