@@ -13,7 +13,6 @@ const kms = vlmzsd.kms;
 const kmsdata = vlmzsd.kmsdata;
 const network = vlmzsd.network;
 
-const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const EnvironMap = std.process.Environ.Map;
 
@@ -250,18 +249,6 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, args: anytype, log: *c
     return opts;
 }
 
-fn nowUnix(io: Io) i64 {
-    const now = Io.Clock.now(.real, io);
-    return @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_s));
-}
-
-fn makeSeed(io: Io) u64 {
-    const now = Io.Clock.now(.real, io);
-    const nanos: u128 = @intCast(now.nanoseconds);
-    const ptr_entropy: u64 = @truncate(@as(u128, @intCast(@intFromPtr(&now))));
-    return @as(u64, @truncate(nanos)) ^ ptr_entropy;
-}
-
 pub fn main(init: std.process.Init) !void {
     var diag = clap.Diagnostic{};
     var res = clap.parse(clap.Help, &params, clap.parsers.default, init.minimal.args, .{
@@ -313,7 +300,7 @@ pub fn main(init: std.process.Init) !void {
         .whitelisting_level = opts.whitelist,
     };
 
-    var prng = std.Random.DefaultPrng.init(makeSeed(init.io));
+    var prng = std.Random.DefaultPrng.init(cli_helper.makeSeed(init.io));
     const rng = prng.random();
 
     // Single-address MVP: serve the first listen address.
@@ -339,7 +326,7 @@ pub fn main(init: std.process.Init) !void {
 
         if (opts.verbose) log.info("connection accepted", .{});
 
-        const now_unix = nowUnix(init.io);
+        const now_unix = cli_helper.nowUnix(init.io);
 
         var rbuf: [4096]u8 = undefined;
         var wbuf: [4096]u8 = undefined;

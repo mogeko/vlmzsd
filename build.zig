@@ -28,7 +28,28 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    b.installArtifact(exe);
+    const exe_install = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&exe_install.step);
+    const vlmzsd_step = b.step("vlmzsd", "Build the vlmzsd server only");
+    vlmzsd_step.dependOn(&exe_install.step);
+
+    const vlmzs_exe = b.addExecutable(.{
+        .name = "vlmzs",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vlmzs.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vlmzsd", .module = mod },
+                .{ .name = "clap", .module = clap_mod },
+            },
+        }),
+    });
+
+    const vlmzs_install = b.addInstallArtifact(vlmzs_exe, .{});
+    b.getInstallStep().dependOn(&vlmzs_install.step);
+    const vlmzs_step = b.step("vlmzs", "Build the vlmzs client only");
+    vlmzs_step.dependOn(&vlmzs_install.step);
 
     const run_step = b.step("run", "Run the app");
 

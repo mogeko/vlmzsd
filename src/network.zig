@@ -24,9 +24,12 @@ pub fn readAll(reader: *Io.Reader, buf: []u8) !void {
     try reader.readSliceAll(buf);
 }
 
-/// Write all of `buf` (equivalent to `_send` in network.c).
+/// Write all of `buf` (equivalent to `_send` in network.c). Flushes the
+/// writer so the bytes reach the socket — the `Io.Writer` is buffered and
+/// would otherwise hold them until the buffer fills.
 pub fn writeAll(writer: *Io.Writer, buf: []const u8) !void {
     try writer.writeAll(buf);
+    try writer.flush();
 }
 
 // ---------------------------------------------------------------------------

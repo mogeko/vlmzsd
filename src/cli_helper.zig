@@ -39,6 +39,37 @@ pub fn parseBool(str: []const u8) error{InvalidBool}!bool {
     return error.InvalidBool;
 }
 
+fn hexVal(c: u8) error{InvalidGuid}!u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => error.InvalidGuid,
+    };
+}
+
+/// Parse a GUID in `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form (case-insensitive)
+/// into its 16 raw bytes.
+pub fn parseGuid(str: []const u8) error{InvalidGuid}![16]u8 {
+    if (str.len != 36) return error.InvalidGuid;
+    var out: [16]u8 = undefined;
+    var oi: usize = 0;
+    var i: usize = 0;
+    while (i < str.len) : (i += 1) {
+        if (i == 8 or i == 13 or i == 18 or i == 23) {
+            if (str[i] != '-') return error.InvalidGuid;
+            continue;
+        }
+        const hi = try hexVal(str[i]);
+        const lo = try hexVal(str[i + 1]);
+        out[oi] = (hi << 4) | lo;
+        oi += 1;
+        i += 1;
+    }
+    if (oi != 16) return error.InvalidGuid;
+    return out;
+}
+
 /// Fixed-format logger writing to stdout. No CLI surface (see `docs/cli.md`):
 /// redirecting/persisting output is the supervisor's (systemd/Docker) job.
 pub const Logger = struct {
@@ -69,6 +100,20 @@ pub const Logger = struct {
     }
 };
 
+/// Current Unix time in seconds (via the `realtime` clock).
+pub fn nowUnix(io: Io) i64 {
+    const now = Io.Clock.now(.real, io);
+    return @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_s));
+}
+
+/// A non-cryptographic seed mixing the realtime clock with stack (ASLR) entropy.
+pub fn makeSeed(io: Io) u64 {
+    const now = Io.Clock.now(.real, io);
+    const nanos: u128 = @intCast(now.nanoseconds);
+    const ptr_entropy: u64 = @truncate(@as(u128, @intCast(@intFromPtr(&now))));
+    return @as(u64, @truncate(nanos)) ^ ptr_entropy;
+}
+
 test "parseDurationSeconds" {
     try std.testing.expectEqual(@as(u64, 30), try parseDurationSeconds("30s"));
     try std.testing.expectEqual(@as(u64, 7200), try parseDurationSeconds("2h"));
@@ -86,4 +131,12 @@ test "parseBool" {
     try std.testing.expectEqual(false, try parseBool("0"));
     try std.testing.expectEqual(false, try parseBool("Off"));
     try std.testing.expectError(error.InvalidBool, parseBool("maybe"));
+}
+
+test "parseGuid" {
+    const g = try parseGuid("00112233-4455-6677-8899-aabbccddeeff");
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff }, &g);
+    try std.testing.expectEqualSlices(u8, &(try parseGuid("00112233-4455-6677-8899-AABBCCDDEEFF")), &.{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff });
+    try std.testing.expectError(error.InvalidGuid, parseGuid("nope"));
+    try std.testing.expectError(error.InvalidGuid, parseGuid("00112233-4455-6677-8899-aabbccddee"));
 }
