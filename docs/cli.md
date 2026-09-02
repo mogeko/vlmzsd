@@ -202,7 +202,7 @@ The following C surface is intentionally **not** carried over, with rationale:
   zig-clap's parsed result — it is independent of the parser choice.
 - **Two entry points share one module.** `src/main.zig` (`vlmzsd`) and
   `src/vlmzs.zig` (`vlmzs`) both import the `vlmzsd` module; argument parsing
-  and option-to-config mapping live in shared code (e.g. `src/cli.zig`).
+  and option-to-config mapping live in shared code (e.g. `src/cli_helper.zig`).
 - **Logging: no external library.** Zig has no community-standard log library,
   and `std.log` does not match the "fixed format → stdout" requirement. Logging
   is a small hand-written helper (~20 lines) writing a fixed format to stdout.

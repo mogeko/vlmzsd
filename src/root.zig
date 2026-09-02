@@ -5,6 +5,7 @@ pub const kmsdata = @import("kmsdata.zig");
 pub const kms = @import("kms.zig");
 pub const rpc = @import("rpc.zig");
 pub const network = @import("network.zig");
+pub const cli_helper = @import("cli_helper.zig");
 
 const std = @import("std");
 const testutil = @import("testutil.zig");
@@ -35,4 +36,5 @@ test {
     _ = kms;
     _ = rpc;
     _ = network;
+    _ = cli_helper;
 }

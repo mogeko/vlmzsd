@@ -16,6 +16,9 @@ const hostbuild_size = 32;
 
 pub const CsvlkData = struct {
     epid: []const u8,
+    /// Human-readable CSVLC name (the string immediately following `epid` in
+    /// the string pool) — used for `--epid <name>=<epid>` lookups.
+    name: []const u8,
     release_date: i64,
     group_id: u32,
     min_key_id: u32,
@@ -115,8 +118,12 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
     errdefer allocator.free(csvlk);
     for (csvlk, 0..) |*rec, i| {
         const base = header_size + i * csvlk_size;
+        const epid_offset: usize = @intCast(readLe(u64, raw, base));
+        const epid = try cString(raw, epid_offset);
+        const name = try cString(raw, epid_offset + epid.len + 1);
         rec.* = .{
-            .epid = try cString(raw, @intCast(readLe(u64, raw, base))),
+            .epid = epid,
+            .name = name,
             .release_date = readLe(i64, raw, base + 8),
             .group_id = readLe(u32, raw, base + 16),
             .min_key_id = readLe(u32, raw, base + 20),
