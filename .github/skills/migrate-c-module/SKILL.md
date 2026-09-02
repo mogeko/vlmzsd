@@ -36,7 +36,7 @@ C reference files live under `reference/vlmcsd-src/`:
 
 1. **Identify the boundary.** Confirm the component and its C reference files from the table above; note whether it is protocol-level (wire bytes must match) or internal (free to be idiomatic).
 
-2. **Extract the contract.** Read the C reference and relevant man pages (`man/vlmcsd.8`, `man/vlmcs.1`, `man/vlmcsdmulti.1`, `man/vlmcsd.ini.5`). Record:
+2. **Extract the contract.** Read the C reference (the module's `.h`/`.c` under `reference/vlmcsd-src/` plus `config.h`) and record:
    - Packed struct layouts, field order, and endianness.
    - Algorithm parameters (e.g. v4 160-bit AES CMAC; v6 non-standard HMAC with timestamp tolerance in `CreateV6Hmac`).
    - Binary formats that must stay compatible (`reference/vlmcsd.kmd`).
@@ -70,5 +70,5 @@ C reference files live under `reference/vlmcsd-src/`:
 
 - Project conventions and architecture: `AGENTS.md`
 - Feature switches enabled by `FEATURES=full`: `reference/vlmcsd-src/config.h`
-- Protocol semantics and legacy CLI behavior: `man/vlmcsd.8`, `man/vlmcs.1`, `man/vlmcsdmulti.1`, `man/vlmcsd.ini.5`
+- Protocol semantics and legacy CLI behavior: `reference/vlmcsd-src/*.c` / `*.h`
 - Sample data: `reference/vlmcsd.kmd`

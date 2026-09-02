@@ -58,7 +58,7 @@ The C build outputs (`bin/vlmcsd`, `bin/vlmcs`, `bin/vlmcsdmulti`, `lib/libkms.*
 ## Key files
 
 - Feature switches (what the C build's `FEATURES=full` enables): `reference/vlmcsd-src/config.h`
-- Reference behavior (protocol semantics, legacy CLI options): `man/vlmcsd.8`, `man/vlmcs.1`, `man/vlmcsdmulti.1`, `man/vlmcsd.ini.5`
+- Reference behavior (protocol semantics, legacy CLI options): `reference/vlmcsd-src/*.c` / `*.h`
 - Sample data: `reference/vlmcsd.kmd`
 - Zig entry points: `src/root.zig` (module), `src/main.zig` (executable/CLI), `build.zig`
 
