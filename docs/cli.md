@@ -143,7 +143,7 @@ Docker). This is a deliberate simplification of the C `-l`/`-T`/`-e` options.
 
 | Option | Short | Default | Notes |
 |---|---|---|---|
-| `HOST[:PORT]` | — | — | positional; port defaults to `1688` |
+| `HOST[:PORT]` | — | `127.0.0.1` | positional; port defaults to `1688` |
 | `--product <name>` | | `Windows` | look up GUIDs from `.kmd` |
 | `--protocol <4\|5\|6>` | | `6` | KMS protocol version |
 | `--app-id <guid>` | | from product | override AppID |

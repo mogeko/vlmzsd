@@ -334,8 +334,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (opts.host == null) {
-        log.err("missing HOST argument", .{});
-        return error.MissingHost;
+        // Default host (mirrors the C `useDefaultHost`): "::1" for IPv6-only,
+        // otherwise "127.0.0.1".
+        opts.host = if (opts.address_family == 6) "::1" else "127.0.0.1";
     }
 
     const sku_index = findSku(&data, opts.product) catch |e| {
