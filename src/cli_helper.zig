@@ -74,12 +74,15 @@ pub fn parseGuid(str: []const u8) error{InvalidGuid}![16]u8 {
 /// redirecting/persisting output is the supervisor's (systemd/Docker) job.
 pub const Logger = struct {
     file_writer: std.Io.File.Writer,
+    mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(io: Io, buffer: []u8) Logger {
         return .{ .file_writer = std.Io.File.writer(std.Io.File.stdout(), io, buffer) };
     }
 
     fn emit(self: *Logger, level: []const u8, comptime fmt: []const u8, args: anytype) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
         const w = &self.file_writer.interface;
         w.writeAll(level) catch {};
         w.print(fmt, args) catch {};

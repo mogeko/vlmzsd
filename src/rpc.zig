@@ -311,7 +311,7 @@ pub fn dispatchKmsRequest(
     if (major_ver == 4) {
         var request_v4: kms.RequestV4 = undefined;
         @memcpy(std.mem.asBytes(&request_v4)[0..kms_request_size], request_body[data_offset..][0..kms_request_size]);
-        response_size = kms.createResponseV4(&request_v4, &kms_response_buf, cfg, now_unix);
+        response_size = kms.createResponseV4(&request_v4, &kms_response_buf, cfg, rng, now_unix);
     } else {
         var request_v6: kms.RequestV6 = undefined;
         @memcpy(std.mem.asBytes(&request_v6)[0..kms_request_size], request_body[data_offset..][0..kms_request_size]);

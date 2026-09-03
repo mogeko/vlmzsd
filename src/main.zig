@@ -14,6 +14,7 @@ const kmsdata = vlmzsd.kmsdata;
 const network = vlmzsd.network;
 
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const EnvironMap = std.process.Environ.Map;
 
 const build_options = @import("build_options");
@@ -158,7 +159,7 @@ fn splitList(gpa: Allocator, s: []const u8) ![]const []const u8 {
     return out[0..i];
 }
 
-fn resolveOptions(gpa: Allocator, env: *const EnvironMap, args: anytype, log: *cli_helper.Logger) !ServerOptions {
+fn resolveOptions(gpa: Allocator, env: *const EnvironMap, args: anytype) !ServerOptions {
     // zig-clap names each argument field after its longest (long) name,
     // preserving hyphens; pull them out via `@field` into snake_case locals.
     const max_clients = @field(args, "max-clients");
@@ -221,17 +222,113 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, args: anytype, log: *c
     opts.verbose = args.verbose != 0;
     opts.quiet = args.quiet != 0;
 
-    // Warn about options whose semantics land in a later phase.
-    if (opts.epids.len > 0) log.warn("--epid overrides are not yet applied", .{});
-    if (opts.randomize != 1) log.warn("--randomize is not yet applied", .{});
-    if (opts.lcid != 0) log.warn("--lcid is not yet applied", .{});
-    if (opts.build != 0) log.warn("--build is not yet applied", .{});
-    if (opts.ip_protection != 0) log.warn("--ip-protection is not yet applied", .{});
-    if (opts.max_clients != 0) log.warn("--max-clients is not yet enforced", .{});
-    if (opts.maintain_clients) log.warn("--maintain-clients is not yet implemented", .{});
-    if (opts.start_empty) log.warn("--start-empty is not yet implemented", .{});
-
     return opts;
+}
+
+/// Find a CSVLC index by its human-readable name (used by `--epid name=epid`).
+fn findCsvlkByName(data: *const kmsdata.KmsData, name: []const u8) ?usize {
+    for (data.csvlk, 0..) |csvlk, i| {
+        if (std.mem.eql(u8, csvlk.name, name)) return i;
+    }
+    return null;
+}
+
+/// Build the per-CSVLC ePID override table: `--epid` entries win, then level-1
+/// pre-randomization fills the remaining slots (mirrors C `randomPidInit`).
+fn buildEpidOverrides(
+    gpa: Allocator,
+    data: *const kmsdata.KmsData,
+    opts: *const ServerOptions,
+    rng: std.Random,
+    now_unix: i64,
+    log: *cli_helper.Logger,
+) ![]const ?[]const u8 {
+    const n = data.csvlk.len;
+    const overrides = try gpa.alloc(?[]const u8, n);
+    errdefer gpa.free(overrides);
+    @memset(overrides, null);
+
+    // 1. `--epid <name>=<epid>` overrides.
+    for (opts.epids) |entry| {
+        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse {
+            log.warn("ignoring malformed --epid entry (expected name=epid): {s}", .{entry});
+            continue;
+        };
+        const name = entry[0..eq];
+        const epid = entry[eq + 1 ..];
+        const idx = findCsvlkByName(data, name) orelse {
+            log.warn("ignoring --epid for unknown CSVLC name: {s}", .{name});
+            continue;
+        };
+        overrides[idx] = try gpa.dupe(u8, epid);
+    }
+
+    // 2. Level-1 pre-randomization: one shared random build, random LCID,
+    //    per-CSVLC random key ID (only when the CSVLC has no --epid override).
+    if (opts.randomize == 1) {
+        const lang: i16 = if (opts.lcid != 0) @intCast(opts.lcid) else 0;
+        var host_build: i32 = if (opts.build != 0) @intCast(opts.build) else 0;
+        for (overrides, 0..) |*slot, i| {
+            if (slot.* != null) continue;
+            if (host_build == 0) host_build = kms.randomHostBuild(data, rng, opts.ndr64);
+            var buf: [kms.pid_buffer_size]u8 = undefined;
+            const pid = kms.generateRandomPid(data, i, &buf, lang, host_build, rng, opts.ndr64, now_unix);
+            slot.* = try gpa.dupe(u8, pid);
+        }
+    }
+
+    return overrides;
+}
+
+/// Per-connection worker context. Allocated per accepted client and owned by
+/// the worker thread, which destroys it on exit.
+const ClientContext = struct {
+    stream: Io.net.Stream,
+    io: Io,
+    gpa: Allocator,
+    cfg: *const kms.ServerConfig,
+    prng: std.Random.DefaultPrng,
+    port_str: []const u8,
+    use_ndr64: bool,
+    use_btfn: bool,
+    disconnect_per_request: bool,
+    timeout_seconds: u32,
+    verbose: bool,
+    sem: ?*Io.Semaphore,
+    log: *cli_helper.Logger,
+};
+
+/// Serve one connection on its own thread (thread-per-connection, mirroring the
+/// C `serveClientThreadProc`). Releases the semaphore and frees the context on
+/// exit.
+fn serveClientThread(ctx: *ClientContext) void {
+    defer {
+        ctx.stream.close(ctx.io);
+        if (ctx.sem) |sem| sem.post(ctx.io);
+        ctx.gpa.destroy(ctx);
+    }
+
+    if (ctx.verbose) ctx.log.info("connection accepted", .{});
+
+    const now_unix = cli_helper.nowUnix(ctx.io);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = ctx.stream.reader(ctx.io, &rbuf);
+    var writer = ctx.stream.writer(ctx.io, &wbuf);
+
+    network.serveRpc(ctx.gpa, &reader.interface, &writer.interface, ctx.prng.random(), now_unix, .{
+        .cfg = ctx.cfg,
+        .secondary_address = ctx.port_str,
+        .use_ndr64 = ctx.use_ndr64,
+        .use_btfn = ctx.use_btfn,
+        .disconnect_per_request = ctx.disconnect_per_request,
+        .timeout_seconds = ctx.timeout_seconds,
+        .socket_fd = ctx.stream.socket.handle,
+    }) catch |e| switch (e) {
+        error.EndOfStream, error.Timeout => {},
+        else => ctx.log.warn("connection error: {s}", .{@errorName(e)}),
+    };
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -260,7 +357,7 @@ pub fn main(init: std.process.Init) !void {
     var log_buf: [4096]u8 = undefined;
     var log = cli_helper.Logger.init(init.io, &log_buf);
 
-    var opts = try resolveOptions(init.gpa, init.environ_map, &res.args, &log);
+    var opts = try resolveOptions(init.gpa, init.environ_map, &res.args);
     defer opts.deinit(init.gpa);
 
     // Load the KMS data: external file overrides the embedded default.
@@ -277,30 +374,87 @@ pub fn main(init: std.process.Init) !void {
     var data = try kmsdata.parse(init.gpa, kmd_raw);
     defer data.deinit(init.gpa);
 
+    var prng = std.Random.DefaultPrng.init(cli_helper.makeSeed(init.io));
+    const rng = prng.random();
+
+    const epid_overrides = try buildEpidOverrides(init.gpa, &data, &opts, rng, cli_helper.nowUnix(init.io), &log);
+    defer {
+        for (epid_overrides) |slot| {
+            if (slot) |s| init.gpa.free(s);
+        }
+        init.gpa.free(epid_overrides);
+    }
+
+    // Client lists (strict mode): one per app, pre-filled unless --start-empty.
+    var client_lists: kms.ClientLists = undefined;
+    var client_lists_storage: ?[]kms.ClientList = null;
+    if (opts.maintain_clients) {
+        client_lists_storage = try init.gpa.alloc(kms.ClientList, data.apps().len);
+        client_lists = .{ .lists = client_lists_storage.? };
+        kms.initClientLists(&client_lists, &data, opts.start_empty, rng);
+    }
+    defer if (client_lists_storage) |s| init.gpa.free(s);
+
     const cfg = kms.ServerConfig{
         .data = &data,
         .vl_activation_interval = opts.activation_interval_minutes,
         .vl_renewal_interval = opts.renewal_interval_minutes,
         .check_client_time = opts.check_client_time,
         .whitelisting_level = opts.whitelist,
+        .randomization_level = opts.randomize,
+        .lcid = @truncate(opts.lcid),
+        .build = opts.build,
+        .epid_overrides = epid_overrides,
+        .use_ndr64 = opts.ndr64,
+        .maintain_clients = opts.maintain_clients,
+        .client_lists = if (client_lists_storage != null) &client_lists else null,
     };
-
-    var prng = std.Random.DefaultPrng.init(cli_helper.makeSeed(init.io));
-    const rng = prng.random();
-
-    // Single-address MVP: serve the first listen address.
-    const addr = opts.listen[0];
-    if (opts.listen.len > 1) log.warn("multiple --listen addresses are not yet served concurrently; using {s}", .{addr});
 
     var port_str_buf: [6]u8 = undefined;
     const port_str = try std.fmt.bufPrint(&port_str_buf, "{d}", .{opts.port});
 
-    var server = network.listen(init.io, addr, opts.port) catch |e| {
-        log.err("failed to listen on {s}:{d}: {s}", .{ addr, opts.port, @errorName(e) });
-        return e;
-    };
+    // Create the listening sockets. ip-protection level 1 listens only on the
+    // host's private addresses; otherwise `--listen` (default 0.0.0.0).
+    var servers = std.ArrayList(Io.net.Server).empty;
+    defer {
+        for (servers.items) |*s| s.deinit(init.io);
+        servers.deinit(init.gpa);
+    }
 
-    log.info("vlmzsd {s} listening on {s}:{d}", .{ version, addr, opts.port });
+    if (opts.ip_protection & 1 != 0) {
+        const privates = try network.getPrivateIPAddresses(init.gpa);
+        defer init.gpa.free(privates);
+        if (privates.len == 0) log.warn("ip-protection level 1: no private IP addresses found", .{});
+        for (privates) |ip0| {
+            var ip = ip0;
+            ip.setPort(opts.port);
+            const s = Io.net.IpAddress.listen(&ip, init.io, .{ .reuse_address = true }) catch |e| {
+                log.warn("failed to listen on a private address: {s}", .{@errorName(e)});
+                continue;
+            };
+            try servers.append(init.gpa, s);
+        }
+    } else {
+        for (opts.listen) |addr| {
+            const s = network.listen(init.io, addr, opts.port) catch |e| {
+                log.err("failed to listen on {s}:{d}: {s}", .{ addr, opts.port, @errorName(e) });
+                return e;
+            };
+            try servers.append(init.gpa, s);
+        }
+    }
+
+    if (servers.items.len == 0) {
+        log.err("could not listen on any socket", .{});
+        return error.NoListenSocket;
+    }
+
+    log.info("vlmzsd {s} listening on port {d} ({d} socket{s})", .{
+        version,
+        opts.port,
+        servers.items.len,
+        if (servers.items.len == 1) "" else "s",
+    });
 
     // Write the PID file (best effort; mirrors the C `writePidFile`, which
     // only logs on failure).
@@ -313,33 +467,74 @@ pub fn main(init: std.process.Init) !void {
         }) catch |e| log.warn("failed to write pid file {s}: {s}", .{ path, @errorName(e) });
     }
 
+    // Concurrency limit: a counting semaphore gates the worker threads
+    // (mirrors the C `MaxTaskSemaphore`). 0 = unlimited.
+    const sem_active = opts.max_clients != 0;
+    var sem = Io.Semaphore{ .permits = if (sem_active) opts.max_clients else 0 };
+
+    var poll_fds: [64]std.posix.pollfd = undefined;
+    if (servers.items.len > poll_fds.len) return error.TooManyListenSockets;
+
     while (true) {
-        const stream = server.accept(init.io) catch |e| {
-            log.err("accept failed: {s}", .{@errorName(e)});
+        const fds = poll_fds[0..servers.items.len];
+        for (servers.items, 0..) |*s, i| {
+            fds[i] = .{ .fd = s.socket.handle, .events = std.posix.POLL.IN, .revents = 0 };
+        }
+        const nready = std.posix.poll(fds, -1) catch |e| {
+            log.err("poll failed: {s}", .{@errorName(e)});
             return e;
         };
-        defer stream.close(init.io);
+        if (nready == 0) continue;
 
-        if (opts.verbose) log.info("connection accepted", .{});
+        for (fds, 0..) |f, i| {
+            if (f.revents & std.posix.POLL.IN == 0) continue;
+            const stream = servers.items[i].accept(init.io) catch |e| {
+                log.warn("accept failed: {s}", .{@errorName(e)});
+                continue;
+            };
 
-        const now_unix = cli_helper.nowUnix(init.io);
+            // ip-protection level 2: reject clients with a public IP address.
+            if (opts.ip_protection & 2 != 0) {
+                if (!network.isClientPrivate(stream.socket.handle)) {
+                    stream.close(init.io);
+                    if (opts.verbose) log.info("client with public IP address rejected", .{});
+                    continue;
+                }
+            }
 
-        var rbuf: [4096]u8 = undefined;
-        var wbuf: [4096]u8 = undefined;
-        var reader = stream.reader(init.io, &rbuf);
-        var writer = stream.writer(init.io, &wbuf);
+            // Block until a worker slot is available (if the cap is enabled).
+            if (sem_active) sem.waitUncancelable(init.io);
 
-        network.serveRpc(init.gpa, &reader.interface, &writer.interface, rng, now_unix, .{
-            .cfg = &cfg,
-            .secondary_address = port_str,
-            .use_ndr64 = opts.ndr64,
-            .use_btfn = opts.btfn,
-            .disconnect_per_request = opts.disconnect_per_request,
-            .timeout_seconds = @intCast(opts.timeout_seconds),
-            .socket_fd = stream.socket.handle,
-        }) catch |e| switch (e) {
-            error.EndOfStream, error.Timeout => {},
-            else => log.warn("connection error: {s}", .{@errorName(e)}),
-        };
+            const ctx = init.gpa.create(ClientContext) catch |e| {
+                stream.close(init.io);
+                if (sem_active) sem.post(init.io);
+                log.warn("out of memory accepting client: {s}", .{@errorName(e)});
+                continue;
+            };
+            ctx.* = .{
+                .stream = stream,
+                .io = init.io,
+                .gpa = init.gpa,
+                .cfg = &cfg,
+                .prng = std.Random.DefaultPrng.init(prng.random().int(u64)),
+                .port_str = port_str,
+                .use_ndr64 = opts.ndr64,
+                .use_btfn = opts.btfn,
+                .disconnect_per_request = opts.disconnect_per_request,
+                .timeout_seconds = @intCast(opts.timeout_seconds),
+                .verbose = opts.verbose,
+                .sem = if (sem_active) &sem else null,
+                .log = &log,
+            };
+
+            const th = std.Thread.spawn(.{}, serveClientThread, .{ctx}) catch |e| {
+                ctx.stream.close(init.io);
+                if (sem_active) sem.post(init.io);
+                init.gpa.destroy(ctx);
+                log.warn("failed to spawn client thread: {s}", .{@errorName(e)});
+                continue;
+            };
+            th.detach();
+        }
     }
 }
