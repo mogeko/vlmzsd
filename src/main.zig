@@ -230,9 +230,6 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, args: anytype, log: *c
     if (opts.max_clients != 0) log.warn("--max-clients is not yet enforced", .{});
     if (opts.maintain_clients) log.warn("--maintain-clients is not yet implemented", .{});
     if (opts.start_empty) log.warn("--start-empty is not yet implemented", .{});
-    if (opts.disconnect_per_request) log.warn("--disconnect-per-request is not yet implemented", .{});
-    if (opts.timeout_seconds != 30) log.warn("--timeout is not yet enforced", .{});
-    if (opts.pid_file != null) log.warn("--pid-file is not yet implemented", .{});
 
     return opts;
 }
@@ -305,6 +302,17 @@ pub fn main(init: std.process.Init) !void {
 
     log.info("vlmzsd {s} listening on {s}:{d}", .{ version, addr, opts.port });
 
+    // Write the PID file (best effort; mirrors the C `writePidFile`, which
+    // only logs on failure).
+    if (opts.pid_file) |path| {
+        var pid_buf: [16]u8 = undefined;
+        const pid_str = try std.fmt.bufPrint(&pid_buf, "{d}", .{std.c.getpid()});
+        std.Io.Dir.writeFile(std.Io.Dir.cwd(), init.io, .{
+            .sub_path = path,
+            .data = pid_str,
+        }) catch |e| log.warn("failed to write pid file {s}: {s}", .{ path, @errorName(e) });
+    }
+
     while (true) {
         const stream = server.accept(init.io) catch |e| {
             log.err("accept failed: {s}", .{@errorName(e)});
@@ -326,8 +334,11 @@ pub fn main(init: std.process.Init) !void {
             .secondary_address = port_str,
             .use_ndr64 = opts.ndr64,
             .use_btfn = opts.btfn,
+            .disconnect_per_request = opts.disconnect_per_request,
+            .timeout_seconds = @intCast(opts.timeout_seconds),
+            .socket_fd = stream.socket.handle,
         }) catch |e| switch (e) {
-            error.EndOfStream => {},
+            error.EndOfStream, error.Timeout => {},
             else => log.warn("connection error: {s}", .{@errorName(e)}),
         };
     }

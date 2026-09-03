@@ -44,6 +44,13 @@ pub const ServeOptions = struct {
     use_ndr64: bool = false,
     /// Bind-time feature negotiation is enabled (`UseServerRpcBTFN`).
     use_btfn: bool = false,
+    /// Close the connection after each RESPONSE/FAULT (C `DisconnectImmediately`).
+    disconnect_per_request: bool = false,
+    /// Idle timeout in seconds (0 = disabled). Polls the connected socket for
+    /// readability before each packet read (C `ServerTimeout`).
+    timeout_seconds: u32 = 0,
+    /// Connected socket fd, polled for readability when `timeout_seconds > 0`.
+    socket_fd: std.posix.socket_t = 0,
 };
 
 /// Write one RPC packet (header + body).
@@ -60,6 +67,19 @@ fn writePacket(
     try writeAll(writer, body);
 }
 
+/// Wait until the connected socket is readable, or return `error.Timeout`
+/// once the idle timeout elapses. A no-op when the timeout is disabled or the
+/// reader already has buffered bytes (the buffered `Io.Reader` may have read
+/// ahead past the packet being consumed).
+fn waitReadable(options: ServeOptions, reader: *Io.Reader) !void {
+    if (options.timeout_seconds == 0 or options.socket_fd == 0) return;
+    if (reader.bufferedLen() > 0) return;
+    var fds = [1]std.posix.pollfd{.{ .fd = options.socket_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const timeout_ms: i32 = @intCast(@as(i64, options.timeout_seconds) * 1000);
+    const n = try std.posix.poll(&fds, timeout_ms);
+    if (n == 0) return error.Timeout;
+}
+
 /// Serve the RPC loop over a connected stream (equivalent to the C `rpcServer`).
 /// Returns when the peer closes the stream or sends an unsupported packet type.
 pub fn serveRpc(
@@ -73,6 +93,7 @@ pub fn serveRpc(
     var negotiation = rpc.BindNegotiation{};
 
     while (true) {
+        try waitReadable(options, reader);
         var header: rpc.RpcHeader = undefined;
         readAll(reader, std.mem.asBytes(&header)) catch |err| switch (err) {
             error.EndOfStream => return,
@@ -90,6 +111,7 @@ pub fn serveRpc(
         if (frag_len < rpc.header_size) return error.InvalidPacket;
         const request_body = try allocator.alloc(u8, frag_len - rpc.header_size);
         defer allocator.free(request_body);
+        try waitReadable(options, reader);
         readAll(reader, request_body) catch |err| switch (err) {
             error.EndOfStream => return,
             else => return err,
@@ -120,11 +142,13 @@ pub fn serveRpc(
                         &fault_body,
                         rpc.packet_flags.first | rpc.packet_flags.last | rpc.packet_flags.not_exec,
                     );
+                    if (options.disconnect_per_request) return;
                 },
                 .response => |resp_body| {
                     defer allocator.free(resp_body);
                     // RESPONSE echoes the request's packet flags (incl. MULTIPLEX).
                     try writePacket(writer, rpc.packet_type.response, header.call_id, resp_body, header.packet_flags);
+                    if (options.disconnect_per_request) return;
                 },
             }
         }
