@@ -42,3 +42,5 @@ EXPOSE 1688/tcp
 
 ENTRYPOINT ["/usr/bin/vlmzsd"]
 
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD [ "/usr/bin/vlmzs", "localhost:1688" ]
