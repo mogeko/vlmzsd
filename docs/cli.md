@@ -155,8 +155,8 @@ Docker). This is a deliberate simplification of the C `-l`/`-T`/`-e` options.
 | `--vm` | `-m` | off | present as a virtual machine |
 | `--count <n>` | `-n` | `1` | number of requests |
 | `--virtual-clients <n>` | `-r` | `1` | NCountPolicy |
-| `--grace <minutes>` | `-g` | `0` | grace period minutes |
-| `--address-family <4\|6>` | | auto | IPv4/IPv6 selection |
+| `--grace <minutes>` | `-g` | `43200` | grace period minutes (BindingExpiration) |
+| `--address-family <4\|6>` | | auto | IPv4/IPv6 selection (IP literals only) |
 | `--list-products` | `-x` | — | print available products and exit |
 | `--license-status <0..6>` | `-t` | `1` | LicenseStatus field |
 | `--reconnect-per-request` | `-T` | off | reconnect for each request |

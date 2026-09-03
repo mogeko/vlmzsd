@@ -84,7 +84,14 @@ pub fn build(b: *std.Build) void {
 
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const vlmzs_tests = b.addTest(.{
+        .root_module = vlmzs_exe.root_module,
+    });
+
+    const run_vlmzs_tests = b.addRunArtifact(vlmzs_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_vlmzs_tests.step);
 }

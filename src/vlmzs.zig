@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const build_options = @import("build_options");
 const version = build_options.version;
 const default_port: u16 = 1688;
+const default_grace_minutes: u32 = 43200;
 const embedded_kmd: []const u8 = @embedFile("vlmcsd.kmd");
 
 const params = clap.parseParamsComptime(
@@ -61,7 +62,7 @@ const ClientOptions = struct {
     vm: bool = false,
     count: u32 = 1,
     virtual_clients: u32 = 0, // 0 = derive from the selected SKU
-    grace: u32 = 0,
+    grace: u32 = default_grace_minutes,
     address_family: u8 = 0,
     list_products: bool = false,
     license_status: u32 = 1,
@@ -130,8 +131,12 @@ fn resolveOptions(args: anytype, positionals: anytype, log: *cli_helper.Logger) 
     opts.vm = args.vm != 0;
     opts.count = args.count orelse 1;
     opts.virtual_clients = virtual_clients orelse 0;
-    opts.grace = args.grace orelse 0;
+    opts.grace = args.grace orelse default_grace_minutes;
     opts.address_family = address_family orelse 0;
+    if (opts.address_family != 0 and opts.address_family != 4 and opts.address_family != 6) {
+        log.err("--address-family must be 4 or 6", .{});
+        return error.InvalidAddressFamily;
+    }
     opts.list_products = list_products != 0;
     opts.license_status = license_status orelse 1;
     opts.reconnect_per_request = reconnect_per_request != 0;
@@ -139,9 +144,6 @@ fn resolveOptions(args: anytype, positionals: anytype, log: *cli_helper.Logger) 
     opts.ndr64 = no_ndr64 == 0;
     opts.btfn = no_btfn == 0;
     opts.verbose = args.verbose != 0;
-
-    if (opts.grace != 0) log.warn("--grace is not yet applied", .{});
-    if (opts.address_family != 0) log.warn("--address-family is not yet enforced", .{});
 
     return opts;
 }
@@ -202,6 +204,7 @@ fn buildRequestBase(
     base.version = @as(u32, proto) << 16;
     base.vm_info = if (opts.vm) 1 else 0;
     base.license_status = opts.license_status;
+    base.binding_expiration = opts.grace;
     base.app_id = opts.app_id orelse app_item.guid;
     base.act_id = opts.sku_id orelse sku.guid;
     base.kms_id = opts.kms_id orelse kms_item.guid;
@@ -242,7 +245,7 @@ fn sendRequest(
     rng: std.Random,
     log: *cli_helper.Logger,
 ) !void {
-    var stream = try network.connect(io, opts.host.?, opts.port);
+    var stream = try network.connect(io, opts.host.?, opts.port, opts.address_family);
     defer stream.close(io);
 
     var rbuf: [4096]u8 = undefined;
@@ -351,4 +354,28 @@ pub fn main(init: std.process.Init) !void {
             return e;
         };
     }
+}
+
+test "buildRequestBase binding expiration" {
+    const alloc = std.testing.allocator;
+    var data = try kmsdata.parse(alloc, embedded_kmd);
+    defer data.deinit(alloc);
+
+    var prng = std.Random.DefaultPrng.init(0);
+    const rng = prng.random();
+
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Default is 30 days (43200 minutes), matching the C `BindingExpiration`.
+    const opts_default = ClientOptions{};
+    const base_default = buildRequestBase(&opts_default, &data, 0, rng, io);
+    try std.testing.expectEqual(@as(u32, 43200), base_default.binding_expiration);
+
+    // An explicit `--grace` overrides it.
+    var opts_custom = ClientOptions{};
+    opts_custom.grace = 60;
+    const base_custom = buildRequestBase(&opts_custom, &data, 0, rng, io);
+    try std.testing.expectEqual(@as(u32, 60), base_custom.binding_expiration);
 }

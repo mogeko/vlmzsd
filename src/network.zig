@@ -238,9 +238,21 @@ fn readPacket(allocator: Allocator, reader: *Io.Reader) ![]u8 {
 // Socket glue
 // ---------------------------------------------------------------------------
 
-/// Connect to `address:port` (IPv4/IPv6 literal).
-pub fn connect(io: Io, address: []const u8, port: u16) !Io.net.Stream {
+/// Connect to `address:port` (IPv4/IPv6 literal). `address_family` (0 = any,
+/// 4 = IPv4-only, 6 = IPv6-only) filters the literal's address family.
+pub fn connect(io: Io, address: []const u8, port: u16, address_family: u8) !Io.net.Stream {
     const ip = try Io.net.IpAddress.parse(address, port);
+    switch (address_family) {
+        4 => switch (ip) {
+            .ip4 => {},
+            .ip6 => return error.AddressFamilyMismatch,
+        },
+        6 => switch (ip) {
+            .ip6 => {},
+            .ip4 => return error.AddressFamilyMismatch,
+        },
+        else => {},
+    }
     return Io.net.IpAddress.connect(&ip, io, .{ .mode = .stream });
 }
 
