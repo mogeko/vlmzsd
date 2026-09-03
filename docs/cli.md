@@ -86,7 +86,7 @@ Grouped by concern (help is rendered in these groups).
 | Option | Short | Default | Env var | Notes |
 |---|---|---|---|---|
 | `--port <n>` | `-p` | `1688` | `VLMZSD_PORT` | TCP listen port |
-| `--listen <addr>` | `-L` | `0.0.0.0` | `VLMZSD_LISTEN` | repeatable / comma-separated |
+| `--listen <addr>` | `-L` | `::` (dual-stack) | `VLMZSD_LISTEN` | repeatable / comma-separated |
 | `--timeout <dur>` | | `30s` | `VLMZSD_TIMEOUT` | idle timeout; `0` disables |
 | `--max-clients <n>` | `-m` | unlimited | `VLMZSD_MAX_CLIENTS` | concurrent client cap |
 

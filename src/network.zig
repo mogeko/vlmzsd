@@ -311,6 +311,25 @@ pub fn listen(io: Io, address: []const u8, port: u16) !Io.net.Server {
     return Io.net.IpAddress.listen(&ip, io, .{ .reuse_address = true });
 }
 
+/// True when the IPv4 address `ip` (numeric, host byte order) is
+/// private/reserved. Public addresses return false.
+fn isPrivateIpv4(ip: u32) bool {
+    return (ip & 0xff000000) == 0x7f000000 or // 127/8 localhost
+        (ip & 0xffff0000) == 0xc0a80000 or // 192.168/16
+        (ip & 0xffff0000) == 0xa9fe0000 or // 169.254/16 link-local
+        (ip & 0xff000000) == 0x0a000000 or // 10/8
+        (ip & 0xfff00000) == 0xac100000; // 172.16/12
+}
+
+/// True when `bytes` is an IPv4-mapped IPv6 address (::ffff:a.b.c.d), which a
+/// dual-stack IPv6 socket reports for IPv4 peers.
+fn isIpv4Mapped(bytes: [16]u8) bool {
+    for (bytes[0..10]) |b| {
+        if (b != 0) return false;
+    }
+    return bytes[10] == 0xff and bytes[11] == 0xff;
+}
+
 /// True when `addr` is a private/reserved IPv4 or IPv6 address (mirrors the
 /// C `isPrivateIPAddress` in network.c). Public addresses return false.
 pub fn isPrivateIPAddress(addr: *const std.posix.sockaddr) bool {
@@ -319,15 +338,15 @@ pub fn isPrivateIPAddress(addr: *const std.posix.sockaddr) bool {
             const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(addr));
             // sockaddr_in.addr is stored in network byte order; on a
             // little-endian host this yields the numeric value via byte swap.
-            const ip = @byteSwap(in.addr);
-            break :blk (ip & 0xff000000) == 0x7f000000 or // 127/8 localhost
-                (ip & 0xffff0000) == 0xc0a80000 or // 192.168/16
-                (ip & 0xffff0000) == 0xa9fe0000 or // 169.254/16 link-local
-                (ip & 0xff000000) == 0x0a000000 or // 10/8
-                (ip & 0xfff00000) == 0xac100000; // 172.16/12
+            break :blk isPrivateIpv4(@byteSwap(in.addr));
         },
         std.posix.AF.INET6 => blk: {
             const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
+            // A dual-stack socket presents IPv4 peers as IPv4-mapped
+            // addresses; judge them by the embedded IPv4 address.
+            if (isIpv4Mapped(in6.addr)) {
+                break :blk isPrivateIpv4(std.mem.readInt(u32, in6.addr[12..16], .big));
+            }
             const qword0 = std.mem.readInt(u64, in6.addr[0..8], .big);
             const qword1 = std.mem.readInt(u64, in6.addr[8..16], .big);
             const word0 = std.mem.readInt(u16, in6.addr[0..2], .big);
@@ -506,6 +525,16 @@ test "isPrivateIPAddress ipv6" {
     {
         var sa = ipv6.addr([_]u8{ 0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
         try std.testing.expect(isPrivateIPAddress(@ptrCast(&sa)));
+    }
+    // ::ffff:127.0.0.1 (IPv4-mapped loopback) → private.
+    {
+        var sa = ipv6.addr([_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 });
+        try std.testing.expect(isPrivateIPAddress(@ptrCast(&sa)));
+    }
+    // ::ffff:8.8.8.8 (IPv4-mapped public) → public.
+    {
+        var sa = ipv6.addr([_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 8, 8, 8, 8 });
+        try std.testing.expect(!isPrivateIPAddress(@ptrCast(&sa)));
     }
 }
 

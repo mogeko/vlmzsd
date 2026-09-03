@@ -28,7 +28,7 @@ const params = clap.parseParamsComptime(
     \\-h, --help                       Display this help and exit.
     \\-V, --version                    Output version information and exit.
     \\-p, --port <u16>                 TCP listen port (default 1688).
-    \\-L, --listen <str>...            Listen address, repeatable (default 0.0.0.0).
+    \\-L, --listen <str>...            Listen address, repeatable (default ::, dual-stack).
     \\    --timeout <str>              Idle timeout (default 30s, 0 disables).
     \\-m, --max-clients <u32>          Concurrent client cap (default unlimited).
     \\    --data <str>                 External .kmd data file (default embedded).
@@ -55,7 +55,7 @@ const params = clap.parseParamsComptime(
 /// Resolved server configuration (post three-tier precedence merge).
 const ServerOptions = struct {
     port: u16 = default_port,
-    listen: []const []const u8 = &.{"0.0.0.0"},
+    listen: []const []const u8 = &.{"::"},
     timeout_seconds: u64 = 30,
     max_clients: u32 = 0,
     data_file: ?[]const u8 = null,
@@ -414,7 +414,8 @@ pub fn main(init: std.process.Init) !void {
     const port_str = try std.fmt.bufPrint(&port_str_buf, "{d}", .{opts.port});
 
     // Create the listening sockets. ip-protection level 1 listens only on the
-    // host's private addresses; otherwise `--listen` (default 0.0.0.0).
+    // host's private addresses; otherwise `--listen` (default ::, a dual-stack
+    // socket covering both IPv4 and IPv6).
     var servers = std.ArrayList(Io.net.Server).empty;
     defer {
         for (servers.items) |*s| s.deinit(init.io);
@@ -437,6 +438,16 @@ pub fn main(init: std.process.Init) !void {
     } else {
         for (opts.listen) |addr| {
             const s = network.listen(init.io, addr, opts.port) catch |e| {
+                // Fallback: a default dual-stack "::" listen fails when the
+                // host has no IPv6 stack; retry on IPv4 only.
+                if (std.mem.eql(u8, addr, "::") and e == error.AddressFamilyUnsupported) {
+                    const s4 = network.listen(init.io, "0.0.0.0", opts.port) catch |e4| {
+                        log.err("failed to listen on 0.0.0.0:{d}: {s}", .{ opts.port, @errorName(e4) });
+                        return e4;
+                    };
+                    try servers.append(init.gpa, s4);
+                    continue;
+                }
                 log.err("failed to listen on {s}:{d}: {s}", .{ addr, opts.port, @errorName(e) });
                 return e;
             };
