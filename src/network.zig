@@ -42,6 +42,8 @@ pub const ServeOptions = struct {
     /// Port-number string to embed in BIND responses ("" → none).
     secondary_address: []const u8 = "",
     use_ndr64: bool = false,
+    /// Bind-time feature negotiation is enabled (`UseServerRpcBTFN`).
+    use_btfn: bool = false,
 };
 
 /// Write one RPC packet (header + body).
@@ -96,6 +98,7 @@ pub fn serveRpc(
         if (action == 0 or action == 2) {
             const resp_body = try rpc.buildBindResponse(allocator, request_body, options.rpc_assoc_group, .{
                 .use_ndr64 = options.use_ndr64,
+                .use_btfn = options.use_btfn,
                 .secondary_address = options.secondary_address,
             }, &negotiation);
             defer allocator.free(resp_body);

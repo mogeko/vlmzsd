@@ -229,7 +229,6 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, args: anytype, log: *c
     if (opts.max_clients != 0) log.warn("--max-clients is not yet enforced", .{});
     if (opts.maintain_clients) log.warn("--maintain-clients is not yet implemented", .{});
     if (opts.start_empty) log.warn("--start-empty is not yet implemented", .{});
-    if (opts.btfn) log.warn("--btfn is not yet implemented", .{});
     if (opts.disconnect_per_request) log.warn("--disconnect-per-request is not yet implemented", .{});
     if (opts.timeout_seconds != 30) log.warn("--timeout is not yet enforced", .{});
     if (opts.pid_file != null) log.warn("--pid-file is not yet implemented", .{});
@@ -325,6 +324,7 @@ pub fn main(init: std.process.Init) !void {
             .cfg = &cfg,
             .secondary_address = port_str,
             .use_ndr64 = opts.ndr64,
+            .use_btfn = opts.btfn,
         }) catch |e| switch (e) {
             error.EndOfStream => {},
             else => log.warn("connection error: {s}", .{@errorName(e)}),
