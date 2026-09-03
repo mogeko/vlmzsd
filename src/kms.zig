@@ -270,6 +270,64 @@ pub fn getProductIndex(guid: *const Guid, list: []const kmsdata.VlmcsdData) ?usi
     return null;
 }
 
+// ---------------------------------------------------------------------------
+// Randomized ePID support (mirrors kms.c `generateRandomPid` et al.)
+// ---------------------------------------------------------------------------
+
+/// Valid LCIDs for randomized ePIDs (mirrors the C `LcidList`).
+const lcid_list = [_]u16{
+    1078, 1052, 1025, 2049, 3073,  4097,  5121,  6145,  7169,  8193,  9217,  10241, 11265, 12289, 13313, 14337, 15361, 16385,
+    1067, 1068, 2092, 1069, 1059,  1093,  5146,  1026,  1027,  1028,  2052,  3076,  4100,  5124,  1050,  4122,  1029,  1030,
+    1125, 1043, 2067, 1033, 2057,  3081,  4105,  5129,  6153,  7177,  8201,  9225,  10249, 11273, 12297, 13321, 1061,  1080,
+    1065, 1035, 1036, 2060, 3084,  4108,  5132,  6156,  1079,  1110,  1031,  2055,  3079,  4103,  5127,  1032,  1095,  1037,
+    1081, 1038, 1039, 1057, 1040,  2064,  1041,  1099,  1087,  1111,  1042,  1088,  1062,  1063,  1071,  1086,  2110,  1100,
+    1082, 1153, 1102, 1104, 1044,  2068,  1045,  1046,  2070,  1094,  1131,  2155,  3179,  1048,  1049,  9275,  4155,  5179,
+    3131, 1083, 2107, 8251, 6203,  7227,  1103,  2074,  6170,  3098,  7194,  1051,  1060,  1034,  2058,  3082,  4106,  5130,
+    6154, 7178, 8202, 9226, 10250, 11274, 12298, 13322, 14346, 15370, 16394, 17418, 18442, 19466, 20490, 1089,  1053,  2077,
+    1114, 1097, 1092, 1098, 1054,  1074,  1058,  1056,  1091,  2115,  1066,  1106,  1076,  1077,
+};
+
+/// Minimum Unix time used as the upper bound for randomized ePID dates
+/// (C `BUILD_TIME` = 2013-10-17T13:00:11Z).
+const build_time: i64 = 1_538_922_811;
+
+/// `HostBuildFlag.UseNdr64` (kms.h).
+const use_ndr64_flag: u32 = 1;
+
+/// Platform ID for a host build (first entry whose build <= `host_build`).
+pub fn getPlatformId(data: *const kmsdata.KmsData, host_build: i32) i32 {
+    for (data.host_builds) |hb| {
+        if (hb.build_number <= host_build) return hb.platform_id;
+    }
+    return data.host_builds[data.host_builds.len - 1].platform_id;
+}
+
+/// Release date for a host build (last entry whose build >= `host_build`).
+pub fn getReleaseDate(data: *const kmsdata.KmsData, host_build: i32) i64 {
+    var i = data.host_builds.len;
+    while (i > 0) {
+        i -= 1;
+        if (data.host_builds[i].build_number >= host_build) return data.host_builds[i].release_date;
+    }
+    return data.host_builds[0].release_date;
+}
+
+/// Return `lcid` when it is a member of `lcid_list`, else 0.
+pub fn isValidLcid(lcid: u16) u16 {
+    for (lcid_list) |entry| {
+        if (lcid == entry) return lcid;
+    }
+    return 0;
+}
+
+/// Return `build` when it matches a known host build, else 0.
+pub fn isValidHostBuild(data: *const kmsdata.KmsData, build: u32) u32 {
+    for (data.host_builds) |hb| {
+        if (build == @as(u32, @intCast(hb.build_number))) return build;
+    }
+    return 0;
+}
+
 /// Convert UTF-8 `pid` to UCS-2 in `out`, appending a null terminator.
 /// Matches `utf8_to_ucs2` in the reference (BMP only; > 0xFFFE rejected).
 /// Returns the number of code units written, excluding the terminator.
@@ -304,6 +362,22 @@ pub const ServerConfig = struct {
     whitelisting_level: u32 = 0,
     /// HwId embedded in v6 responses.
     hwid: [8]u8 = default_hwid,
+    /// ePID randomization level 0/1/2 (C `RandomizationLevel`).
+    randomization_level: u8 = 1,
+    /// Fixed LCID for randomized ePIDs (0 = random).
+    lcid: u16 = 0,
+    /// Fixed host build number for randomized ePIDs (0 = random).
+    build: u32 = 0,
+    /// Per-CSVLC ePID overrides: level-1 cache or `--epid` entries (null = default).
+    epid_overrides: []const ?[]const u8 = &.{},
+    /// Whether the negotiated transfer syntax is NDR64 (used by host-build
+    /// selection when generating ePIDs, matching `getRandomServerType`).
+    use_ndr64: bool = true,
+    /// Track client machines per app (`MaintainClients`). When enabled,
+    /// `client_lists` must point at initialized per-app lists.
+    maintain_clients: bool = false,
+    /// Per-app client lists (null when `maintain_clients` is false).
+    client_lists: ?*ClientLists = null,
 };
 
 pub const BuildError = error{
@@ -316,6 +390,132 @@ fn setEpid(response: *Response, pid: []const u8) BuildError!void {
     response.pid_size = @intCast((n + 1) * 2);
 }
 
+/// Format `value` with a minimum width of `digits` zero-padded digits
+/// (0 = no padding), matching the C `itoc` helper.
+fn itoc(buf: []u8, value: u32, digits: u8) []u8 {
+    var tmp: [16]u8 = undefined;
+    const s = std.fmt.bufPrint(&tmp, "{d}", .{value}) catch unreachable;
+    const width: usize = if (digits > 9) 0 else digits;
+    if (width > s.len) {
+        const pad = width - s.len;
+        @memset(buf[0..pad], '0');
+        @memcpy(buf[pad..][0..s.len], s);
+        return buf[0..width];
+    }
+    @memcpy(buf[0..s.len], s);
+    return buf[0..s.len];
+}
+
+/// Pick a random host build whose NDR64 capability matches `use_ndr64`
+/// (mirrors the C `getRandomServerType`).
+fn getRandomServerType(data: *const kmsdata.KmsData, rng: std.Random, use_ndr64: bool) u32 {
+    while (true) {
+        const idx = rng.uintLessThan(usize, data.host_builds.len);
+        const is_ndr64 = (data.host_builds[idx].flags & use_ndr64_flag) != 0;
+        if (is_ndr64 == use_ndr64) return @intCast(idx);
+    }
+}
+
+/// Pick a random host build number whose NDR64 capability matches `use_ndr64`
+/// (used by level-1 pre-randomization to fix one build for all CSVLCs).
+pub fn randomHostBuild(data: *const kmsdata.KmsData, rng: std.Random, use_ndr64: bool) i32 {
+    return data.host_builds[getRandomServerType(data, rng, use_ndr64)].build_number;
+}
+
+/// Generate a randomized ePID for CSVLC `index` into `out` (UTF-8), matching
+/// the C `generateRandomPid`. `host_build == 0` picks a random host build.
+pub fn generateRandomPid(
+    data: *const kmsdata.KmsData,
+    index: usize,
+    out: []u8,
+    lang: i16,
+    host_build: i32,
+    rng: std.Random,
+    use_ndr64: bool,
+    now_unix: i64,
+) []u8 {
+    const resolved_build: i32 = if (host_build == 0)
+        data.host_builds[getRandomServerType(data, rng, use_ndr64)].build_number
+    else
+        host_build;
+
+    const csvlk = data.csvlk[index];
+    const key_id = csvlk.min_key_id + rng.uintLessThan(u32, csvlk.max_key_id - csvlk.min_key_id);
+
+    const resolved_lang: u16 = if (lang < 1)
+        lcid_list[rng.uintLessThan(usize, lcid_list.len)]
+    else
+        @intCast(lang);
+
+    const host_release = getReleaseDate(data, resolved_build);
+    const min_time: i64 = @max(csvlk.release_date, host_release);
+    const max_time: i64 = @max(now_unix, build_time);
+    const span = max_time - min_time;
+    const kms_time: i64 = if (span > 0)
+        min_time + @as(i64, @intCast(rng.uintLessThan(u64, @intCast(span))))
+    else
+        min_time;
+
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(kms_time) };
+    const yad = epoch.getEpochDay().calculateYearDay();
+
+    var b: [6][16]u8 = undefined;
+    const platform = itoc(&b[0], @intCast(getPlatformId(data, resolved_build)), 5);
+    const group = itoc(&b[1], csvlk.group_id, 5);
+    const key_hi = itoc(&b[2], key_id / 1_000_000, 3);
+    const key_lo = itoc(&b[3], key_id % 1_000_000, 6);
+    const yday = itoc(&b[4], yad.day + 1, 3);
+    const year = itoc(&b[5], yad.year, 4);
+
+    return std.fmt.bufPrint(out, "{s}-{s}-{s}-{s}-03-{d}-{d}.0000-{s}{s}", .{
+        platform, group, key_hi, key_lo, resolved_lang, resolved_build, yday, year,
+    }) catch unreachable;
+}
+
+// ---------------------------------------------------------------------------
+// Client list (strict mode, `--maintain-clients`)
+// ---------------------------------------------------------------------------
+
+/// Per-app client machine list (mirrors the C `ClientList_t`).
+pub const ClientList = struct {
+    guids: [max_clients]Guid,
+    current_count: usize,
+    max_count: usize,
+    current_position: usize,
+};
+
+/// Mutable client-list state, one list per app. Owned by the server and passed
+/// via `ServerConfig.client_lists` (a `?*` keeps `ServerConfig` usable as const
+/// while still allowing the lists to mutate). The spin mutex guards concurrent
+/// access from the per-connection worker threads.
+pub const ClientLists = struct {
+    lists: []ClientList,
+    mutex: std.atomic.Mutex = .unlocked,
+};
+
+/// Initialize the client lists (mirrors the C `InitializeClientLists`). With
+/// `start_empty` false, each app's list is pre-filled with `NCountPolicy/2 - 1`
+/// random CMIDs so that half the slots look occupied.
+pub fn initClientLists(
+    lists: *ClientLists,
+    data: *const kmsdata.KmsData,
+    start_empty: bool,
+    rng: std.Random,
+) void {
+    const apps = data.apps();
+    for (lists.lists, 0..) |*cl, i| {
+        cl.* = std.mem.zeroes(ClientList);
+        if (start_empty) continue;
+        const max_count: usize = apps[i].n_count_policy;
+        const half: usize = max_count >> 1;
+        const prefill: usize = if (half > 0) half - 1 else 0;
+        cl.current_count = prefill;
+        cl.max_count = max_count;
+        var j: usize = 0;
+        while (j < prefill) : (j += 1) rng.bytes(&cl.guids[j]);
+    }
+}
+
 /// Build the unencrypted base response. Returns an HRESULT (0 = S_OK).
 /// This is the non-strict (no client list) path plus whitelist/time checks,
 /// matching `CreateResponseBaseCallback` with `MaintainClients` off.
@@ -323,6 +523,7 @@ pub fn createResponseBase(
     cfg: *const ServerConfig,
     request: *const Request,
     response: *Response,
+    rng: std.Random,
     now_unix: i64,
 ) i32 {
     const min_clients = request.n_policy;
@@ -358,10 +559,74 @@ pub fn createResponseBase(
 
     const epid_index: usize = if (index_opt) |i| kms_items[i].epid_index else 0;
 
-    const min_active_clients = cfg.data.csvlk[epid_index].min_active_clients;
-    response.count = @max(required_clients, min_active_clients);
+    // Client count: strict mode tracks per-app CMIDs; otherwise answer the
+    // minimum active clients (mirrors `CreateResponseBaseCallback`).
+    if (cfg.maintain_clients) {
+        const app_index: usize = if (index_opt) |i| kms_items[i].app_index else 0;
+        if (cfg.client_lists) |cl| {
+            while (!cl.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer cl.mutex.unlock();
+            const list = &cl.lists[app_index];
+            const required: usize = required_clients;
+            // Cap the logical list size at MAX_CLIENTS so the fixed-size GUID
+            // ring buffer is never indexed out of bounds (the C reference can
+            // overrun `Guid[MAX_CLIENTS]` here when N_Policy is maliciously
+            // large; we keep the same ring-buffer semantics safely).
+            if (required > list.max_count) list.max_count = @min(required, max_clients);
 
-    setEpid(response, cfg.data.csvlk[epid_index].epid) catch return hresult.invalid_arg;
+            const zero = zeroGuid();
+            var i: usize = 0;
+            var known = false;
+            while (i < list.max_count) : (i += 1) {
+                if (guidEqual(&list.guids[i], &request.cmid)) {
+                    known = true;
+                    break;
+                }
+            }
+
+            if (known) {
+                response.count = @intCast(list.current_count);
+            } else {
+                i = 0;
+                while (i < list.max_count) : (i += 1) {
+                    if (guidEqual(&list.guids[i], &zero)) {
+                        if (list.current_count >= max_clients) return hresult.too_many_clients;
+                        list.current_count += 1;
+                        response.count = @intCast(list.current_count);
+                        list.guids[i] = request.cmid;
+                        break;
+                    }
+                }
+                if (i >= list.max_count) {
+                    // No empty slot: evict the oldest entry (ring buffer).
+                    const pos = list.current_position;
+                    list.guids[pos] = request.cmid;
+                    const wrap: usize = @min(list.max_count, max_clients);
+                    list.current_position = (pos + 1) % wrap;
+                    response.count = @intCast(list.current_count);
+                }
+            }
+        } else {
+            const min_active_clients = cfg.data.csvlk[epid_index].min_active_clients;
+            response.count = @max(required_clients, min_active_clients);
+        }
+    } else {
+        const min_active_clients = cfg.data.csvlk[epid_index].min_active_clients;
+        response.count = @max(required_clients, min_active_clients);
+    }
+
+    // ePID source (mirrors the C `getEpid`): override (--epid / level-1 cache)
+    // > per-request randomization (level 2) > the .kmd default.
+    const override: ?[]const u8 = if (cfg.epid_overrides.len > epid_index) cfg.epid_overrides[epid_index] else null;
+    var pid_buf: [pid_buffer_size]u8 = undefined;
+    const pid: []const u8 = if (override) |p|
+        p
+    else if (cfg.randomization_level == 2)
+        generateRandomPid(cfg.data, epid_index, &pid_buf, @intCast(cfg.lcid), @intCast(cfg.build), rng, cfg.use_ndr64, now_unix)
+    else
+        cfg.data.csvlk[epid_index].epid;
+
+    setEpid(response, pid) catch return hresult.invalid_arg;
 
     response.version = request.version;
     response.cmid = request.cmid;
@@ -414,11 +679,12 @@ pub fn createResponseV4(
     request: *const RequestV4,
     out: *align(@alignOf(ResponseV4)) [max_response_size]u8,
     cfg: *const ServerConfig,
+    rng: std.Random,
     now_unix: i64,
 ) i32 {
     const response: *ResponseV4 = @ptrCast(out);
 
-    const hresult_code = createResponseBase(cfg, &request.base, &response.base, now_unix);
+    const hresult_code = createResponseBase(cfg, &request.base, &response.base, rng, now_unix);
     if (hresult_code != hresult.ok) return hresult_code;
 
     const pid_size = response.base.pid_size;
@@ -476,7 +742,7 @@ pub fn createResponseV6(
     xorBlock(&request.iv, &response.random_xored_ivs);
 
     // 4. Base response.
-    const hresult_code = createResponseBase(cfg, &request.base, &response.base, now_unix);
+    const hresult_code = createResponseBase(cfg, &request.base, &response.base, rng, now_unix);
     if (hresult_code != hresult.ok) return hresult_code;
 
     // 5. Compact the variable-length ePID.
@@ -711,6 +977,54 @@ test "filetime conversion" {
     try std.testing.expectEqual(@as(i64, 1_700_000_000), fileTimeToUnixTime(unixTimeToFileTime(1_700_000_000)));
 }
 
+test "generateRandomPid format" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var prng = std.Random.DefaultPrng.init(0xDEAD_BEEF);
+    var buf: [pid_buffer_size]u8 = undefined;
+    // CSVLC 0 (Windows), fixed LCID 1033 and build 17763.
+    const pid = generateRandomPid(&td.data, 0, &buf, 1033, 17763, prng.random(), true, 1_700_000_000);
+
+    // platform(5)-group(5)-keyHi(3)-keyLo(6)-03-lang-build.0000-yday(3)year(4)
+    try std.testing.expectEqualStrings("03612", pid[0..5]); // platform id for 17763
+    try std.testing.expectEqual('-', pid[5]);
+    try std.testing.expectEqualStrings("00206", pid[6..11]); // Windows group id
+    try std.testing.expectEqual('-', pid[11]);
+    try std.testing.expectEqual('-', pid[15]);
+    try std.testing.expectEqual('-', pid[22]);
+    try std.testing.expectEqualStrings("03", pid[23..25]);
+    try std.testing.expectEqualStrings("1033", pid[26..30]); // fixed LCID
+    try std.testing.expectEqualStrings("17763", pid[31..36]); // fixed build
+    try std.testing.expectEqualStrings(".0000", pid[36..41]);
+    try std.testing.expectEqual('-', pid[41]);
+    try std.testing.expectEqual(@as(usize, 49), pid.len);
+
+    // keyId must fall within [MinKeyId, MaxKeyId) for CSVLC 0.
+    const key_hi = try std.fmt.parseInt(u32, pid[12..15], 10);
+    const key_lo = try std.fmt.parseInt(u32, pid[16..22], 10);
+    const key_id = key_hi * 1_000_000 + key_lo;
+    const csvlk = td.data.csvlk[0];
+    try std.testing.expect(key_id >= csvlk.min_key_id);
+    try std.testing.expect(key_id < csvlk.max_key_id);
+}
+
+test "generateRandomPid random lang/build" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var buf: [pid_buffer_size]u8 = undefined;
+    // lang < 1 → random LCID; host_build 0 → random build.
+    const pid = generateRandomPid(&td.data, 0, &buf, 0, 0, prng.random(), true, 1_700_000_000);
+
+    // The middle is always "-03-" and the tail is ".0000-yday(3)year(4)".
+    try std.testing.expect(std.mem.indexOf(u8, pid, "-03-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pid, ".0000-") != null);
+}
+
 const TestData = struct {
     raw: []u8,
     data: kmsdata.KmsData,
@@ -746,6 +1060,79 @@ fn makeBase(data: *const kmsdata.KmsData, version: u32) Request {
     return base;
 }
 
+test "client list insert and lookup" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    const storage = try alloc.alloc(ClientList, td.data.apps().len);
+    defer alloc.free(storage);
+    var lists: ClientLists = .{ .lists = storage };
+    var prng = std.Random.DefaultPrng.init(0);
+    initClientLists(&lists, &td.data, true, prng.random()); // start empty
+
+    var cfg = ServerConfig{ .data = &td.data, .maintain_clients = true, .client_lists = &lists };
+    var base = makeBase(&td.data, 6 << 16);
+    var resp: Response = undefined;
+    const rng = prng.random();
+
+    // A brand-new CMID increments the count.
+    base.cmid = [_]u8{1} ** 16;
+    try std.testing.expectEqual(@as(i32, 0), createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
+    try std.testing.expectEqual(@as(u32, 1), resp.count);
+
+    // The same CMID is already known: count unchanged.
+    try std.testing.expectEqual(@as(i32, 0), createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
+    try std.testing.expectEqual(@as(u32, 1), resp.count);
+
+    // A different CMID increments again.
+    base.cmid = [_]u8{2} ** 16;
+    try std.testing.expectEqual(@as(i32, 0), createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
+    try std.testing.expectEqual(@as(u32, 2), resp.count);
+}
+
+test "client list ring eviction" {
+    const Cmid = struct {
+        fn make(v: u64) Guid {
+            var g: Guid = undefined;
+            std.mem.writeInt(u64, g[0..8], v, .little);
+            @memset(g[8..16], 0);
+            return g;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    const storage = try alloc.alloc(ClientList, td.data.apps().len);
+    defer alloc.free(storage);
+    var lists: ClientLists = .{ .lists = storage };
+    var prng = std.Random.DefaultPrng.init(0);
+    initClientLists(&lists, &td.data, true, prng.random());
+
+    var cfg = ServerConfig{ .data = &td.data, .maintain_clients = true, .client_lists = &lists };
+    var base = makeBase(&td.data, 6 << 16);
+    base.n_policy = 25; // required_clients = 50 → max_count = 50
+    var resp: Response = undefined;
+    const rng = prng.random();
+
+    // Fill all 50 slots (start at 1: an all-zero GUID is the empty-slot mark).
+    for (0..50) |i| {
+        base.cmid = Cmid.make(i + 1);
+        try std.testing.expectEqual(@as(i32, 0), createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
+    }
+    try std.testing.expectEqual(@as(usize, 50), lists.lists[0].current_count);
+
+    // No empty slot: the oldest entry (position 0) is evicted.
+    const newest = Cmid.make(999);
+    base.cmid = newest;
+    try std.testing.expectEqual(@as(i32, 0), createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
+    try std.testing.expectEqual(@as(u32, 50), resp.count);
+    try std.testing.expect(guidEqual(&lists.lists[0].guids[0], &newest));
+    try std.testing.expectEqual(@as(usize, 1), lists.lists[0].current_position);
+}
+
 test "v4 request/response round-trip" {
     const alloc = std.testing.allocator;
     var td = try loadTestData(alloc);
@@ -757,8 +1144,9 @@ test "v4 request/response round-trip" {
     var request: RequestV4 = undefined;
     createRequestV4(&request, &base);
 
+    var prng = std.Random.DefaultPrng.init(0x1234_5678);
     var out: [max_response_size]u8 align(4) = undefined;
-    const resp_len: usize = @intCast(createResponseV4(&request, &out, &cfg, 1_700_000_000));
+    const resp_len: usize = @intCast(createResponseV4(&request, &out, &cfg, prng.random(), 1_700_000_000));
     try std.testing.expect(resp_len > 0);
 
     var resp: ResponseV4 = undefined;

@@ -1,4 +1,6 @@
 const std = @import("std");
+/// The project version, read from `build.zig.zon` (single source of truth).
+const version = @import("build.zig.zon").version;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -6,6 +8,7 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("vlmzsd", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .link_libc = true,
     });
 
     // External dependency: zig-clap for CLI argument parsing.
@@ -14,6 +17,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const clap_mod = clap_dep.module("clap");
+
+    // Expose the project version to source via `@import("build_options")`.
+    const version_options = b.addOptions();
+    version_options.addOption([]const u8, "version", version);
 
     const exe = b.addExecutable(.{
         .name = "vlmzsd",
@@ -27,6 +34,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    exe.root_module.addOptions("build_options", version_options);
 
     const exe_install = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&exe_install.step);
@@ -45,6 +54,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    vlmzs_exe.root_module.addOptions("build_options", version_options);
 
     const vlmzs_install = b.addInstallArtifact(vlmzs_exe, .{});
     b.getInstallStep().dependOn(&vlmzs_install.step);
@@ -74,7 +85,14 @@ pub fn build(b: *std.Build) void {
 
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const vlmzs_tests = b.addTest(.{
+        .root_module = vlmzs_exe.root_module,
+    });
+
+    const run_vlmzs_tests = b.addRunArtifact(vlmzs_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_vlmzs_tests.step);
 }

@@ -311,7 +311,7 @@ pub fn dispatchKmsRequest(
     if (major_ver == 4) {
         var request_v4: kms.RequestV4 = undefined;
         @memcpy(std.mem.asBytes(&request_v4)[0..kms_request_size], request_body[data_offset..][0..kms_request_size]);
-        response_size = kms.createResponseV4(&request_v4, &kms_response_buf, cfg, now_unix);
+        response_size = kms.createResponseV4(&request_v4, &kms_response_buf, cfg, rng, now_unix);
     } else {
         var request_v6: kms.RequestV6 = undefined;
         @memcpy(std.mem.asBytes(&request_v6)[0..kms_request_size], request_body[data_offset..][0..kms_request_size]);
@@ -702,4 +702,56 @@ test "dispatch v6 request end-to-end" {
     var resp: kms.ResponseV6 = undefined;
     const result = kms.decryptResponseV6(&resp, parsed.data.len, @constCast(parsed.data), &request_client, null);
     try std.testing.expect(result.ok());
+}
+
+test "BTFN bind negotiation round-trip" {
+    const alloc = std.testing.allocator;
+
+    // Client BIND requesting NDR32 + NDR64 + BTFN.
+    const bind_req = try buildBindRequest(alloc, packet_type.bind_req, 2, .{
+        .use_ndr64 = true,
+        .use_btfn = true,
+        .multiplexed = false,
+    });
+    defer alloc.free(bind_req);
+
+    // Server BIND_ACK with NDR64 and BTFN enabled.
+    var negotiation = BindNegotiation{};
+    const resp_body = try buildBindResponse(alloc, bind_req[header_size..], 0, .{
+        .use_ndr64 = true,
+        .use_btfn = true,
+        .secondary_address = "1688",
+    }, &negotiation);
+    defer alloc.free(resp_body);
+
+    const result = parseBindResponse(resp_body);
+    // With NDR64 negotiated, NDR32 is declined (Microsoft behavior).
+    try std.testing.expect(!result.has_ndr32);
+    try std.testing.expect(result.has_ndr64);
+    try std.testing.expect(result.has_btfn);
+    try std.testing.expectEqual(@as(u16, 0), negotiation.ndr_ctx);
+    try std.testing.expectEqual(@as(u16, 1), negotiation.ndr64_ctx);
+}
+
+test "BTFN declined when disabled" {
+    const alloc = std.testing.allocator;
+
+    const bind_req = try buildBindRequest(alloc, packet_type.bind_req, 2, .{
+        .use_ndr64 = false,
+        .use_btfn = true,
+        .multiplexed = false,
+    });
+    defer alloc.free(bind_req);
+
+    var negotiation = BindNegotiation{};
+    const resp_body = try buildBindResponse(alloc, bind_req[header_size..], 0, .{
+        .use_ndr64 = false,
+        .use_btfn = false,
+    }, &negotiation);
+    defer alloc.free(resp_body);
+
+    const result = parseBindResponse(resp_body);
+    try std.testing.expect(result.has_ndr32);
+    try std.testing.expect(!result.has_ndr64);
+    try std.testing.expect(!result.has_btfn);
 }
