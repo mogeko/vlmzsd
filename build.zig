@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("vlmzsd", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .link_libc = true,
     });
 
     // External dependency: zig-clap for CLI argument parsing.

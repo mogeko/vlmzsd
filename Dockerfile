@@ -31,7 +31,7 @@ COPY ./README.md /opt/app/README.md
 
 RUN /opt/builder/zig build --release=safe
 
-FROM gcr.io/distroless/static-debian13:latest
+FROM gcr.io/distroless/cc-debian13:latest
 
 COPY --from=builder /opt/app/zig-out/bin/vlmzsd /usr/bin/vlmzsd
 COPY --from=builder /opt/app/zig-out/bin/vlmzs /usr/bin/vlmzs
@@ -41,3 +41,4 @@ COPY --from=builder /opt/app/README.md /usr/share/doc/vlmzsd/README.md
 EXPOSE 1688/tcp
 
 ENTRYPOINT ["/usr/bin/vlmzsd"]
+
