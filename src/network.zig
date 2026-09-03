@@ -104,7 +104,10 @@ pub fn serveRpc(
             defer allocator.free(resp_body);
 
             const resp_packet: u8 = if (action == 0) rpc.packet_type.bind_ack else rpc.packet_type.alter_context_ack;
-            try writePacket(writer, resp_packet, header.call_id, resp_body, rpc.packet_flags.first | rpc.packet_flags.last);
+            // BIND_ACK echoes the request's packet flags (incl. MULTIPLEX);
+            // ALTER_CONTEXT_ACK always uses FIRST|LAST (matches the reference).
+            const resp_flags: u8 = if (action == 0) header.packet_flags else rpc.packet_flags.first | rpc.packet_flags.last;
+            try writePacket(writer, resp_packet, header.call_id, resp_body, resp_flags);
         } else {
             const dispatch = try rpc.dispatchKmsRequest(allocator, request_body, &negotiation, options.cfg, rng, now_unix);
             switch (dispatch) {
@@ -120,7 +123,8 @@ pub fn serveRpc(
                 },
                 .response => |resp_body| {
                     defer allocator.free(resp_body);
-                    try writePacket(writer, rpc.packet_type.response, header.call_id, resp_body, rpc.packet_flags.first | rpc.packet_flags.last);
+                    // RESPONSE echoes the request's packet flags (incl. MULTIPLEX).
+                    try writePacket(writer, rpc.packet_type.response, header.call_id, resp_body, header.packet_flags);
                 },
             }
         }
