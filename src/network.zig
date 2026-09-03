@@ -238,10 +238,20 @@ fn readPacket(allocator: Allocator, reader: *Io.Reader) ![]u8 {
 // Socket glue
 // ---------------------------------------------------------------------------
 
-/// Connect to `address:port` (IPv4/IPv6 literal). `address_family` (0 = any,
-/// 4 = IPv4-only, 6 = IPv6-only) filters the literal's address family.
+/// Connect to `address:port`, accepting an IPv4/IPv6 literal or a host name
+/// (resolved via the Io DNS lookup). `address_family` (0 = any, 4 = IPv4-only,
+/// 6 = IPv6-only) filters the address family.
 pub fn connect(io: Io, address: []const u8, port: u16, address_family: u8) !Io.net.Stream {
-    const ip = try Io.net.IpAddress.parse(address, port);
+    if (Io.net.IpAddress.parse(address, port)) |ip| {
+        return connectIpAddress(io, ip, address_family);
+    } else |_| {}
+
+    const host = try Io.net.HostName.init(address);
+    return connectHostName(io, host, port, address_family);
+}
+
+/// Connect to a parsed IP literal, rejecting a mismatched address family.
+fn connectIpAddress(io: Io, ip: Io.net.IpAddress, address_family: u8) !Io.net.Stream {
     switch (address_family) {
         4 => switch (ip) {
             .ip4 => {},
@@ -254,6 +264,45 @@ pub fn connect(io: Io, address: []const u8, port: u16, address_family: u8) !Io.n
         else => {},
     }
     return Io.net.IpAddress.connect(&ip, io, .{ .mode = .stream });
+}
+
+/// Resolve `host` and connect to the first reachable address, filtering by
+/// `address_family` (mirrors the C `getaddrinfo` `ai_family` behavior).
+fn connectHostName(io: Io, host: Io.net.HostName, port: u16, address_family: u8) !Io.net.Stream {
+    const family: ?Io.net.IpAddress.Family = switch (address_family) {
+        4 => .ip4,
+        6 => .ip6,
+        else => null,
+    };
+
+    var canonical_buf: [Io.net.HostName.max_len]u8 = undefined;
+    var result_buf: [32]Io.net.HostName.LookupResult = undefined;
+    var queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&result_buf);
+
+    try Io.net.HostName.lookup(host, io, &queue, .{
+        .port = port,
+        .canonical_name_buffer = &canonical_buf,
+        .family = family,
+    });
+
+    var last_err: ?Io.net.IpAddress.ConnectError = null;
+    while (queue.getOne(io)) |result| {
+        switch (result) {
+            .address => |addr| {
+                const stream = Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch |err| {
+                    last_err = err;
+                    continue;
+                };
+                return stream;
+            },
+            .canonical_name => continue,
+        }
+    } else |err| switch (err) {
+        error.Canceled => return err,
+        error.Closed => {},
+    }
+
+    return last_err orelse error.UnknownHostName;
 }
 
 /// Listen on `address:port`.
