@@ -39,17 +39,11 @@ const params = clap.parseParamsComptime(
     \\    --whitelist <u32>            Whitelisting level 0-3 (default 0).
     \\    --ip-protection <u8>         Public-IP protection level 0-3 (default 0).
     \\    --check-client-time          Validate client timestamp.
-    \\    --no-check-client-time       Do not validate client timestamp.
     \\    --maintain-clients           Keep client list across requests.
-    \\    --no-maintain-clients        Do not keep client list.
     \\    --start-empty                Start with empty client list.
-    \\    --ndr64                      Use NDR64 transfer syntax (default on).
-    \\    --no-ndr64                   Do not use NDR64.
-    \\    --btfn                       Use bind-time feature negotiation.
-    \\    --no-btfn                    Do not use BTFN.
+    \\    --no-ndr64                   Disable NDR64 transfer syntax (default on).
+    \\    --no-btfn                    Disable bind-time feature negotiation (default on).
     \\    --disconnect-per-request     Disconnect after each request.
-    \\    --foreground                 Run in the foreground (default).
-    \\    --no-foreground              Run in the background.
     \\    --pid-file <str>             Write PID to file.
     \\-v, --verbose                    Verbose logging.
     \\-q, --quiet                      Quiet logging (warnings/errors only).
@@ -75,9 +69,8 @@ const ServerOptions = struct {
     maintain_clients: bool = false,
     start_empty: bool = false,
     ndr64: bool = true,
-    btfn: bool = false,
+    btfn: bool = true,
     disconnect_per_request: bool = false,
-    foreground: bool = true,
     pid_file: ?[]const u8 = null,
     verbose: bool = false,
     quiet: bool = false,
@@ -96,15 +89,15 @@ fn envGet(env: *const EnvironMap, name: []const u8) ?[]const u8 {
     return env.get(name);
 }
 
-fn resolveBool(
+/// Resolve a single boolean flag: the flag flips the default; the env var
+/// supplies an explicit value.
+fn resolveFlag(
     cli_flag: usize,
-    cli_no_flag: usize,
     env: *const EnvironMap,
     env_name: []const u8,
     default: bool,
 ) !bool {
-    if (cli_flag != 0) return true;
-    if (cli_no_flag != 0) return false;
+    if (cli_flag != 0) return !default;
     if (envGet(env, env_name)) |s| return cli_helper.parseBool(s);
     return default;
 }
@@ -172,14 +165,11 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, args: anytype, log: *c
     const renewal_interval = @field(args, "renewal-interval");
     const ip_protection = @field(args, "ip-protection");
     const check_client_time = @field(args, "check-client-time");
-    const no_check_client_time = @field(args, "no-check-client-time");
     const maintain_clients = @field(args, "maintain-clients");
-    const no_maintain_clients = @field(args, "no-maintain-clients");
     const start_empty = @field(args, "start-empty");
     const no_ndr64 = @field(args, "no-ndr64");
     const no_btfn = @field(args, "no-btfn");
     const disconnect_per_request = @field(args, "disconnect-per-request");
-    const no_foreground = @field(args, "no-foreground");
     const pid_file = @field(args, "pid-file");
 
     var opts = ServerOptions{};
@@ -218,15 +208,14 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, args: anytype, log: *c
     opts.whitelist = try resolveInt(u32, args.whitelist, env, "VLMZSD_WHITELIST", 0);
     opts.ip_protection = try resolveInt(u8, ip_protection, env, "VLMZSD_IP_PROTECTION", 0);
 
-    opts.check_client_time = try resolveBool(check_client_time, no_check_client_time, env, "VLMZSD_CHECK_CLIENT_TIME", false);
-    opts.maintain_clients = try resolveBool(maintain_clients, no_maintain_clients, env, "VLMZSD_MAINTAIN_CLIENTS", false);
-    opts.start_empty = try resolveBool(start_empty, 0, env, "VLMZSD_START_EMPTY", false);
+    opts.check_client_time = try resolveFlag(check_client_time, env, "VLMZSD_CHECK_CLIENT_TIME", false);
+    opts.maintain_clients = try resolveFlag(maintain_clients, env, "VLMZSD_MAINTAIN_CLIENTS", false);
+    opts.start_empty = try resolveFlag(start_empty, env, "VLMZSD_START_EMPTY", false);
 
-    opts.ndr64 = try resolveBool(args.ndr64, no_ndr64, env, "VLMZSD_NDR64", true);
-    opts.btfn = try resolveBool(args.btfn, no_btfn, env, "VLMZSD_BTFN", false);
-    opts.disconnect_per_request = try resolveBool(disconnect_per_request, 0, env, "VLMZSD_DISCONNECT_PER_REQUEST", false);
+    opts.ndr64 = try resolveFlag(no_ndr64, env, "VLMZSD_NDR64", true);
+    opts.btfn = try resolveFlag(no_btfn, env, "VLMZSD_BTFN", true);
+    opts.disconnect_per_request = try resolveFlag(disconnect_per_request, env, "VLMZSD_DISCONNECT_PER_REQUEST", false);
 
-    opts.foreground = try resolveBool(args.foreground, no_foreground, env, "VLMZSD_FOREGROUND", true);
     opts.pid_file = resolveStr(pid_file, env, "VLMZSD_PID_FILE", null);
     opts.verbose = args.verbose != 0;
     opts.quiet = args.quiet != 0;
@@ -243,7 +232,6 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, args: anytype, log: *c
     if (opts.btfn) log.warn("--btfn is not yet implemented", .{});
     if (opts.disconnect_per_request) log.warn("--disconnect-per-request is not yet implemented", .{});
     if (opts.timeout_seconds != 30) log.warn("--timeout is not yet enforced", .{});
-    if (!opts.foreground) log.warn("background mode is not supported; daemonization is the supervisor's job", .{});
     if (opts.pid_file != null) log.warn("--pid-file is not yet implemented", .{});
 
     return opts;

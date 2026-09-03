@@ -38,12 +38,9 @@ const params = clap.parseParamsComptime(
     \\-x, --list-products         Print available products and exit.
     \\-t, --license-status <u32>  LicenseStatus field (0-6, default 1).
     \\-T, --reconnect-per-request Reconnect for each request.
-    \\    --multiplexed           Use multiplexed RPC (default on).
-    \\    --no-multiplexed        Do not use multiplexed RPC.
-    \\    --ndr64                 Use NDR64 (default on).
-    \\    --no-ndr64              Do not use NDR64.
-    \\    --btfn                  Use bind-time feature negotiation.
-    \\    --no-btfn               Do not use BTFN.
+    \\    --no-multiplexed        Disable multiplexed RPC (default on).
+    \\    --no-ndr64              Disable NDR64 (default on).
+    \\    --no-btfn               Disable bind-time feature negotiation (default on).
     \\-v, --verbose               Verbose logging.
     \\<str>                       KMS server host[:port].
     \\
@@ -70,7 +67,7 @@ const ClientOptions = struct {
     reconnect_per_request: bool = false,
     multiplexed: bool = true,
     ndr64: bool = true,
-    btfn: bool = false,
+    btfn: bool = true,
     verbose: bool = false,
 };
 
@@ -137,9 +134,9 @@ fn resolveOptions(args: anytype, positionals: anytype, log: *cli_helper.Logger) 
     opts.list_products = list_products != 0;
     opts.license_status = license_status orelse 1;
     opts.reconnect_per_request = reconnect_per_request != 0;
-    opts.multiplexed = args.multiplexed != 0 or no_multiplexed == 0;
-    opts.ndr64 = args.ndr64 != 0 or no_ndr64 == 0;
-    opts.btfn = args.btfn != 0 and no_btfn == 0;
+    opts.multiplexed = no_multiplexed == 0;
+    opts.ndr64 = no_ndr64 == 0;
+    opts.btfn = no_btfn == 0;
     opts.verbose = args.verbose != 0;
 
     if (opts.grace != 0) log.warn("--grace is not yet applied", .{});

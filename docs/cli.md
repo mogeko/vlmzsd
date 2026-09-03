@@ -113,23 +113,22 @@ Grouped by concern (help is rendered in these groups).
 | `--renewal-interval <dur>` | | `7d` | `VLMZSD_RENEWAL_INTERVAL` | VL renewal interval |
 | `--whitelist <0..3>` | | `0` | `VLMZSD_WHITELIST` | whitelisting level |
 | `--ip-protection <0..3>` | | `0` | `VLMZSD_IP_PROTECTION` | public-IP protection level |
-| `--check-client-time` / `--no-check-client-time` | | off | `VLMZSD_CHECK_CLIENT_TIME` | validate client timestamp |
-| `--maintain-clients` / `--no-maintain-clients` | | off | `VLMZSD_MAINTAIN_CLIENTS` | keep client list across requests |
+| `--check-client-time` | | off | `VLMZSD_CHECK_CLIENT_TIME` | validate client timestamp |
+| `--maintain-clients` | | off | `VLMZSD_MAINTAIN_CLIENTS` | keep client list across requests |
 | `--start-empty` | | off | `VLMZSD_START_EMPTY` | start with empty client list |
 
 ### Protocol
 
 | Option | Short | Default | Env var | Notes |
 |---|---|---|---|---|
-| `--ndr64` / `--no-ndr64` | | on | `VLMZSD_NDR64` | NDR64 transfer syntax |
-| `--btfn` / `--no-btfn` | | off | `VLMZSD_BTFN` | bind-time feature negotiation |
+| `--no-ndr64` | | on | `VLMZSD_NDR64` | disable NDR64 transfer syntax |
+| `--no-btfn` | | on | `VLMZSD_BTFN` | disable bind-time feature negotiation |
 | `--disconnect-per-request` | | off | `VLMZSD_DISCONNECT_PER_REQUEST` | disconnect after each request |
 
 ### Process
 
 | Option | Short | Default | Env var | Notes |
 |---|---|---|---|---|
-| `--foreground` / `--no-foreground` | | on | `VLMZSD_FOREGROUND` | foreground is the default: logging is stdout-only and daemonization/file logging is delegated to systemd/Docker |
 | `--pid-file <file>` | | — | `VLMZSD_PID_FILE` | write PID to file |
 | `--verbose` / `--quiet` | `-v` / `-q` | off | `VLMZSD_VERBOSE` | verbosity of stdout logging |
 
@@ -161,9 +160,9 @@ Docker). This is a deliberate simplification of the C `-l`/`-T`/`-e` options.
 | `--list-products` | `-x` | — | print available products and exit |
 | `--license-status <0..6>` | `-t` | `1` | LicenseStatus field |
 | `--reconnect-per-request` | `-T` | off | reconnect for each request |
-| `--multiplexed` / `--no-multiplexed` | | on | multiplexed RPC |
-| `--ndr64` / `--no-ndr64` | | on | NDR64 transfer syntax |
-| `--btfn` / `--no-btfn` | | off | bind-time feature negotiation |
+| `--no-multiplexed` | | on | disable multiplexed RPC |
+| `--no-ndr64` | | on | disable NDR64 transfer syntax |
+| `--no-btfn` | | on | disable bind-time feature negotiation |
 | `--verbose` | `-v` | off | verbosity |
 
 ### Deferred client options
