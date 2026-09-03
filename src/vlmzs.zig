@@ -15,7 +15,8 @@ const network = vlmzsd.network;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-const version = "0.0.0";
+const build_options = @import("build_options");
+const version = build_options.version;
 const default_port: u16 = 1688;
 const embedded_kmd: []const u8 = @embedFile("vlmcsd.kmd");
 

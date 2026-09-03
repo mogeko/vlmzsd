@@ -1,4 +1,6 @@
 const std = @import("std");
+/// The project version, read from `build.zig.zon` (single source of truth).
+const version = @import("build.zig.zon").version;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -15,6 +17,10 @@ pub fn build(b: *std.Build) void {
     });
     const clap_mod = clap_dep.module("clap");
 
+    // Expose the project version to source via `@import("build_options")`.
+    const version_options = b.addOptions();
+    version_options.addOption([]const u8, "version", version);
+
     const exe = b.addExecutable(.{
         .name = "vlmzsd",
         .root_module = b.createModule(.{
@@ -27,6 +33,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    exe.root_module.addOptions("build_options", version_options);
 
     const exe_install = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&exe_install.step);
@@ -45,6 +53,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    vlmzs_exe.root_module.addOptions("build_options", version_options);
 
     const vlmzs_install = b.addInstallArtifact(vlmzs_exe, .{});
     b.getInstallStep().dependOn(&vlmzs_install.step);
