@@ -1152,6 +1152,136 @@ test "client list ring eviction" {
     try std.testing.expectEqual(@as(usize, 1), lists.lists[0].current_position);
 }
 
+/// Build a minimal in-memory `KmsData` variant (1 CSVLC / 1 app / 1 kms / 1 sku /
+/// 1 host build) with the given CSVLC release date — for boundary tests that
+/// need data outside the embedded `.kmd` (docs/migration.md §5).
+fn makeVariantData(allocator: std.mem.Allocator, release_date: i64) !kmsdata.KmsData {
+    const csvlk = try allocator.alloc(kmsdata.CsvlkData, 1);
+    csvlk[0] = .{
+        .epid = "test",
+        .name = "test",
+        .release_date = release_date,
+        .group_id = 206,
+        .min_key_id = 1,
+        .max_key_id = 2,
+        .min_active_clients = 25,
+    };
+
+    const items = try allocator.alloc(kmsdata.VlmcsdData, 3);
+    items[0] = .{ .guid = [_]u8{1} ** 16, .name = "app", .app_index = 0, .kms_index = 0, .protocol_version = 0, .n_count_policy = 25, .is_retail = 0, .is_preview = 0, .epid_index = 0 };
+    items[1] = .{ .guid = [_]u8{2} ** 16, .name = "kms", .app_index = 0, .kms_index = 0, .protocol_version = 0, .n_count_policy = 25, .is_retail = 0, .is_preview = 0, .epid_index = 0 };
+    items[2] = .{ .guid = [_]u8{3} ** 16, .name = "sku", .app_index = 0, .kms_index = 0, .protocol_version = 6, .n_count_policy = 25, .is_retail = 0, .is_preview = 0, .epid_index = 0 };
+
+    const host_builds = try allocator.alloc(kmsdata.HostBuild, 1);
+    host_builds[0] = .{ .display_name = "test", .release_date = release_date, .build_number = 17763, .platform_id = 3612, .flags = 7 };
+
+    return .{
+        .minor_ver = 0,
+        .major_ver = 2,
+        .flags = 0,
+        .csvlk = csvlk,
+        .items = items,
+        .app_count = 1,
+        .kms_count = 1,
+        .sku_count = 1,
+        .host_builds = host_builds,
+    };
+}
+
+test "required_clients over 2000 rejected" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = ServerConfig{ .data = &td.data };
+    var base = makeBase(&td.data, 6 << 16);
+    base.n_policy = 1001; // required_clients = 2002 > 2000 — docs/migration.md §5
+
+    var prng = std.Random.DefaultPrng.init(0);
+    var resp: Response = undefined;
+    try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+}
+
+test "client time off by more than 4 hours rejected" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = ServerConfig{ .data = &td.data, .check_client_time = true };
+    var base = makeBase(&td.data, 6 << 16);
+    base.client_time = u64ToFileTime(unixTimeToFileTime(1_700_000_000 + 5 * 3600)); // +5 h — docs/migration.md §5
+
+    var prng = std.Random.DefaultPrng.init(0);
+    var resp: Response = undefined;
+    try std.testing.expectEqual(hresult.client_time_mismatch, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+}
+
+test "whitelist rejects unknown product" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = ServerConfig{ .data = &td.data, .whitelisting_level = 1 };
+    var base = makeBase(&td.data, 6 << 16);
+    base.kms_id = [_]u8{0xFF} ** 16; // not in the .kmd — docs/migration.md §5
+
+    var prng = std.Random.DefaultPrng.init(0);
+    var resp: Response = undefined;
+    try std.testing.expectEqual(hresult.product_rejected, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+}
+
+test "client list full rejected" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    const storage = try alloc.alloc(ClientList, td.data.apps().len);
+    defer alloc.free(storage);
+    var lists: ClientLists = .{ .lists = storage };
+    var prng = std.Random.DefaultPrng.init(0);
+    initClientLists(&lists, &td.data, true, prng.random()); // start empty
+
+    // Simulate a full list: count at the cap, empty slots still present.
+    lists.lists[0].current_count = max_clients;
+    lists.lists[0].max_count = max_clients;
+
+    var cfg = ServerConfig{ .data = &td.data, .maintain_clients = true, .client_lists = &lists };
+    var base = makeBase(&td.data, 6 << 16);
+    base.cmid = [_]u8{1} ** 16; // new CMID — docs/migration.md §5
+
+    var resp: Response = undefined;
+    try std.testing.expectEqual(hresult.too_many_clients, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+}
+
+test "overlong ePID rejected" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    // 64 ASCII chars exceed the 63 UCS-2 code unit limit — docs/migration.md §5.
+    const overlong = "0123456789012345678901234567890123456789012345678901234567890123";
+    const overrides = [_]?[]const u8{overlong};
+    var cfg = ServerConfig{ .data = &td.data, .epid_overrides = &overrides };
+    var base = makeBase(&td.data, 6 << 16);
+
+    var prng = std.Random.DefaultPrng.init(0);
+    var resp: Response = undefined;
+    try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+}
+
+test "ePID date span zero or negative" {
+    const alloc = std.testing.allocator;
+    const now: i64 = 1_700_000_000;
+    var data = try makeVariantData(alloc, now + 100); // release_date in the future — docs/migration.md §5
+    defer data.deinit(alloc);
+
+    var prng = std.Random.DefaultPrng.init(0);
+    var out: [pid_buffer_size]u8 = undefined;
+    // span <= 0 → take min_time directly, never `%0` (the C UB fix).
+    const pid = generateRandomPid(&data, 0, &out, 0, 0, prng.random(), true, now);
+    try std.testing.expect(pid.len > 0);
+}
+
 test "v4 request/response round-trip" {
     const alloc = std.testing.allocator;
     var td = try loadTestData(alloc);

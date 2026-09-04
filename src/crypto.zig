@@ -499,3 +499,13 @@ test "v6 CBC reference vectors" {
     defer alloc.free(dec_hex);
     try testutil.expectBytes(dec_hex, "000000000000000000000000000000000000000000000000000000000000000010101010101010101010101010101010"); // from upstream C dump_vectors
 }
+
+test "AesCmacV4 leaves input unchanged" {
+    // Zig uses a separate pad buffer; the C reference wrote the 0x80 padding
+    // byte into the input buffer — docs/migration.md §5.
+    var msg = [_]u8{0xAB} ** 34;
+    const original = msg;
+    var mac: Block = undefined;
+    aesCmacV4(&msg, &mac);
+    try std.testing.expectEqualSlices(u8, &original, &msg);
+}

@@ -529,6 +529,27 @@ test "isPrivateIPAddress ipv4" {
     }
 }
 
+test "IPv4-mapped address private detection" {
+    // A dual-stack socket reports IPv4 peers as ::ffff:a.b.c.d; extract the
+    // embedded IPv4 for an exact decision — docs/migration.md §5.
+    const mapped = struct {
+        fn addr(octets: [4]u8) std.posix.sockaddr.in6 {
+            var sa = std.mem.zeroes(std.posix.sockaddr.in6);
+            sa.family = std.posix.AF.INET6;
+            sa.addr[10] = 0xFF;
+            sa.addr[11] = 0xFF;
+            @memcpy(sa.addr[12..16], &octets);
+            return sa;
+        }
+    };
+
+    var pub6 = mapped.addr(.{ 8, 8, 8, 8 }); // public IPv4
+    try std.testing.expect(!isPrivateIPAddress(@ptrCast(&pub6)));
+
+    var priv6 = mapped.addr(.{ 10, 0, 0, 1 }); // 10/8 private
+    try std.testing.expect(isPrivateIPAddress(@ptrCast(&priv6)));
+}
+
 test "isPrivateIPAddress ipv6" {
     const ipv6 = struct {
         fn addr(bytes: [16]u8) std.posix.sockaddr.in6 {

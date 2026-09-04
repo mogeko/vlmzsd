@@ -843,6 +843,77 @@ test "rejected response wire bytes (NDR64)" {
     try std.testing.expectEqual(@as(u32, 0x8007000D), readLe(u32, body, 24)); // HRESULT
 }
 
+test "dispatch non-zero minor version returns HRESULT" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = kms.ServerConfig{ .data = &td.data };
+    var base = makeBase(&td.data);
+    base.version = (6 << 16) | 1; // non-zero minor — docs/migration.md §5
+
+    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    const rng = prng.random();
+
+    var request_v6: kms.RequestV6 = undefined;
+    kms.createRequestV6(&request_v6, &base, rng);
+
+    var negotiation = BindNegotiation{ .ndr_ctx = 0, .ndr64_ctx = 1 };
+    const e_invalid_arg: i32 = @bitCast(@as(u32, 0x8007000D));
+
+    const rpc_request = try wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), true, 2);
+    defer alloc.free(rpc_request);
+    const dispatch = try dispatchKmsRequest(alloc, rpc_request[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
+    const resp_body = switch (dispatch.kind) {
+        .fault => return error.TestUnexpectedResult,
+        .response => |body| body,
+    };
+    defer alloc.free(resp_body);
+
+    try std.testing.expectEqual(@as(u16, 0), dispatch.major_version);
+    const parsed = parseKmsResponse(resp_body, true);
+    try std.testing.expectEqual(e_invalid_arg, parsed.status);
+}
+
+test "too-short request disconnects" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = kms.ServerConfig{ .data = &td.data };
+    var negotiation = BindNegotiation{ .ndr_ctx = 0, .ndr64_ctx = 1 };
+    var prng = std.Random.DefaultPrng.init(0);
+
+    // Body shorter than request32_fixed_size (16) → disconnect — docs/migration.md §5.
+    try std.testing.expectError(error.InvalidRequest, dispatchKmsRequest(
+        alloc,
+        &[_]u8{0} ** 8,
+        &negotiation,
+        &cfg,
+        prng.random(),
+        1_700_000_000,
+    ));
+}
+
+test "unknown context returns FAULT" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = kms.ServerConfig{ .data = &td.data };
+    var negotiation = BindNegotiation{ .ndr_ctx = 0, .ndr64_ctx = 1 };
+    var prng = std.Random.DefaultPrng.init(0);
+
+    // context_id matches neither negotiated id — docs/migration.md §5.
+    var body: [16]u8 = [_]u8{0} ** 16;
+    std.mem.writeInt(u16, body[4..6], 0xEEEE, .little);
+    const dispatch = try dispatchKmsRequest(alloc, &body, &negotiation, &cfg, prng.random(), 1_700_000_000);
+    switch (dispatch.kind) {
+        .fault => |nca| try std.testing.expectEqual(nca_unk_if, nca),
+        .response => return error.TestUnexpectedResult,
+    }
+}
+
 test "BTFN bind negotiation round-trip" {
     const alloc = std.testing.allocator;
 
