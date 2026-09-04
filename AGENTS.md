@@ -66,6 +66,23 @@ source linked above).
   `--verbose` enables `debug`, `--quiet` drops `info` (see `docs/cli.md`).
 - Tests: byte-level round-trips and golden hex vectors (hard-coded in `src/crypto.zig`).
 
+## CLI implementation decisions
+
+- **Argument parsing: `zig-clap`** (Hejsil/zig-clap) — the closest thing Zig has to a
+  community-standard CLI library (à la Rust `clap`): short/long options, repeatable options,
+  `--opt=value`, and automatic help generation. It is the project's first external dependency
+  (added to `build.zig.zon`). The three-tier env-var precedence is implemented as a thin layer
+  on top of zig-clap's parsed result — independent of the parser choice.
+- **Two entry points share one module.** `src/main.zig` (`vlmzsd`) and `src/vlmzs.zig` (`vlmzs`)
+  both import the `vlmzsd` module; argument parsing and option-to-config mapping live in shared
+  code (e.g. `src/cli_helper.zig`).
+- **Logging: no external library.** Zig has no community-standard log library, and `std.log` does
+  not match the "fixed format, timestamped, stdout/stderr split" requirement. The server uses a
+  hand-written `cli_helper.Logger`; the client (`vlmzs`) is a CLI debugging tool and writes a bare
+  `Output` (stdout/stderr, no timestamp) instead.
+- **Version pinning risk:** zig-clap's `master` tracks Zig master; pin the release tag that
+  supports Zig `0.16.0`.
+
 ## Pitfalls
 
 - `std.Io` / `std.process.Init` are WIP in 0.16 — consult current stdlib source, not older tutorials.

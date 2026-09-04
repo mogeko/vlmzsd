@@ -262,7 +262,36 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 3. Diff BIND (including NDR64 + BTFN) negotiation byte order.
 4. Diff error-path (invalid version / short request) response bytes (already aligned with C behavior; recommended to lock with golden vectors).
 
-## 8. Notes
+## 8. CLI surface changes
+
+The CLI is redesigned relative to the C `vlmcsd`/`vlmcs` getopt + INI surface
+(see `docs/cli.md` for the user-facing spec). The changes fall into two groups.
+
+### Dropped C options
+
+| C option(s) | Rationale |
+|---|---|
+| `-i <file>` (INI), client `-G`/`-l` (INI) | no config file by design |
+| `-u`/`-g` (setuid/setgid) | deployment concern (systemd `User=`/`Group=`) |
+| `-s`/`-S`/`-U`/`-W` (NT service) | Windows-only; out of scope for macOS/Linux first |
+| `-F0`/`-F1` (freebind) | exotic; revisit if requested |
+| `-x <level>` (exit-on-warning) | removed; warnings never terminate the server |
+| `-O <vpn>` (TAP adapter) | Windows/OpenVPN-specific; out of scope |
+| `-l syslog\|<file>`, `-T0`/`-T1` | logging is fixed-format (timestamped); supervisor handles files |
+| `-e` (log to stdout) | redundant: `info`→stdout, `warn`/`err`→stderr is the default split |
+| `-Z` (SIGHUP restart) | internal; re-add only if signal handling is needed |
+
+### Deferred client options
+
+These depend on DNS SRV support (`dns_srv.c`), which is not part of the current
+migration surface. They will be added when DNS SRV is implemented:
+
+| Option | C equivalent | Notes |
+|---|---|---|
+| `--no-dns` | `-d` | do not resolve SRV records |
+| `--no-srv-priority` | `-P` | ignore SRV record priority |
+
+## 9. Notes
 
 - The upstream C source ([Wind4/vlmcsd@svn1113](https://github.com/Wind4/vlmcsd/tree/svn1113)) is no longer vendored; it remains a historical reference only.
 - Build uses `build.zig` only; two executables: `vlmzsd` (server) and `vlmzs` (client).
