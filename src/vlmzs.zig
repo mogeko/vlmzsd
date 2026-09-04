@@ -21,6 +21,105 @@ const default_port: u16 = 1688;
 const default_grace_minutes: u32 = 43200;
 const embedded_kmd: []const u8 = @embedFile("vlmcsd.kmd");
 
+/// Bare stdout/stderr writers for the client. The client is a CLI debugging
+/// tool, not a service: its answer (ePID) and `--verbose` protocol dumps go to
+/// stdout, errors go to stderr — no timestamp, no level, matching the C
+/// `vlmcs` client (`printf`/`errorout`). The server-side `cli_helper.Logger`
+/// is deliberately not used here.
+const Output = struct {
+    io: Io,
+    out: std.Io.File.Writer,
+    err: std.Io.File.Writer,
+    /// Guards concurrent `print`/`eprint` calls (the client dispatches
+    /// `--reconnect-per-request` tasks in parallel onto the thread pool).
+    mutex: Io.Mutex = .init,
+
+    fn init(io: Io, out_buf: []u8, err_buf: []u8) Output {
+        return .{
+            .io = io,
+            .out = std.Io.File.writer(std.Io.File.stdout(), io, out_buf),
+            .err = std.Io.File.writer(std.Io.File.stderr(), io, err_buf),
+        };
+    }
+
+    /// Write to stdout and flush (the answer/progress stream).
+    fn print(self: *Output, comptime fmt: []const u8, args: anytype) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.out.interface.print(fmt, args) catch {};
+        self.out.interface.flush() catch {};
+    }
+
+    /// Write to stderr and flush (the error stream).
+    fn eprint(self: *Output, comptime fmt: []const u8, args: anytype) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.err.interface.print(fmt, args) catch {};
+        self.err.interface.flush() catch {};
+    }
+};
+
+/// Format a 16-byte GUID as the canonical `8-4-4-4-12` hex string. The first
+/// three fields are little-endian, the last eight bytes are big-endian — the
+/// mixed layout C `uuid2StringLE` reproduces.
+fn formatGuid(guid: *const kms.Guid, buf: []u8) []const u8 {
+    const data1 = std.mem.readInt(u32, guid[0..4], .little);
+    const data2 = std.mem.readInt(u16, guid[4..6], .little);
+    const data3 = std.mem.readInt(u16, guid[6..8], .little);
+    const data4 = std.mem.readInt(u64, guid[8..16], .big);
+    return std.fmt.bufPrint(buf, "{X:0>8}-{X:0>4}-{X:0>4}-{X:0>4}-{X:0>12}", .{
+        data1,
+        data2,
+        data3,
+        data4 >> 48,
+        data4 & 0xffff_ffff_ffff,
+    }) catch unreachable;
+}
+
+/// Human-readable license status (C `LicenseStatusText`).
+fn licenseStatusText(status: u32) []const u8 {
+    return switch (status) {
+        0 => "Unlicensed",
+        1 => "Licensed",
+        2 => "OOB grace",
+        3 => "OOT grace",
+        4 => "Non-Genuine",
+        5 => "Notification",
+        6 => "Extended grace",
+        else => "Unknown",
+    };
+}
+
+/// Human-readable reason for a server rejection HRESULT (C `displayRequestError`).
+fn rejectionReason(status: u32) ?[]const u8 {
+    return switch (status) {
+        0xC004F042 => "the KMS server has declined to activate the requested product",
+        0x8007000D => "the KMS host cannot handle this product (it only supports legacy protocol versions)",
+        0xC004F06C => "the time stamp differs too much from the KMS server time",
+        0xC004D104 => "the security processor reported that invalid data was used",
+        1 => "an RPC protocol error occurred",
+        else => null,
+    };
+}
+
+/// Format a Unix timestamp as UTC `YYYY-MM-DD HH:MM:SS` (C verbose dumps use
+/// `strftime("%Y-%m-%d %X", gmtime(...))`).
+fn formatUtc(unix: i64, buf: []u8) []const u8 {
+    const secs: u64 = @intCast(unix);
+    const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
+    const yad = epoch.getEpochDay().calculateYearDay();
+    const mad = yad.calculateMonthDay();
+    const day_secs: u64 = secs % 86400;
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+        @as(u32, yad.year),
+        @as(u32, @intFromEnum(mad.month)) + 1,
+        @as(u32, mad.day_index) + 1,
+        @as(u32, @intCast(day_secs / 3600)),
+        @as(u32, @intCast((day_secs % 3600) / 60)),
+        @as(u32, @intCast(day_secs % 60)),
+    }) catch unreachable;
+}
+
 const params = clap.parseParamsComptime(
     \\-h, --help                  Display this help and exit.
     \\-V, --version               Output version information and exit.
@@ -97,7 +196,7 @@ fn parseHostPort(host_arg: []const u8) !struct { host: []const u8, port: u16 } {
     return .{ .host = host_arg, .port = default_port };
 }
 
-fn resolveOptions(args: anytype, positionals: anytype, log: *cli_helper.Logger) !ClientOptions {
+fn resolveOptions(args: anytype, positionals: anytype, out: *Output) !ClientOptions {
     // zig-clap names hyphenated long options verbatim; access via @field.
     const virtual_clients = @field(args, "virtual-clients");
     const license_status = @field(args, "license-status");
@@ -134,7 +233,7 @@ fn resolveOptions(args: anytype, positionals: anytype, log: *cli_helper.Logger) 
     opts.grace = args.grace orelse default_grace_minutes;
     opts.address_family = address_family orelse 0;
     if (opts.address_family != 0 and opts.address_family != 4 and opts.address_family != 6) {
-        log.err("--address-family must be 4 or 6", .{});
+        out.eprint("error: --address-family must be 4 or 6\n", .{});
         return error.InvalidAddressFamily;
     }
     opts.list_products = list_products != 0;
@@ -224,17 +323,101 @@ fn ucs2ToAscii(pid: *const [64]u16, out: []u8) []const u8 {
     return out[0..i];
 }
 
-fn printResponse(result: kms.ResponseResult, base: *const kms.Response, log: *cli_helper.Logger) void {
-    if (!result.ok()) {
-        log.err("response verification failed", .{});
-        return;
+/// Report each failed response-verification check to stderr (C `displayResponse`).
+fn reportVerificationErrors(result: kms.ResponseResult, out: *Output) void {
+    out.print("\n", .{}); // end the in-progress "Sending ..." line on stdout
+    if (!result.rpc_ok) out.eprint("ERROR: non-zero RPC result code\n", .{});
+    if (!result.decrypt_success) out.eprint("ERROR: decryption of the V5/V6 response failed\n", .{});
+    if (!result.ivs_ok) out.eprint("ERROR: AES CBC initialization vectors of request and response do not match\n", .{});
+    if (!result.pid_length_ok) out.eprint("ERROR: the length of the PID is not valid\n", .{});
+    if (!result.hash_ok) out.eprint("ERROR: computed hash does not match the hash in the response\n", .{});
+    if (!result.client_machine_id_ok) out.eprint("ERROR: client machine GUIDs of request and response do not match\n", .{});
+    if (!result.timestamp_ok) out.eprint("ERROR: time stamps of request and response do not match\n", .{});
+    if (!result.version_ok) out.eprint("ERROR: protocol versions of request and response do not match\n", .{});
+    if (!result.hmac_sha256_ok) out.eprint("ERROR: keyed-hash message authentication code (HMAC) is incorrect\n", .{});
+    if (!result.iv_not_suspicious) out.eprint("WARNING: the KMS server is an emulator (response uses a KMSv5-style IV in KMSv6)\n", .{});
+    if (result.effective_response_size != result.correct_response_size) {
+        out.eprint("WARNING: RPC payload size should be {d} but is {d}\n", .{
+            result.correct_response_size,
+            result.effective_response_size,
+        });
     }
+}
+
+/// Report a server rejection to stderr with a human-readable reason when known
+/// (C `displayRequestError`).
+fn printRejection(status: i32, out: *Output) void {
+    out.print("\n", .{}); // end the in-progress "Sending ..." line on stdout
+    const hr: u32 = @bitCast(status);
+    if (rejectionReason(hr)) |reason| {
+        out.eprint("Error 0x{X:0>8}: {s}\n", .{ hr, reason });
+    } else {
+        out.eprint("Error 0x{X:0>8}\n", .{hr});
+    }
+}
+
+/// Print the activation answer to stdout (C `displayResponse`, non-verbose).
+/// `hwid` is only present for v5+ responses.
+fn printResultSummary(base: *const kms.Response, hwid: ?*const [8]u8, out: *Output) void {
     var epid_buf: [64]u8 = undefined;
     const epid = ucs2ToAscii(&base.kms_pid, &epid_buf);
-    log.info("ePID: {s}", .{epid});
-    log.info("count: {d}  activation interval: {d} min  renewal interval: {d} min", .{
-        base.count, base.vl_activation_interval, base.vl_renewal_interval,
-    });
+    out.print(" -> {s}", .{epid});
+    if (hwid) |h| out.print(" ({X:0>16})", .{std.mem.readInt(u64, h, .big)});
+    out.print("\n", .{});
+}
+
+/// One aligned GUID line with the product name when the GUID is in `list`.
+fn printGuidLine(out: *Output, label: []const u8, guid: *const kms.Guid, list: []const kmsdata.VlmcsdData, buf: []u8) void {
+    if (kms.getProductIndex(guid, list)) |idx| {
+        out.print("{s:<32}: {s} ({s})\n", .{ label, formatGuid(guid, buf), list[idx].name });
+    } else {
+        out.print("{s:<32}: {s}\n", .{ label, formatGuid(guid, buf) });
+    }
+}
+
+/// Verbose per-field request dump (C `logRequestVerbose`).
+fn printRequestVerbose(req: *const kms.Request, data: *const kmsdata.KmsData, out: *Output) void {
+    const major: u16 = @truncate(req.version >> 16);
+    const minor: u16 = @truncate(req.version);
+    var guid_buf: [64]u8 = undefined;
+    var time_buf: [64]u8 = undefined;
+    var ws_buf: [64]u8 = undefined;
+
+    out.print("\nRequest Parameters\n==================\n\n", .{});
+    out.print("Protocol version                : {d}.{d}\n", .{ major, minor });
+    out.print("Client is a virtual machine     : {s}\n", .{if (req.vm_info != 0) "Yes" else "No"});
+    out.print("Licensing status                : {d} ({s})\n", .{ req.license_status, licenseStatusText(req.license_status) });
+    out.print("Remaining time (0 = forever)    : {d} minutes\n", .{req.binding_expiration});
+    printGuidLine(out, "Application ID", &req.app_id, data.apps(), &guid_buf);
+    printGuidLine(out, "SKU ID (aka Activation ID)", &req.act_id, data.skus(), &guid_buf);
+    printGuidLine(out, "KMS ID (aka KMS counted ID)", &req.kms_id, data.kms(), &guid_buf);
+    out.print("Client machine ID               : {s}\n", .{formatGuid(&req.cmid, &guid_buf)});
+    out.print("Previous client machine ID      : {s}\n", .{formatGuid(&req.cmid_prev, &guid_buf)});
+    out.print("Client request timestamp (UTC)  : {s}\n", .{formatUtc(kms.fileTimeToUnixTime(kms.fileTimeToU64(req.client_time)), &time_buf)});
+    out.print("Workstation name                : {s}\n", .{ucs2ToAscii(&req.workstation_name, &ws_buf)});
+    out.print("N count policy (minimum clients): {d}\n", .{req.n_policy});
+    out.print("\n", .{});
+}
+
+/// Verbose per-field response dump (C `logResponseVerbose`).
+fn printResponseVerbose(base: *const kms.Response, hwid: ?*const [8]u8, result: kms.ResponseResult, out: *Output) void {
+    const major: u16 = @truncate(base.version >> 16);
+    const minor: u16 = @truncate(base.version);
+    var epid_buf: [64]u8 = undefined;
+    var guid_buf: [64]u8 = undefined;
+    var time_buf: [64]u8 = undefined;
+
+    out.print("\n\nResponse from KMS server\n========================\n\n", .{});
+    out.print("Size of KMS Response            : {d} (0x{x})\n", .{ result.effective_response_size, result.effective_response_size });
+    out.print("Protocol version                : {d}.{d}\n", .{ major, minor });
+    out.print("KMS host extended PID           : {s}\n", .{ucs2ToAscii(&base.kms_pid, &epid_buf)});
+    if (hwid) |h| out.print("KMS host Hardware ID            : {X:0>16}\n", .{std.mem.readInt(u64, h, .big)});
+    out.print("Client machine ID               : {s}\n", .{formatGuid(&base.cmid, &guid_buf)});
+    out.print("Client request timestamp (UTC)  : {s}\n", .{formatUtc(kms.fileTimeToUnixTime(kms.fileTimeToU64(base.client_time)), &time_buf)});
+    out.print("KMS host current active clients : {d}\n", .{base.count});
+    out.print("Renewal interval policy         : {d}\n", .{base.vl_renewal_interval});
+    out.print("Activation interval policy      : {d}\n", .{base.vl_activation_interval});
+    out.print("\n", .{});
 }
 
 fn sendRequest(
@@ -243,7 +426,8 @@ fn sendRequest(
     opts: *const ClientOptions,
     base: kms.Request,
     rng: std.Random,
-    log: *cli_helper.Logger,
+    out: *Output,
+    data: *const kmsdata.KmsData,
 ) !void {
     var stream = try network.connect(io, opts.host.?, opts.port, opts.address_family);
     defer stream.close(io);
@@ -262,7 +446,7 @@ fn sendRequest(
 
     const use_ndr64 = if (opts.ndr64 and bind.has_ndr64) true else bind.has_ndr32;
 
-    try sendRequestOn(gpa, &reader.interface, &writer.interface, &call_id, use_ndr64, base, rng, log);
+    try sendRequestOn(gpa, &reader.interface, &writer.interface, &call_id, use_ndr64, base, rng, out, data, opts.verbose);
 }
 
 /// Send one KMS request over an already-established connection (BIND done).
@@ -274,50 +458,64 @@ fn sendRequestOn(
     use_ndr64: bool,
     base: kms.Request,
     rng: std.Random,
-    log: *cli_helper.Logger,
+    out: *Output,
+    data: *const kmsdata.KmsData,
+    verbose: bool,
 ) !void {
     const proto: u16 = @intCast(base.version >> 16);
+    if (verbose) printRequestVerbose(&base, data, out);
+    out.print("Sending activation request (KMS V{d}) ", .{proto});
+
     if (proto == 4) {
         var req: kms.RequestV4 = undefined;
         kms.createRequestV4(&req, &base);
         const sent = try network.clientSendRequest(gpa, reader, writer, call_id, std.mem.asBytes(&req), use_ndr64);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
-            log.err("server rejected request (status 0x{X:0>8})", .{@as(u32, @bitCast(sent.status))});
+            printRejection(sent.status, out);
             return;
         }
         var resp: kms.ResponseV4 = undefined;
         const result = kms.decryptResponseV4(&resp, sent.data.len, sent.data, &req);
-        printResponse(result, &resp.base, log);
+        if (!result.ok()) {
+            reportVerificationErrors(result, out);
+            return;
+        }
+        if (verbose) printResponseVerbose(&resp.base, null, result, out) else printResultSummary(&resp.base, null, out);
     } else {
         var req: kms.RequestV6 = undefined;
         kms.createRequestV6(&req, &base, rng);
         const sent = try network.clientSendRequest(gpa, reader, writer, call_id, std.mem.asBytes(&req), use_ndr64);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
-            log.err("server rejected request (status 0x{X:0>8})", .{@as(u32, @bitCast(sent.status))});
+            printRejection(sent.status, out);
             return;
         }
         var resp: kms.ResponseV6 = undefined;
         const result = kms.decryptResponseV6(&resp, sent.data.len, sent.data, &req, null);
-        printResponse(result, &resp.base, log);
+        if (!result.ok()) {
+            reportVerificationErrors(result, out);
+            return;
+        }
+        if (verbose) printResponseVerbose(&resp.base, &resp.hwid, result, out) else printResultSummary(&resp.base, &resp.hwid, out);
     }
 }
 
 /// One activation request dispatched as a pooled task (via `Group.concurrent`).
 /// Derives its own PRNG from `seed` so concurrent requests never share PRNG
-/// state; failures are logged here rather than propagated.
+/// state; failures are reported here rather than propagated.
 fn sendRequestTask(
     gpa: Allocator,
     io: Io,
     opts: *const ClientOptions,
     base: kms.Request,
     seed: u64,
-    log: *cli_helper.Logger,
+    out: *Output,
+    data: *const kmsdata.KmsData,
 ) void {
     var prng = std.Random.DefaultPrng.init(seed);
-    sendRequest(gpa, io, opts, base, prng.random(), log) catch |e| {
-        log.err("request failed: {s}", .{@errorName(e)});
+    sendRequest(gpa, io, opts, base, prng.random(), out, data) catch |e| {
+        out.eprint("request failed: {s}\n", .{@errorName(e)});
     };
 }
 
@@ -330,7 +528,7 @@ fn sendRequestsReused(
     data: *const kmsdata.KmsData,
     sku_index: usize,
     rng: std.Random,
-    log: *cli_helper.Logger,
+    out: *Output,
 ) !void {
     var stream = try network.connect(io, opts.host.?, opts.port, opts.address_family);
     defer stream.close(io);
@@ -352,14 +550,14 @@ fn sendRequestsReused(
     var i: usize = 0;
     while (i < opts.count) : (i += 1) {
         const base = buildRequestBase(opts, data, sku_index, rng, io);
-        try sendRequestOn(gpa, &reader.interface, &writer.interface, &call_id, use_ndr64, base, rng, log);
+        try sendRequestOn(gpa, &reader.interface, &writer.interface, &call_id, use_ndr64, base, rng, out, data, opts.verbose);
     }
 }
 
-fn listProducts(data: *const kmsdata.KmsData, log: *cli_helper.Logger) void {
-    log.info("You may use these product names or numbers:", .{});
+fn listProducts(data: *const kmsdata.KmsData, out: *Output) void {
+    out.print("You may use these product names or numbers:\n", .{});
     for (data.skus(), 0..) |sku, i| {
-        log.info("{d:>3} = {s}", .{ i + 1, sku.name });
+        out.print("{d:>3} = {s}\n", .{ i + 1, sku.name });
     }
 }
 
@@ -388,16 +586,15 @@ pub fn main(init: std.process.Init) !void {
 
     var out_buf: [4096]u8 = undefined;
     var err_buf: [4096]u8 = undefined;
-    var log = cli_helper.Logger.init(init.io, &out_buf, &err_buf);
+    var out = Output.init(init.io, &out_buf, &err_buf);
 
-    var opts = try resolveOptions(&res.args, res.positionals, &log);
-    if (opts.verbose) log.min_level = .debug;
+    var opts = try resolveOptions(&res.args, res.positionals, &out);
 
     var data = try kmsdata.parse(init.gpa, embedded_kmd);
     defer data.deinit(init.gpa);
 
     if (opts.list_products) {
-        listProducts(&data, &log);
+        listProducts(&data, &out);
         return;
     }
 
@@ -408,7 +605,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const sku_index = findSku(&data, opts.product) catch |e| {
-        log.err("invalid product selector", .{});
+        out.eprint("error: invalid product selector\n", .{});
         return e;
     };
 
@@ -425,17 +622,17 @@ pub fn main(init: std.process.Init) !void {
             var req_prng = std.Random.DefaultPrng.init(seed);
             const base = buildRequestBase(&opts, &data, sku_index, req_prng.random(), init.io);
             group.concurrent(init.io, sendRequestTask, .{
-                init.gpa, init.io, &opts, base, seed, &log,
+                init.gpa, init.io, &opts, base, seed, &out, &data,
             }) catch |e| {
-                log.err("failed to dispatch request: {s}", .{@errorName(e)});
+                out.eprint("failed to dispatch request: {s}\n", .{@errorName(e)});
                 return e;
             };
         }
         try group.await(init.io);
     } else {
         // Reuse one connection for all requests (keep-alive), sent sequentially.
-        sendRequestsReused(init.gpa, init.io, &opts, &data, sku_index, prng.random(), &log) catch |e| {
-            log.err("request failed: {s}", .{@errorName(e)});
+        sendRequestsReused(init.gpa, init.io, &opts, &data, sku_index, prng.random(), &out) catch |e| {
+            out.eprint("request failed: {s}\n", .{@errorName(e)});
             return e;
         };
     }
