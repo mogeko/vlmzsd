@@ -542,7 +542,7 @@ pub fn main(init: std.process.Init) !void {
                 .log = &log,
             };
 
-            group.concurrent(&group, init.io, serveClientThread, .{ctx}) catch |e| {
+            group.concurrent(init.io, serveClientThread, .{ctx}) catch |e| {
                 ctx.stream.close(init.io);
                 if (sem_active) sem.post(init.io);
                 init.gpa.destroy(ctx);

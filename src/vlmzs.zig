@@ -290,6 +290,23 @@ fn sendRequest(
     }
 }
 
+/// One activation request dispatched as a pooled task (via `Group.concurrent`).
+/// Derives its own PRNG from `seed` so concurrent requests never share PRNG
+/// state; failures are logged here rather than propagated.
+fn sendRequestTask(
+    gpa: Allocator,
+    io: Io,
+    opts: *const ClientOptions,
+    base: kms.Request,
+    seed: u64,
+    log: *cli_helper.Logger,
+) void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    sendRequest(gpa, io, opts, base, prng.random(), log) catch |e| {
+        log.err("request failed: {s}", .{@errorName(e)});
+    };
+}
+
 fn listProducts(data: *const kmsdata.KmsData, log: *cli_helper.Logger) void {
     log.info("You may use these product names or numbers:", .{});
     for (data.skus(), 0..) |sku, i| {
@@ -347,16 +364,24 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var prng = std.Random.DefaultPrng.init(cli_helper.makeSeed(init.io));
-    const rng = prng.random();
 
+    // Dispatch up to `--count` requests onto the Io.Threaded pool. Each request
+    // builds its base and derives its own PRNG before submission, so concurrent
+    // tasks never share PRNG state.
+    var group = Io.Group.init;
     var i: usize = 0;
     while (i < opts.count) : (i += 1) {
-        const base = buildRequestBase(&opts, &data, sku_index, rng, init.io);
-        sendRequest(init.gpa, init.io, &opts, base, rng, &log) catch |e| {
-            log.err("request failed: {s}", .{@errorName(e)});
+        const seed = prng.random().int(u64);
+        var req_prng = std.Random.DefaultPrng.init(seed);
+        const base = buildRequestBase(&opts, &data, sku_index, req_prng.random(), init.io);
+        group.concurrent(init.io, sendRequestTask, .{
+            init.gpa, init.io, &opts, base, seed, &log,
+        }) catch |e| {
+            log.err("failed to dispatch request: {s}", .{@errorName(e)});
             return e;
         };
     }
+    try group.await(init.io);
 }
 
 test "buildRequestBase binding expiration" {
