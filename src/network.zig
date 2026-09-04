@@ -12,6 +12,7 @@ const std = @import("std");
 const Io = std.Io;
 const rpc = @import("rpc.zig");
 const kms = @import("kms.zig");
+const cli_helper = @import("cli_helper.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -38,6 +39,7 @@ pub fn writeAll(writer: *Io.Writer, buf: []const u8) !void {
 
 pub const ServeOptions = struct {
     cfg: *const kms.ServerConfig,
+    log: ?*cli_helper.Logger = null,
     rpc_assoc_group: u32 = 0,
     /// Port-number string to embed in BIND responses ("" → none).
     secondary_address: []const u8 = "",
@@ -125,6 +127,14 @@ pub fn serveRpc(
             }, &negotiation);
             defer allocator.free(resp_body);
 
+            if (action == 0) {
+                if (options.log) |l| {
+                    l.debug("BIND: negotiated {s}", .{
+                        if (negotiation.ndr64_ctx != rpc.invalid_ctx) "NDR64" else "NDR32",
+                    });
+                }
+            }
+
             const resp_packet: u8 = if (action == 0) rpc.packet_type.bind_ack else rpc.packet_type.alter_context_ack;
             // BIND_ACK echoes the request's packet flags (incl. MULTIPLEX);
             // ALTER_CONTEXT_ACK always uses FIRST|LAST (matches the reference).
@@ -132,8 +142,9 @@ pub fn serveRpc(
             try writePacket(writer, resp_packet, header.call_id, resp_body, resp_flags);
         } else {
             const dispatch = try rpc.dispatchKmsRequest(allocator, request_body, &negotiation, options.cfg, rng, now_unix);
-            switch (dispatch) {
+            switch (dispatch.kind) {
                 .fault => |nca| {
+                    if (options.log) |l| l.warn("RPC fault (NCA 0x{X:0>8})", .{nca});
                     const fault_body = rpc.buildFault(nca);
                     // The C reference writes the server's global CallId (2)
                     // into FAULT headers, not the request's CallId.
@@ -148,6 +159,18 @@ pub fn serveRpc(
                 },
                 .response => |resp_body| {
                     defer allocator.free(resp_body);
+                    if (options.log) |l| {
+                        if (dispatch.response_size < 0) {
+                            const hr: u32 = @bitCast(dispatch.response_size);
+                            if (dispatch.major_version != 0) {
+                                l.warn("KMS v{d} request rejected (HRESULT 0x{X:0>8})", .{ dispatch.major_version, hr });
+                            } else {
+                                l.warn("invalid KMS request rejected (HRESULT 0x{X:0>8})", .{hr});
+                            }
+                        } else {
+                            l.debug("KMS v{d} request → {d}-byte response", .{ dispatch.major_version, dispatch.response_size });
+                        }
+                    }
                     // RESPONSE echoes the request's packet flags (incl. MULTIPLEX).
                     try writePacket(writer, rpc.packet_type.response, header.call_id, resp_body, header.packet_flags);
                     if (options.disconnect_per_request) return;
@@ -370,6 +393,17 @@ pub fn isClientPrivate(fd: std.posix.socket_t) bool {
     return isPrivateIPAddress(@ptrCast(&addr));
 }
 
+/// Format the connected socket's peer address into `buf` (e.g. "1.2.3.4:1688").
+/// Returns "unknown" when the peer address cannot be determined.
+pub fn formatPeer(fd: std.posix.socket_t, buf: []u8) []const u8 {
+    var addr: std.posix.sockaddr.storage align(8) = undefined;
+    var addrlen: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    std.posix.getpeername(fd, @ptrCast(&addr), &addrlen) catch return "unknown";
+    var w = Io.Writer.fixed(buf);
+    sockaddrToIpAddress(@ptrCast(&addr)).format(&w) catch return "unknown";
+    return w.buffered();
+}
+
 // ---------------------------------------------------------------------------
 // Interface enumeration (`getifaddrs`; used by ip-protection level 1)
 // ---------------------------------------------------------------------------
@@ -391,13 +425,13 @@ fn sockaddrToIpAddress(addr: *const std.posix.sockaddr) Io.net.IpAddress {
     switch (addr.family) {
         std.posix.AF.INET => {
             const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(addr));
-            var ip4: Io.net.Ip4Address = .{ .bytes = undefined, .port = 0 };
+            var ip4: Io.net.Ip4Address = .{ .bytes = undefined, .port = std.mem.bigToNative(u16, in.port) };
             @memcpy(&ip4.bytes, std.mem.asBytes(&in.addr));
             return .{ .ip4 = ip4 };
         },
         std.posix.AF.INET6 => {
             const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
-            return .{ .ip6 = .{ .bytes = in6.addr, .port = 0 } };
+            return .{ .ip6 = .{ .bytes = in6.addr, .port = std.mem.bigToNative(u16, in6.port) } };
         },
         else => unreachable,
     }

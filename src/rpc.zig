@@ -261,12 +261,19 @@ pub fn buildBindResponse(
 // Server side: request dispatch
 // ---------------------------------------------------------------------------
 
-/// Result of dispatching an RPC request.
-pub const DispatchResult = union(enum) {
-    /// NCA fault (unknown context or unsupported KMS version).
-    fault: u32,
-    /// Normal RPC response body (allocator-allocated).
-    response: []u8,
+/// Result of dispatching an RPC request. The metadata fields let the caller
+/// (the socket layer) emit logs without reaching into protocol internals.
+pub const DispatchResult = struct {
+    kind: union(enum) {
+        /// NCA fault (unknown context or unsupported KMS version).
+        fault: u32,
+        /// Normal RPC response body (allocator-allocated).
+        response: []u8,
+    },
+    /// KMS major version parsed from the request (0 = invalid/unknown).
+    major_version: u16 = 0,
+    /// Positive = response byte length; negative = HRESULT rejection.
+    response_size: i32 = 0,
 };
 
 /// Build the 16-byte FAULT response body for an NCA error. The caller pairs it
@@ -293,7 +300,7 @@ pub fn dispatchKmsRequest(
     const context_id = readLe(u16, request_body, 4);
     const is_ndr64 = context_id == negotiation.ndr64_ctx;
     const is_ndr32 = context_id == negotiation.ndr_ctx;
-    if (!is_ndr32 and !is_ndr64) return .{ .fault = nca_unk_if };
+    if (!is_ndr32 and !is_ndr64) return .{ .kind = .{ .fault = nca_unk_if } };
 
     const data_offset: usize = if (is_ndr64) request64_fixed_size else request32_fixed_size;
 
@@ -305,6 +312,7 @@ pub fn dispatchKmsRequest(
 
     var kms_response_buf: [kms.max_response_size]u8 align(4) = undefined;
     var response_size: i32 = e_invalid_arg;
+    var major_ver: u16 = 0;
 
     // Mirror `checkRpcRequestSize` (rpc.c): only KMS v4.0/v5.0/v6.0 are
     // supported. `major_index` wraps for major < 4 exactly like the C
@@ -314,7 +322,7 @@ pub fn dispatchKmsRequest(
         const major_index: u32 = (version >> 16) - 4;
         const minor: u32 = version & 0xffff;
         if (major_index <= 2 and minor == 0) {
-            const major_ver: u16 = @intCast(version >> 16);
+            major_ver = @intCast(version >> 16);
             const kms_request_size: usize = if (major_ver == 4) kms_request_v4_size else kms_request_v6_size;
             if (request_body.len >= data_offset + kms_request_size) {
                 if (major_ver == 4) {
@@ -375,7 +383,11 @@ pub fn dispatchKmsRequest(
     writeLe(u16, body, 4, context_id);
     // CancelCount + Pad1 are already zero.
 
-    return .{ .response = body };
+    return .{
+        .kind = .{ .response = body },
+        .major_version = major_ver,
+        .response_size = response_size,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -696,7 +708,7 @@ test "dispatch v6 request end-to-end" {
     defer alloc.free(rpc_request);
 
     const dispatch = try dispatchKmsRequest(alloc, rpc_request[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
-    const resp_body = switch (dispatch) {
+    const resp_body = switch (dispatch.kind) {
         .fault => return error.TestUnexpectedResult,
         .response => |body| body,
     };
@@ -737,7 +749,7 @@ test "dispatch unsupported KMS version returns HRESULT" {
         const rpc_request = try wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), true, 2);
         defer alloc.free(rpc_request);
         const dispatch = try dispatchKmsRequest(alloc, rpc_request[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
-        const resp_body = switch (dispatch) {
+        const resp_body = switch (dispatch.kind) {
             .fault => return error.TestUnexpectedResult,
             .response => |body| body,
         };
@@ -752,7 +764,7 @@ test "dispatch unsupported KMS version returns HRESULT" {
         const rpc_request = try wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), false, 2);
         defer alloc.free(rpc_request);
         const dispatch = try dispatchKmsRequest(alloc, rpc_request[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
-        const resp_body = switch (dispatch) {
+        const resp_body = switch (dispatch.kind) {
             .fault => return error.TestUnexpectedResult,
             .response => |body| body,
         };

@@ -306,7 +306,9 @@ fn serveClientThread(ctx: *ClientContext) void {
         ctx.gpa.destroy(ctx);
     }
 
-    ctx.log.debug("connection accepted", .{});
+    var peer_buf: [64]u8 = undefined;
+    const peer = network.formatPeer(ctx.stream.socket.handle, &peer_buf);
+    ctx.log.debug("connection from {s} accepted", .{peer});
 
     const now_unix = cli_helper.nowUnix(ctx.io);
 
@@ -317,6 +319,7 @@ fn serveClientThread(ctx: *ClientContext) void {
 
     network.serveRpc(ctx.gpa, &reader.interface, &writer.interface, ctx.prng.random(), now_unix, .{
         .cfg = ctx.cfg,
+        .log = ctx.log,
         .secondary_address = ctx.port_str,
         .use_ndr64 = ctx.use_ndr64,
         .use_btfn = ctx.use_btfn,
@@ -324,8 +327,9 @@ fn serveClientThread(ctx: *ClientContext) void {
         .timeout_seconds = ctx.timeout_seconds,
         .socket_fd = ctx.stream.socket.handle,
     }) catch |e| switch (e) {
-        error.EndOfStream, error.Timeout => {},
-        else => ctx.log.warn("connection error: {s}", .{@errorName(e)}),
+        error.EndOfStream => ctx.log.debug("connection from {s} closed", .{peer}),
+        error.Timeout => ctx.log.debug("connection from {s} timed out", .{peer}),
+        else => ctx.log.warn("connection from {s} error: {s}", .{ peer, @errorName(e) }),
     };
 }
 
@@ -373,6 +377,12 @@ pub fn main(init: std.process.Init) !void {
 
     var data = try kmsdata.parse(init.gpa, kmd_raw);
     defer data.deinit(init.gpa);
+
+    if (opts.data_file) |path| {
+        log.info("loaded KMS data from {s}", .{path});
+    } else {
+        log.debug("using embedded KMS data", .{});
+    }
 
     var prng = std.Random.DefaultPrng.init(cli_helper.makeSeed(init.io));
     const rng = prng.random();
