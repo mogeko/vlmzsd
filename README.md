@@ -12,12 +12,13 @@ of the C [vlmcsd](https://github.com/Wind4/vlmcsd) (no longer maintained).
 ## Features
 
 - KMS v4 / v5 / v6 with ePID generation and randomization
+- Custom `.kmd` data — embedded default or an external file via `--data`
 - Hand-written DCE/RPC: BIND, NDR32/NDR64, FAULT
 - From-scratch AES (v4 160-bit key, v6 key-schedule XOR)
 - `std.Io.Threaded` concurrency with a `--max-clients` cap
 - No config file — CLI + `VLMZSD_*` environment variables
 
-## Run with Docker
+## Run with Container
 
 ```sh
 docker run --rm -p 1688:1688 ghcr.io/mogeko/vlmzsd:latest
