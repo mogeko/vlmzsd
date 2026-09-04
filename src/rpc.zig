@@ -113,7 +113,33 @@ pub const RpcHeader = extern struct {
 };
 
 comptime {
+    // DCE/RPC wire contract — docs/migration.md §3.3.
     std.debug.assert(@sizeOf(RpcHeader) == 16);
+
+    // Fixed sizes (bytes).
+    std.debug.assert(header_size == 16);
+    std.debug.assert(ctx_item_size == 44);
+    std.debug.assert(ctx_result_size == 24);
+    std.debug.assert(bind_request_fixed_size == 12);
+    std.debug.assert(bind_response_fixed_size == 20);
+    std.debug.assert(request32_fixed_size == 16);
+    std.debug.assert(request64_fixed_size == 24);
+    std.debug.assert(response32_data_offset == 20);
+    std.debug.assert(response64_data_offset == 32);
+
+    // NCA faults and the invalid context id.
+    std.debug.assert(nca_unk_if == 0x1c010003);
+    std.debug.assert(nca_proto_error == 0x1c01000b);
+    std.debug.assert(invalid_ctx == 0xFFFF);
+
+    // DataRepresentation = BE32(0x10000000) stored little-endian → bytes `10 00 00 00`.
+    std.debug.assert(data_representation_le == 0x10);
+
+    // Transfer-syntax GUIDs, byte-for-byte as the C `BYTE[16]` tables.
+    std.debug.assert(std.mem.eql(u8, &interface_uuid, &[_]u8{ 0x75, 0x21, 0xc8, 0x51, 0x4e, 0x84, 0x50, 0x47, 0xb0, 0xd8, 0xec, 0x25, 0x55, 0x55, 0xbc, 0x06 }));
+    std.debug.assert(std.mem.eql(u8, &transfer_syntax_ndr32, &[_]u8{ 0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11, 0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10, 0x48, 0x60 }));
+    std.debug.assert(std.mem.eql(u8, &transfer_syntax_ndr64, &[_]u8{ 0x33, 0x05, 0x71, 0x71, 0xba, 0xbe, 0x37, 0x49, 0x83, 0x19, 0xb5, 0xdb, 0xef, 0x9c, 0xcc, 0x36 }));
+    std.debug.assert(std.mem.eql(u8, &bind_time_feature_negotiation, &[_]u8{ 0x2c, 0x1c, 0xb7, 0x6c, 0x12, 0x98, 0x40, 0x45, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }));
 }
 
 /// Initialize an RPC header the way the reference does for KMS (one-fragment
@@ -579,6 +605,15 @@ pub fn parseKmsResponse(response_body: []const u8, use_ndr64: bool) KmsResponseP
 // Tests
 // ---------------------------------------------------------------------------
 
+test "FAULT body bytes" {
+    // AllocHint=32@0, Error.Code=nca@8, rest zero — docs/migration.md §3.3.
+    const body = buildFault(nca_unk_if);
+    try std.testing.expectEqual(@as(u32, 32), readLe(u32, &body, 0));
+    try std.testing.expectEqual(@as(u32, 0), readLe(u32, &body, 4));
+    try std.testing.expectEqual(nca_unk_if, readLe(u32, &body, 8));
+    try std.testing.expectEqual(@as(u32, 0), readLe(u32, &body, 12));
+}
+
 test "bind NDR64 negotiation" {
     const alloc = std.testing.allocator;
 
@@ -772,6 +807,40 @@ test "dispatch unsupported KMS version returns HRESULT" {
         const parsed = parseKmsResponse(resp_body, false);
         try std.testing.expectEqual(e_invalid_arg, parsed.status);
     }
+}
+
+test "rejected response wire bytes (NDR64)" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = kms.ServerConfig{ .data = &td.data };
+    var base = makeBase(&td.data);
+    base.version = 7 << 16; // unsupported major version
+
+    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    const rng = prng.random();
+    var request_v6: kms.RequestV6 = undefined;
+    kms.createRequestV6(&request_v6, &base, rng);
+
+    var negotiation = BindNegotiation{ .ndr_ctx = 0, .ndr64_ctx = 1 };
+    const rpc_request = try wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), true, 2);
+    defer alloc.free(rpc_request);
+
+    const dispatch = try dispatchKmsRequest(alloc, rpc_request[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
+    const body = switch (dispatch.kind) {
+        .fault => return error.TestUnexpectedResult,
+        .response => |b| b,
+    };
+    defer alloc.free(body);
+
+    // Rejected body is 28 bytes: AllocHint@0, ContextId@4, DataLength=0@8,
+    // DataSizeMax=0@16, HRESULT 0x8007000D@24 — docs/migration.md §3.3.
+    try std.testing.expectEqual(@as(usize, 28), body.len);
+    try std.testing.expectEqual(@as(u32, 20), readLe(u32, body, 0)); // AllocHint
+    try std.testing.expectEqual(@as(u64, 0), readLe(u64, body, 8)); // DataLength
+    try std.testing.expectEqual(@as(u64, 0), readLe(u64, body, 16)); // DataSizeMax
+    try std.testing.expectEqual(@as(u32, 0x8007000D), readLe(u32, body, 24)); // HRESULT
 }
 
 test "BTFN bind negotiation round-trip" {

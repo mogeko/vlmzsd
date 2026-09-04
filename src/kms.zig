@@ -145,6 +145,15 @@ const ticks_per_second: i64 = 10_000_000;
 /// Default HwId shipped by the reference (`config.h` `HWID`).
 pub const default_hwid = [8]u8{ 0x3A, 0x1C, 0x04, 0x96, 0x00, 0xB6, 0x00, 0x76 };
 
+comptime {
+    // Crypto/date constants — docs/migration.md §3.2.
+    std.debug.assert(time_c1 == 0x00000022816889BD);
+    std.debug.assert(time_c2 == 0x000000208CBAB5ED);
+    std.debug.assert(time_c3 == 0x3156CD5AC628477A);
+    std.debug.assert(filetime_epoch_offset == 11_644_473_600);
+    std.debug.assert(std.mem.eql(u8, &default_hwid, &[_]u8{ 0x3A, 0x1C, 0x04, 0x96, 0x00, 0xB6, 0x00, 0x76 }));
+}
+
 // HRESULT values returned by `CreateResponseBase` (used as rejection codes).
 pub const hresult = struct {
     pub const ok: i32 = 0;
@@ -208,6 +217,18 @@ comptime {
     std.debug.assert(v6_post_epid_size == 124);
     std.debug.assert(v6_decrypt_size == 256);
     std.debug.assert(cmid_offset == 136);
+    std.debug.assert(response_base_offset == 20);
+    std.debug.assert(max_response_size == 384);
+    std.debug.assert(pid_buffer_size == 64);
+    std.debug.assert(workstation_name_buffer == 64);
+    std.debug.assert(max_request_size == 260);
+    std.debug.assert(max_clients == 671);
+    std.debug.assert(response_result_ok == 0x3FF);
+    std.debug.assert(request_size == 236);
+    std.debug.assert(response_v4_size == 188);
+    std.debug.assert(response_v5_size == 240);
+    std.debug.assert(response_v6_size == 280);
+    std.debug.assert(version_size == 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +311,10 @@ const lcid_list = [_]u16{
 /// Minimum Unix time used as the upper bound for randomized ePID dates
 /// (C `BUILD_TIME` = 2013-10-17T13:00:11Z).
 const build_time: i64 = 1_538_922_811;
+
+comptime {
+    std.debug.assert(build_time == 1_538_922_811); // docs/migration.md §3.2
+}
 
 /// `HostBuildFlag.UseNdr64` (kms.h).
 const use_ndr64_flag: u32 = 1;
