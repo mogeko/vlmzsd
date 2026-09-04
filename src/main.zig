@@ -297,9 +297,8 @@ const ClientContext = struct {
     log: *cli_helper.Logger,
 };
 
-/// Serve one connection on its own thread (thread-per-connection, mirroring the
-/// C `serveClientThreadProc`). Releases the semaphore and frees the context on
-/// exit.
+/// Serve one connection as a pooled task (dispatched via `Group.concurrent`).
+/// Releases the semaphore and frees the context on exit.
 fn serveClientThread(ctx: *ClientContext) void {
     defer {
         ctx.stream.close(ctx.io);
@@ -484,6 +483,11 @@ pub fn main(init: std.process.Init) !void {
     const sem_active = opts.max_clients != 0;
     var sem = Io.Semaphore{ .permits = if (sem_active) opts.max_clients else 0 };
 
+    // Long-lived task group: accepted connections are dispatched onto the
+    // `Io.Threaded` pool via `Group.concurrent`. Each task's resources are
+    // released when it returns, so the group never needs to be awaited.
+    var group = Io.Group.init;
+
     var poll_fds: [64]std.posix.pollfd = undefined;
     if (servers.items.len > poll_fds.len) return error.TooManyListenSockets;
 
@@ -538,14 +542,13 @@ pub fn main(init: std.process.Init) !void {
                 .log = &log,
             };
 
-            const th = std.Thread.spawn(.{}, serveClientThread, .{ctx}) catch |e| {
+            group.concurrent(&group, init.io, serveClientThread, .{ctx}) catch |e| {
                 ctx.stream.close(init.io);
                 if (sem_active) sem.post(init.io);
                 init.gpa.destroy(ctx);
-                log.warn("failed to spawn client thread: {s}", .{@errorName(e)});
+                log.warn("failed to dispatch client task: {s}", .{@errorName(e)});
                 continue;
             };
-            th.detach();
         }
     }
 }
