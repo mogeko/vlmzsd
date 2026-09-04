@@ -162,7 +162,7 @@ the C `-l`/`-T`/`-e` options.
 | `--address-family <4\|6>` | | auto | IPv4/IPv6 selection (IP literals and host names) |
 | `--list-products` | `-x` | — | print available products and exit |
 | `--license-status <0..6>` | `-t` | `1` | LicenseStatus field |
-| `--reconnect-per-request` | `-T` | off | reconnect for each request |
+| `--reconnect-per-request` | `-T` | off | force a new connection per request (default reuses one) |
 | `--no-multiplexed` | | on | disable multiplexed RPC |
 | `--no-ndr64` | | on | disable NDR64 transfer syntax |
 | `--no-btfn` | | on | disable bind-time feature negotiation |

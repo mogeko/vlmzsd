@@ -262,11 +262,25 @@ fn sendRequest(
 
     const use_ndr64 = if (opts.ndr64 and bind.has_ndr64) true else bind.has_ndr32;
 
+    try sendRequestOn(gpa, &reader.interface, &writer.interface, &call_id, use_ndr64, base, rng, log);
+}
+
+/// Send one KMS request over an already-established connection (BIND done).
+fn sendRequestOn(
+    gpa: Allocator,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    call_id: *u32,
+    use_ndr64: bool,
+    base: kms.Request,
+    rng: std.Random,
+    log: *cli_helper.Logger,
+) !void {
     const proto: u16 = @intCast(base.version >> 16);
     if (proto == 4) {
         var req: kms.RequestV4 = undefined;
         kms.createRequestV4(&req, &base);
-        const sent = try network.clientSendRequest(gpa, &reader.interface, &writer.interface, &call_id, std.mem.asBytes(&req), use_ndr64);
+        const sent = try network.clientSendRequest(gpa, reader, writer, call_id, std.mem.asBytes(&req), use_ndr64);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
             log.err("server rejected request (status 0x{X:0>8})", .{@as(u32, @bitCast(sent.status))});
@@ -278,7 +292,7 @@ fn sendRequest(
     } else {
         var req: kms.RequestV6 = undefined;
         kms.createRequestV6(&req, &base, rng);
-        const sent = try network.clientSendRequest(gpa, &reader.interface, &writer.interface, &call_id, std.mem.asBytes(&req), use_ndr64);
+        const sent = try network.clientSendRequest(gpa, reader, writer, call_id, std.mem.asBytes(&req), use_ndr64);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
             log.err("server rejected request (status 0x{X:0>8})", .{@as(u32, @bitCast(sent.status))});
@@ -305,6 +319,41 @@ fn sendRequestTask(
     sendRequest(gpa, io, opts, base, prng.random(), log) catch |e| {
         log.err("request failed: {s}", .{@errorName(e)});
     };
+}
+
+/// Send `--count` requests over a single reused connection (keep-alive).
+/// Requests are sequential because one connection carries one in-flight RPC.
+fn sendRequestsReused(
+    gpa: Allocator,
+    io: Io,
+    opts: *const ClientOptions,
+    data: *const kmsdata.KmsData,
+    sku_index: usize,
+    rng: std.Random,
+    log: *cli_helper.Logger,
+) !void {
+    var stream = try network.connect(io, opts.host.?, opts.port, opts.address_family);
+    defer stream.close(io);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = stream.reader(io, &rbuf);
+    var writer = stream.writer(io, &wbuf);
+
+    var call_id: u32 = 2;
+    const bind = try network.clientBind(gpa, &reader.interface, &writer.interface, &call_id, .{
+        .use_ndr64 = opts.ndr64,
+        .use_btfn = opts.btfn,
+        .multiplexed = opts.multiplexed,
+    });
+
+    const use_ndr64 = if (opts.ndr64 and bind.has_ndr64) true else bind.has_ndr32;
+
+    var i: usize = 0;
+    while (i < opts.count) : (i += 1) {
+        const base = buildRequestBase(opts, data, sku_index, rng, io);
+        try sendRequestOn(gpa, &reader.interface, &writer.interface, &call_id, use_ndr64, base, rng, log);
+    }
 }
 
 fn listProducts(data: *const kmsdata.KmsData, log: *cli_helper.Logger) void {
@@ -365,23 +414,31 @@ pub fn main(init: std.process.Init) !void {
 
     var prng = std.Random.DefaultPrng.init(cli_helper.makeSeed(init.io));
 
-    // Dispatch up to `--count` requests onto the Io.Threaded pool. Each request
-    // builds its base and derives its own PRNG before submission, so concurrent
-    // tasks never share PRNG state.
-    var group = Io.Group.init;
-    var i: usize = 0;
-    while (i < opts.count) : (i += 1) {
-        const seed = prng.random().int(u64);
-        var req_prng = std.Random.DefaultPrng.init(seed);
-        const base = buildRequestBase(&opts, &data, sku_index, req_prng.random(), init.io);
-        group.concurrent(init.io, sendRequestTask, .{
-            init.gpa, init.io, &opts, base, seed, &log,
-        }) catch |e| {
-            log.err("failed to dispatch request: {s}", .{@errorName(e)});
+    if (opts.reconnect_per_request) {
+        // Each request gets its own connection; dispatch them in parallel onto
+        // the Io.Threaded pool. Each request builds its base and derives its own
+        // PRNG before submission, so concurrent tasks never share PRNG state.
+        var group = Io.Group.init;
+        var i: usize = 0;
+        while (i < opts.count) : (i += 1) {
+            const seed = prng.random().int(u64);
+            var req_prng = std.Random.DefaultPrng.init(seed);
+            const base = buildRequestBase(&opts, &data, sku_index, req_prng.random(), init.io);
+            group.concurrent(init.io, sendRequestTask, .{
+                init.gpa, init.io, &opts, base, seed, &log,
+            }) catch |e| {
+                log.err("failed to dispatch request: {s}", .{@errorName(e)});
+                return e;
+            };
+        }
+        try group.await(init.io);
+    } else {
+        // Reuse one connection for all requests (keep-alive), sent sequentially.
+        sendRequestsReused(init.gpa, init.io, &opts, &data, sku_index, prng.random(), &log) catch |e| {
+            log.err("request failed: {s}", .{@errorName(e)});
             return e;
         };
     }
-    try group.await(init.io);
 }
 
 test "buildRequestBase binding expiration" {

@@ -85,7 +85,7 @@ pub const Logger = struct {
     io: Io,
     out_writer: std.Io.File.Writer,
     err_writer: std.Io.File.Writer,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: Io.Mutex = .init,
     /// Messages below this level are dropped.
     min_level: Level = .info,
 
@@ -99,8 +99,8 @@ pub const Logger = struct {
 
     fn emit(self: *Logger, level: Level, comptime fmt: []const u8, args: anytype) void {
         if (@intFromEnum(level) < @intFromEnum(self.min_level)) return;
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const to_err = level == .warn or level == .err;
         const w: *std.Io.Writer = if (to_err) &self.err_writer.interface else &self.out_writer.interface;
         writeTimestamp(w, self.io);
