@@ -1,5 +1,5 @@
-//! KMS protocol layer (v4/v5/v6) — wire/binary-compatible reimplementation
-//! of `reference/vlmcsd-src/kms.c` / `kms.h`.
+//! KMS protocol layer (v4/v5/v6) — wire/binary-compatible implementation of
+//! the vlmcsd KMS protocol (see `docs/migration.md`).
 //!
 //! Protocol structs are `extern struct` so their memory layout matches the
 //! C packed structs byte-for-byte (verified below with compile-time
@@ -1026,23 +1026,17 @@ test "generateRandomPid random lang/build" {
 }
 
 const TestData = struct {
-    raw: []u8,
     data: kmsdata.KmsData,
 
     fn deinit(self: *TestData, allocator: std.mem.Allocator) void {
         self.data.deinit(allocator);
-        allocator.free(self.raw);
     }
 };
 
 fn loadTestData(allocator: std.mem.Allocator) !TestData {
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const raw = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, "reference/vlmcsd.kmd", allocator, .unlimited);
-    errdefer allocator.free(raw);
+    const raw: []const u8 = @embedFile("vlmcsd.kmd");
     const data = try kmsdata.parse(allocator, raw);
-    return .{ .raw = raw, .data = data };
+    return .{ .data = data };
 }
 
 fn makeBase(data: *const kmsdata.KmsData, version: u32) Request {

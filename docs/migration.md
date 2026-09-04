@@ -1,18 +1,19 @@
 # vlmzsd Migration Status & Traceability Document
 
 This document records the migration status, key implementation details, and known deviations of the
-vlmcsd (C, `reference/vlmcsd-src/`) → vlmzsd (modern Zig, `src/`) port. The goal: **to be able to
-trace protocol behavior, byte layouts, and design decisions even after the C code under `reference/`
-is eventually deleted.**
+vlmcsd (C, [Wind4/vlmcsd@svn1113](https://github.com/Wind4/vlmcsd/tree/svn1113)) → vlmzsd (modern Zig, `src/`) port. The goal: **to be able to
+trace protocol behavior, byte layouts, and design decisions even though the C code is no longer
+vendored in this repository.**
 
 > References: `AGENTS.md` (architecture & conventions), `docs/cli.md` (CLI spec),
-> `reference/vlmcsd-src/config.h` (feature switches), `reference/vlmcsd-src/*.c` / `*.h` (read-only reference).
+> `config.h`, `kms.c`/`kms.h`, `rpc.c`/`rpc.h`, `crypto*.c`, `helpers.c`, `network.c` in the upstream
+> [vlmcsd](https://github.com/Wind4/vlmcsd/tree/svn1113) source (historical reference).
 
 ---
 
 ## 1. Overall conclusion
 
-**Migration is complete; wire-level compatibility is byte-for-byte, and the C code can be deleted.**
+**Migration is complete; wire-level compatibility is byte-for-byte.**
 
 - The v4 / v5 / v6 **normal activation paths** (valid request → response build → encryption/HMAC → RPC framing) are **byte-identical** to the C reference.
 - Error/exception paths (invalid version, short request, unknown context, data-file validation) are aligned with C behavior.
@@ -24,7 +25,7 @@ Verification: 35/35 unit tests pass (including byte-level golden vectors), plus 
 
 ## 2. Module mapping overview
 
-| C reference (read-only) | Zig implementation | Migration type | Status |
+| Upstream C source | Zig implementation | Migration type | Status |
 |---|---|---|---|
 | `kms.c` / `kms.h` | `src/kms.zig` | Protocol layer (wire-critical) | ✅ Done |
 | `rpc.c` / `rpc.h` | `src/rpc.zig` + `src/network.zig` (byte-stream part) | Transport layer (wire-critical) | ✅ Done |
@@ -143,7 +144,7 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
   `IsRetail@28` `IsPreview@29` `EPidIndex@30`.
 - HostBuild record, 32 bytes: `DisplayNameOffset@0` (u64) `ReleaseDate@8` (i64)
   `BuildNumber@16` (i32) `PlatformId@20` (i32) `Flags@24` (u32, `UseNdr64=1<<0`).
-- Default data: `reference/vlmcsd.kmd` (15,079 bytes, 6 CSVLC / 3 app / 29 kms / 202 sku / 6 hostbuild).
+- Default data: `src/vlmcsd.kmd` (embedded; 15,079 bytes, 6 CSVLC / 3 app / 29 kms / 202 sku / 6 hostbuild).
 
 ---
 
@@ -195,7 +196,7 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 - AES implemented per FIPS-197 (S-box / inverse S-box / key expansion / MixColumns, etc.), supporting Nk=4 and Nk=5.
 - `expandKey(comptime nk, key, is_v6)`: after standard expansion, v6 applies the `rk[64]/rk[96]/rk[128]` XOR.
 - `aesCmacV4`, `aesCbcEncrypt/Decrypt` (PKCS#7), `hmacSha256`/`sha256` (`std.crypto`).
-- Golden vectors: `testdata/crypto/*.hex` (from the C `reference/dump_vectors`), byte-asserted in `crypto.zig` tests.
+- Golden vectors: hard-coded hex constants in `src/crypto.zig` tests (derived from the upstream C `dump_vectors`).
 
 ### 4.4 `src/kmsdata.zig` (← `helpers.c loadKmsData`)
 
@@ -249,12 +250,12 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
   - `rpc.zig`: BIND negotiation (NDR32/NDR64/BTFN); request wrap (NDR32/NDR64); dispatch end-to-end; invalid-version HRESULT.
   - `crypto.zig`: v4 CMAC / v5 / v6 encryption / CBC / HMAC-SHA256 golden vectors.
   - `kmsdata.zig`: `.kmd` parsing field asserts.
-- **Golden vectors**: `testdata/crypto/*.hex` (provenance in `testdata/README.md`), from the C reference `dump_vectors`.
+- **Golden vectors**: hard-coded hex constants in `src/crypto.zig` tests, derived from the upstream C `dump_vectors`.
 - **End-to-end**: `vlmzs` ↔ `vlmzsd` (v4/v5/v6, NDR32/NDR64, DNS, IPv4/IPv6 dual-stack, invalid-version rejection,
   10 concurrent clients, `--max-clients` throttling).
 - **Real client**: final acceptance should be against a real Windows KMS client or packet capture (below).
 
-## 7. Suggested final acceptance before deleting the C code
+## 7. Suggested final acceptance
 
 1. Byte-level round-trip against a real Windows KMS client (or Wine + capture) for v4/v5/v6, NDR32/NDR64.
 2. Diff `CurrentCount` and eviction behavior under `--maintain-clients`.
@@ -263,7 +264,7 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 
 ## 8. Notes
 
-- The C code under `reference/vlmcsd-src/` is a read-only reference, never compiled and never modified (see `.github/instructions/c-reference-readonly.instructions.md`).
+- The upstream C source ([Wind4/vlmcsd@svn1113](https://github.com/Wind4/vlmcsd/tree/svn1113)) is no longer vendored; it remains a historical reference only.
 - Build uses `build.zig` only; two executables: `vlmzsd` (server) and `vlmzs` (client).
 - The migration favors "idiomatic Zig" over transliteration: `std.crypto` / `std.net` / `std.Io` / `std.unicode` / `std.mem` first;
   `shared_globals.c` global state is replaced by explicit context/allocator/RNG passing.

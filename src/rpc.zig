@@ -1,5 +1,5 @@
-//! DCE/RPC transport layer — wire/binary-compatible reimplementation of
-//! `reference/vlmcsd-src/rpc.c` / `rpc.h` (the non-`USE_MSRPC` path).
+//! DCE/RPC transport layer — wire/binary-compatible implementation of the
+//! vlmcsd DCE/RPC wire format (the non-`USE_MSRPC` path; see `docs/migration.md`).
 //!
 //! This module implements the byte-level framing: RPC headers, BIND/ALTER-CONTEXT
 //! negotiation, and NDR32/NDR64 request/response wrapping. It does not open
@@ -646,23 +646,17 @@ test "kms request wrap (NDR64)" {
 }
 
 const TestData = struct {
-    raw: []u8,
     data: kmsdata.KmsData,
 
     fn deinit(self: *TestData, allocator: Allocator) void {
         self.data.deinit(allocator);
-        allocator.free(self.raw);
     }
 };
 
 fn loadTestData(allocator: Allocator) !TestData {
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const raw = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, "reference/vlmcsd.kmd", allocator, .unlimited);
-    errdefer allocator.free(raw);
+    const raw: []const u8 = @embedFile("vlmcsd.kmd");
     const data = try kmsdata.parse(allocator, raw);
-    return .{ .raw = raw, .data = data };
+    return .{ .data = data };
 }
 
 fn makeBase(data: *const kmsdata.KmsData) kms.Request {

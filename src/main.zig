@@ -21,7 +21,7 @@ const build_options = @import("build_options");
 const version = build_options.version;
 const default_port: u16 = 1688;
 
-/// Embedded default `.kmd` data (mirrors `reference/vlmcsd.kmd`).
+/// Embedded default `.kmd` data (the vlmcsd default data file).
 const embedded_kmd: []const u8 = @embedFile("vlmcsd.kmd");
 
 const params = clap.parseParamsComptime(

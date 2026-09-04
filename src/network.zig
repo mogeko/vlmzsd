@@ -1,5 +1,5 @@
-//! Network layer — an idiomatic `std.Io` / `std.Io.net` replacement for
-//! `reference/vlmcsd-src/network.c`.
+//! Network layer — idiomatic `std.Io` / `std.Io.net` socket I/O (the upstream
+//! vlmcsd `network.c` is a historical reference only).
 //!
 //! The C `network.c`/`rpc.c` boundary is reorganized here: `rpc.zig` holds the
 //! pure wire-format code, and this module adds the byte-stream I/O on top of
@@ -436,23 +436,17 @@ pub fn getPrivateIPAddresses(allocator: Allocator) ![]Io.net.IpAddress {
 const kmsdata = @import("kmsdata.zig");
 
 const TestData = struct {
-    raw: []u8,
     data: kmsdata.KmsData,
 
     fn deinit(self: *TestData, allocator: Allocator) void {
         self.data.deinit(allocator);
-        allocator.free(self.raw);
     }
 };
 
 fn loadTestData(allocator: Allocator) !TestData {
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const raw = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, "reference/vlmcsd.kmd", allocator, .unlimited);
-    errdefer allocator.free(raw);
+    const raw: []const u8 = @embedFile("vlmcsd.kmd");
     const data = try kmsdata.parse(allocator, raw);
-    return .{ .raw = raw, .data = data };
+    return .{ .data = data };
 }
 
 fn makeBase(data: *const kmsdata.KmsData) kms.Request {

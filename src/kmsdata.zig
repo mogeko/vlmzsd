@@ -1,8 +1,8 @@
 //! Parser for the vlmcsd `.kmd` binary data file.
 //!
 //! The format is a little-endian packed structure tree, parsed here field by
-//! field (no `@ptrCast` to padded structs) to match `loadKmsData` in
-//! `reference/vlmcsd-src/helpers.c`.
+//! field (no `@ptrCast` to padded structs) to match `loadKmsData` in the
+//! upstream vlmcsd `helpers.c` (see `docs/migration.md`).
 
 const std = @import("std");
 const testutil = @import("testutil.zig");
@@ -180,15 +180,10 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
     };
 }
 
-test "parse reference/vlmcsd.kmd" {
+test "parse embedded .kmd data" {
     const alloc = std.testing.allocator;
 
-    var threaded = std.Io.Threaded.init(alloc, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const raw = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, "reference/vlmcsd.kmd", alloc, .unlimited);
-    defer alloc.free(raw);
-
+    const raw: []const u8 = @embedFile("vlmcsd.kmd");
     var data = try parse(alloc, raw);
     defer data.deinit(alloc);
 
