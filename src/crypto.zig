@@ -58,6 +58,13 @@ const aes_key_v4 = [20]u8{ 0x05, 0x3d, 0x83, 0x07, 0xf9, 0xe5, 0xf0, 0x88, 0xeb,
 pub const aes_key_v5 = [16]u8{ 0xcd, 0x7e, 0x79, 0x6f, 0x2a, 0xb2, 0x5d, 0xcb, 0x55, 0xff, 0xc8, 0xef, 0x83, 0x64, 0xc4, 0x70 };
 pub const aes_key_v6 = [16]u8{ 0xa9, 0x4a, 0x41, 0x95, 0xe2, 0x01, 0x43, 0x2d, 0x9b, 0xcb, 0x46, 0x04, 0x05, 0xd8, 0x4a, 0x21 };
 
+comptime {
+    // Key bytes pinned to `AesKeyV4`/`AesKeyV5`/`AesKeyV6` — docs/migration.md §3.2.
+    std.debug.assert(std.mem.eql(u8, &aes_key_v4, &[_]u8{ 0x05, 0x3d, 0x83, 0x07, 0xf9, 0xe5, 0xf0, 0x88, 0xeb, 0x5e, 0xa6, 0x68, 0x6c, 0xf0, 0x37, 0xc7, 0xe4, 0xef, 0xd2, 0xd6 }));
+    std.debug.assert(std.mem.eql(u8, &aes_key_v5, &[_]u8{ 0xcd, 0x7e, 0x79, 0x6f, 0x2a, 0xb2, 0x5d, 0xcb, 0x55, 0xff, 0xc8, 0xef, 0x83, 0x64, 0xc4, 0x70 }));
+    std.debug.assert(std.mem.eql(u8, &aes_key_v6, &[_]u8{ 0xa9, 0x4a, 0x41, 0x95, 0xe2, 0x01, 0x43, 0x2d, 0x9b, 0xcb, 0x46, 0x04, 0x05, 0xd8, 0x4a, 0x21 }));
+}
+
 fn beWord(b: []const u8) u32 {
     return (@as(u32, b[0]) << 24) | (@as(u32, b[1]) << 16) | (@as(u32, b[2]) << 8) | b[3];
 }
@@ -400,22 +407,22 @@ test "v4 CMAC reference vectors" {
     aesCmacV4(&msg32, &mac);
     const hex = try testutil.hexDump(alloc, &mac);
     defer alloc.free(hex);
-    try testutil.expectBytes(hex, "1c3cb37a2a7283b1f2158220eb321c46");
+    try testutil.expectBytes(hex, "1c3cb37a2a7283b1f2158220eb321c46"); // from upstream C dump_vectors
 
     aesCmacV4(msg32[0..16], &mac);
     const hex16 = try testutil.hexDump(alloc, &mac);
     defer alloc.free(hex16);
-    try testutil.expectBytes(hex16, "2a090d7c1155251ab86445447d060335");
+    try testutil.expectBytes(hex16, "2a090d7c1155251ab86445447d060335"); // from upstream C dump_vectors
 
     aesCmacV4(msg64[0..20], &mac);
     const hex20 = try testutil.hexDump(alloc, &mac);
     defer alloc.free(hex20);
-    try testutil.expectBytes(hex20, "268a68935873a958f7d05c7f3699fb82");
+    try testutil.expectBytes(hex20, "268a68935873a958f7d05c7f3699fb82"); // from upstream C dump_vectors
 
     aesCmacV4(msg64[0..34], &mac);
     const hex34 = try testutil.hexDump(alloc, &mac);
     defer alloc.free(hex34);
-    try testutil.expectBytes(hex34, "ba177194ba0223ab1f4441bfe8a3d782");
+    try testutil.expectBytes(hex34, "ba177194ba0223ab1f4441bfe8a3d782"); // from upstream C dump_vectors
 }
 
 test "v6 AES reference vector" {
@@ -424,7 +431,24 @@ test "v6 AES reference vector" {
     const enc = aesV6EncryptBlock(&zero);
     const hex = try testutil.hexDump(alloc, &enc);
     defer alloc.free(hex);
-    try testutil.expectBytes(hex, "8ca59de0c483c04aa7026a22d6dd208e");
+    try testutil.expectBytes(hex, "8ca59de0c483c04aa7026a22d6dd208e"); // from upstream C dump_vectors
+}
+
+test "v6 key schedule XOR" {
+    // After the standard 128-bit expansion, v6 XORs 0x73/0x09/0xE4 into the
+    // first byte of round keys 4/6/8 (rk offsets 64/96/128) — docs/migration.md §3.2.
+    const std_rk = expandKey(4, &aes_key_v6, false);
+    const v6_rk = expandKey(4, &aes_key_v6, true);
+
+    for (0..std_rk.len) |i| {
+        const expected_diff: u8 = switch (i) {
+            64 => 0x73,
+            96 => 0x09,
+            128 => 0xE4,
+            else => 0,
+        };
+        try std.testing.expectEqual(std_rk[i] ^ expected_diff, v6_rk[i]);
+    }
 }
 
 test "HMAC-SHA256 reference vector" {
@@ -435,7 +459,7 @@ test "HMAC-SHA256 reference vector" {
     hmacSha256(&key, &data, &out);
     const hex = try testutil.hexDump(alloc, &out);
     defer alloc.free(hex);
-    try testutil.expectBytes(hex, "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a");
+    try testutil.expectBytes(hex, "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"); // from upstream C dump_vectors
 }
 
 test "v5 AES reference vector" {
@@ -444,7 +468,7 @@ test "v5 AES reference vector" {
     const enc = aesEncryptBlock(&aes_key_v5, false, zero);
     const hex = try testutil.hexDump(alloc, &enc);
     defer alloc.free(hex);
-    try testutil.expectBytes(hex, "ec7c7e75b1923978eac4b2d2260235d5");
+    try testutil.expectBytes(hex, "ec7c7e75b1923978eac4b2d2260235d5"); // from upstream C dump_vectors
 }
 
 test "v6 AES decrypt reference vector" {
@@ -454,7 +478,7 @@ test "v6 AES decrypt reference vector" {
     const dec = aesDecryptBlock(&aes_key_v6, true, enc);
     const hex = try testutil.hexDump(alloc, &dec);
     defer alloc.free(hex);
-    try testutil.expectBytes(hex, "00000000000000000000000000000000");
+    try testutil.expectBytes(hex, "00000000000000000000000000000000"); // round-trip, not a wire vector
 }
 
 test "v6 CBC reference vectors" {
@@ -468,10 +492,20 @@ test "v6 CBC reference vectors" {
 
     const enc_hex = try testutil.hexDump(alloc, data[0..48]);
     defer alloc.free(enc_hex);
-    try testutil.expectBytes(enc_hex, "8ca59de0c483c04aa7026a22d6dd208e43abf3a9a6b76d992a2c6b1732e80c8ca39d3d0e063cefedecf8cc6e09d14eac");
+    try testutil.expectBytes(enc_hex, "8ca59de0c483c04aa7026a22d6dd208e43abf3a9a6b76d992a2c6b1732e80c8ca39d3d0e063cefedecf8cc6e09d14eac"); // from upstream C dump_vectors
 
     aesCbcDecrypt(&aes_key_v6, true, &iv, data[0..48], 48);
     const dec_hex = try testutil.hexDump(alloc, data[0..48]);
     defer alloc.free(dec_hex);
-    try testutil.expectBytes(dec_hex, "000000000000000000000000000000000000000000000000000000000000000010101010101010101010101010101010");
+    try testutil.expectBytes(dec_hex, "000000000000000000000000000000000000000000000000000000000000000010101010101010101010101010101010"); // from upstream C dump_vectors
+}
+
+test "AesCmacV4 leaves input unchanged" {
+    // Zig uses a separate pad buffer; the C reference wrote the 0x80 padding
+    // byte into the input buffer — docs/migration.md §5.
+    var msg = [_]u8{0xAB} ** 34;
+    const original = msg;
+    var mac: Block = undefined;
+    aesCmacV4(&msg, &mac);
+    try std.testing.expectEqualSlices(u8, &original, &msg);
 }

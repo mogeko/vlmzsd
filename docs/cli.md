@@ -12,10 +12,7 @@ this file is the spec they must follow.
 - **No config file.** Configuration comes exclusively from CLI arguments and
   environment variables. There is no INI/TOML/YAML config surface.
 - **Three-tier precedence, fixed:** built-in default < environment variable <
-  CLI argument. This is not a convention — it follows from the two use cases:
-  the server's configuration is static and comes from the deployment
-  environment (Docker/systemd), the client's configuration is dynamic and
-  comes from each invocation.
+  CLI argument (see [§3](#3-configuration-precedence)).
 - **Discoverable.** `--help` is complete and grouped by concern; every default
   value is shown. No single-letter getopt soup.
 - **Human-friendly types.** Durations and GUIDs are written in readable form,
@@ -25,13 +22,14 @@ this file is the spec they must follow.
 
 ```
 vlmzsd [OPTIONS]                 # KMS server (foreground)
-vlmzs HOST[:PORT] [OPTIONS]      # activation client
+vlmzs [HOST[:PORT]] [OPTIONS]    # activation client
 ```
 
 Each binary supports `--help` / `-h` and `--version` / `-V`.
 
 `vlmzsd` runs the KMS server in the foreground. `vlmzs` sends one activation
-request to an existing KMS server.
+request to an existing KMS server. When `HOST` is omitted, `vlmzs` targets
+`127.0.0.1` (`::1` with `--address-family 6`).
 
 ## 3. Configuration precedence
 
@@ -73,10 +71,6 @@ Standard hyphenated hex: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
 (e.g. `Windows`, `Office2013`) and `<epid>` is the 20-byte ePID string.
 Repeatable; comma-separated in the environment variable.
 
-> Requires `kmsdata.zig` to expose the CSVLC name (the string immediately
-> following the ePID string in the `.kmd` string pool) — tracked as a
-> prerequisite for Phase 6.
-
 ## 5. Server (`vlmzsd`) options
 
 Grouped by concern (help is rendered in these groups).
@@ -86,7 +80,7 @@ Grouped by concern (help is rendered in these groups).
 | Option | Short | Default | Env var | Notes |
 |---|---|---|---|---|
 | `--port <n>` | `-p` | `1688` | `VLMZSD_PORT` | TCP listen port |
-| `--listen <addr>` | `-L` | `0.0.0.0` | `VLMZSD_LISTEN` | repeatable / comma-separated |
+| `--listen <addr>` | `-L` | `::` (dual-stack) | `VLMZSD_LISTEN` | repeatable / comma-separated |
 | `--timeout <dur>` | | `30s` | `VLMZSD_TIMEOUT` | idle timeout; `0` disables |
 | `--max-clients <n>` | `-m` | unlimited | `VLMZSD_MAX_CLIENTS` | concurrent client cap |
 
@@ -130,80 +124,40 @@ Grouped by concern (help is rendered in these groups).
 | Option | Short | Default | Env var | Notes |
 |---|---|---|---|---|
 | `--pid-file <file>` | | — | `VLMZSD_PID_FILE` | write PID to file |
-| `--verbose` / `--quiet` | `-v` / `-q` | off | `VLMZSD_VERBOSE` | verbosity of stdout logging |
+| `--verbose` / `--quiet` | `-v` / `-q` | off | — | enable `debug` / drop `info` |
 
 ### Logging
 
-Logging has **no CLI surface**. Output is a **fixed format** written to
-**stdout** only; there is no `--log`, `--log-timestamp`, or log-level flag.
-Redirecting/persisting logs is the job of the supervisor (systemd/journald,
-Docker). This is a deliberate simplification of the C `-l`/`-T`/`-e` options.
+Logging has **no CLI surface**. Output is a **fixed format** prefixed with a
+UTC ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`); the timestamp is always on and
+cannot be configured. `debug`/`info` messages go to **stdout**, `warn`/`err`
+messages go to **stderr** (Unix convention). `--verbose` enables `debug`;
+`--quiet` drops `info`. Redirecting/persisting logs is the job of the
+supervisor (systemd/journald, Docker). This is a deliberate simplification of
+the C `-l`/`-T`/`-e` options.
 
 ## 6. Client (`vlmzs`) options
 
 | Option | Short | Default | Notes |
 |---|---|---|---|
 | `HOST[:PORT]` | — | `127.0.0.1` | positional; port defaults to `1688` |
-| `--product <name>` | | `Windows` | look up GUIDs from `.kmd` |
-| `--protocol <4\|5\|6>` | | `6` | KMS protocol version |
+| `--product <name>` | | first SKU | product name or 1-based number; looks up GUIDs from `.kmd` |
+| `--protocol <4\|5\|6>` | | from product | KMS protocol version (derived from the selected SKU) |
 | `--app-id <guid>` | | from product | override AppID |
 | `--sku-id <guid>` | | from product | override SKUID |
 | `--kms-id <guid>` | | from product | override KMSID |
 | `--cmid <guid>` | `-c` | random | client machine ID |
 | `--prev-cmid <guid>` | `-o` | zeroed | previous client machine ID |
-| `--workstation <name>` | `-w` | host name | workstation name |
+| `--workstation <name>` | `-w` | random | workstation name |
 | `--vm` | `-m` | off | present as a virtual machine |
 | `--count <n>` | `-n` | `1` | number of requests |
-| `--virtual-clients <n>` | `-r` | `1` | NCountPolicy |
+| `--virtual-clients <n>` | `-r` | from product | NCountPolicy override (derived from the selected SKU) |
 | `--grace <minutes>` | `-g` | `43200` | grace period minutes (BindingExpiration) |
 | `--address-family <4\|6>` | | auto | IPv4/IPv6 selection (IP literals and host names) |
 | `--list-products` | `-x` | — | print available products and exit |
 | `--license-status <0..6>` | `-t` | `1` | LicenseStatus field |
-| `--reconnect-per-request` | `-T` | off | reconnect for each request |
+| `--reconnect-per-request` | `-T` | off | force a new connection per request (default reuses one) |
 | `--no-multiplexed` | | on | disable multiplexed RPC |
 | `--no-ndr64` | | on | disable NDR64 transfer syntax |
 | `--no-btfn` | | on | disable bind-time feature negotiation |
 | `--verbose` | `-v` | off | verbosity |
-
-### Deferred client options
-
-These depend on DNS SRV support (`dns_srv.c`), which is not part of the current
-migration surface. They will be added when DNS SRV is implemented:
-
-| Option | C equivalent | Notes |
-|---|---|---|
-| `--no-dns` | `-d` | do not resolve SRV records |
-| `--no-srv-priority` | `-P` | ignore SRV record priority |
-
-## 7. Dropped C options
-
-The following C surface is intentionally **not** carried over, with rationale:
-
-| C option(s) | Rationale |
-|---|---|
-| `-i <file>` (INI), client `-G`/`-l` (INI) | no config file by design |
-| `-u`/`-g` (setuid/setgid) | deployment concern (systemd `User=`/`Group=`) |
-| `-s`/`-S`/`-U`/`-W` (NT service) | Windows-only; out of scope for macOS/Linux first |
-| `-F0`/`-F1` (freebind) | exotic; revisit if requested |
-| `-x <level>` (exit-on-warning) | removed; warnings never terminate the server |
-| `-O <vpn>` (TAP adapter) | Windows/OpenVPN-specific; out of scope |
-| `-l syslog\|<file>`, `-T0`/`-T1` | logging is fixed-format stdout; supervisor handles files |
-| `-e` (log to stdout) | stdout is the only destination, so redundant |
-| `-Z` (SIGHUP restart) | internal; re-add only if signal handling is needed |
-
-## 8. Implementation decisions
-
-- **Argument parsing: `zig-clap`** (Hejsil/zig-clap), the closest thing Zig has
-  to a community-standard CLI library (à la Rust `clap`): short/long options,
-  repeatable options, `--opt=value`, and automatic help generation. It is the
-  project's first external dependency (added to `build.zig.zon`). The
-  three-tier env-var precedence is implemented as a thin layer on top of
-  zig-clap's parsed result — it is independent of the parser choice.
-- **Two entry points share one module.** `src/main.zig` (`vlmzsd`) and
-  `src/vlmzs.zig` (`vlmzs`) both import the `vlmzsd` module; argument parsing
-  and option-to-config mapping live in shared code (e.g. `src/cli_helper.zig`).
-- **Logging: no external library.** Zig has no community-standard log library,
-  and `std.log` does not match the "fixed format → stdout" requirement. Logging
-  is a small hand-written helper (~20 lines) writing a fixed format to stdout.
-- **Version pinning risk:** zig-clap's `master` tracks Zig master; when adding
-  the dependency, pin the release tag that supports Zig `0.16.0`.

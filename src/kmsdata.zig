@@ -1,8 +1,8 @@
 //! Parser for the vlmcsd `.kmd` binary data file.
 //!
 //! The format is a little-endian packed structure tree, parsed here field by
-//! field (no `@ptrCast` to padded structs) to match `loadKmsData` in
-//! `reference/vlmcsd-src/helpers.c`.
+//! field (no `@ptrCast` to padded structs) to match `loadKmsData` in the
+//! upstream vlmcsd `helpers.c` (see `docs/migration.md`).
 
 const std = @import("std");
 const testutil = @import("testutil.zig");
@@ -13,6 +13,14 @@ const header_size = 72;
 const csvlk_size = 32;
 const item_size = 32;
 const hostbuild_size = 32;
+
+comptime {
+    // `.kmd` record sizes — docs/migration.md §3.4.
+    std.debug.assert(header_size == 72);
+    std.debug.assert(csvlk_size == 32);
+    std.debug.assert(item_size == 32);
+    std.debug.assert(hostbuild_size == 32);
+}
 
 pub const CsvlkData = struct {
     epid: []const u8,
@@ -93,6 +101,9 @@ fn cString(raw: []const u8, offset: usize) error{InvalidFormat}![]const u8 {
 pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
     if (raw.len < header_size) return error.InvalidFormat;
     if (!std.mem.eql(u8, raw[0..4], "KMD\x00")) return error.InvalidFormat;
+    // Mirrors `loadKmsData` (`data[size-1] != 0` → format error when
+    // UNSAFE_DATA_LOAD is off).
+    if (raw[raw.len - 1] != 0) return error.InvalidFormat;
 
     const minor_ver = readLe(u16, raw, 4);
     const major_ver = readLe(u16, raw, 6);
@@ -177,15 +188,10 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
     };
 }
 
-test "parse reference/vlmcsd.kmd" {
+test "parse embedded .kmd data" {
     const alloc = std.testing.allocator;
 
-    var threaded = std.Io.Threaded.init(alloc, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const raw = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, "reference/vlmcsd.kmd", alloc, .unlimited);
-    defer alloc.free(raw);
-
+    const raw: []const u8 = @embedFile("vlmcsd.kmd");
     var data = try parse(alloc, raw);
     defer data.deinit(alloc);
 
@@ -201,14 +207,46 @@ test "parse reference/vlmcsd.kmd" {
     try std.testing.expectEqual(@as(usize, 6), data.host_builds.len);
 
     try testutil.expectBytes(data.csvlk[0].epid, "06401-00206-560-594696-03-1033-9600.0000-2962018");
+    try testutil.expectBytes(data.csvlk[0].name, "Windows");
+    try std.testing.expectEqual(@as(i64, 1538438400), data.csvlk[0].release_date);
+    try std.testing.expectEqual(@as(u32, 206), data.csvlk[0].group_id);
+    try std.testing.expectEqual(@as(u32, 551000000), data.csvlk[0].min_key_id);
+    try std.testing.expectEqual(@as(u32, 570999999), data.csvlk[0].max_key_id);
+    try std.testing.expectEqual(@as(u8, 0), data.csvlk[0].min_active_clients);
 
     try testutil.expectBytes(data.items[0].guid[0..], "\x34\x27\xc9\x55\x82\xd6\x71\x4d\x98\x3e\xd6\xec\x3f\x16\x05\x9f");
     try testutil.expectBytes(data.items[0].name, "Windows");
     try std.testing.expectEqual(@as(u8, 50), data.items[0].n_count_policy);
+    try std.testing.expectEqual(@as(u8, 0), data.items[0].app_index);
+    try std.testing.expectEqual(@as(u8, 0), data.items[0].kms_index);
+    try std.testing.expectEqual(@as(u8, 0), data.items[0].protocol_version);
+    try std.testing.expectEqual(@as(u8, 0), data.items[0].is_retail);
+    try std.testing.expectEqual(@as(u8, 0), data.items[0].is_preview);
+    try std.testing.expectEqual(@as(u8, 0), data.items[0].epid_index);
 
     try std.testing.expectEqual(@as(i32, 17763), data.host_builds[0].build_number);
     try std.testing.expectEqual(@as(i32, 3612), data.host_builds[0].platform_id);
     try std.testing.expectEqual(@as(u32, 7), data.host_builds[0].flags);
     try std.testing.expectEqual(@as(i64, 1538438400), data.host_builds[0].release_date);
     try testutil.expectBytes(data.host_builds[0].display_name, "Windows 10 1809 / Server 2019");
+}
+
+test "kmd header fields" {
+    // 72-byte header + default-data size pinned to docs/migration.md §3.4.
+    const raw: []const u8 = @embedFile("vlmcsd.kmd");
+
+    try std.testing.expectEqual(@as(usize, 15079), raw.len);
+    try std.testing.expectEqualStrings("KMD", raw[0..3]); // Magic
+    try std.testing.expectEqual(@as(u8, 0), raw[3]); // Magic[3] = NUL
+    try std.testing.expectEqual(@as(u16, 0), readLe(u16, raw, 4)); // MinorVer
+    try std.testing.expectEqual(@as(u16, 2), readLe(u16, raw, 6)); // MajorVer
+    try std.testing.expectEqual(@as(u8, 6), raw[8]); // CsvlkCount
+    try std.testing.expectEqual(@as(u8, 1), raw[9]); // Flags
+    try std.testing.expectEqual(@as(u32, 3), readLe(u32, raw, 12)); // AppItemCount
+    try std.testing.expectEqual(@as(u32, 29), readLe(u32, raw, 16)); // KmsItemCount
+    try std.testing.expectEqual(@as(u32, 202), readLe(u32, raw, 20)); // SkuItemCount
+    try std.testing.expectEqual(@as(u32, 6), readLe(u32, raw, 24)); // HostBuildCount
+    try std.testing.expectEqual(@as(u64, 264), readLe(u64, raw, 32)); // AppItemOffset
+    try std.testing.expectEqual(@as(u64, 7752), readLe(u64, raw, 56)); // HostBuildOffset
+    try std.testing.expectEqual(@as(u8, 0), raw[raw.len - 1]); // trailing NUL
 }

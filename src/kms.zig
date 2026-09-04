@@ -1,5 +1,5 @@
-//! KMS protocol layer (v4/v5/v6) — wire/binary-compatible reimplementation
-//! of `reference/vlmcsd-src/kms.c` / `kms.h`.
+//! KMS protocol layer (v4/v5/v6) — wire/binary-compatible implementation of
+//! the vlmcsd KMS protocol (see `docs/migration.md`).
 //!
 //! Protocol structs are `extern struct` so their memory layout matches the
 //! C packed structs byte-for-byte (verified below with compile-time
@@ -145,6 +145,15 @@ const ticks_per_second: i64 = 10_000_000;
 /// Default HwId shipped by the reference (`config.h` `HWID`).
 pub const default_hwid = [8]u8{ 0x3A, 0x1C, 0x04, 0x96, 0x00, 0xB6, 0x00, 0x76 };
 
+comptime {
+    // Crypto/date constants — docs/migration.md §3.2.
+    std.debug.assert(time_c1 == 0x00000022816889BD);
+    std.debug.assert(time_c2 == 0x000000208CBAB5ED);
+    std.debug.assert(time_c3 == 0x3156CD5AC628477A);
+    std.debug.assert(filetime_epoch_offset == 11_644_473_600);
+    std.debug.assert(std.mem.eql(u8, &default_hwid, &[_]u8{ 0x3A, 0x1C, 0x04, 0x96, 0x00, 0xB6, 0x00, 0x76 }));
+}
+
 // HRESULT values returned by `CreateResponseBase` (used as rejection codes).
 pub const hresult = struct {
     pub const ok: i32 = 0;
@@ -208,6 +217,18 @@ comptime {
     std.debug.assert(v6_post_epid_size == 124);
     std.debug.assert(v6_decrypt_size == 256);
     std.debug.assert(cmid_offset == 136);
+    std.debug.assert(response_base_offset == 20);
+    std.debug.assert(max_response_size == 384);
+    std.debug.assert(pid_buffer_size == 64);
+    std.debug.assert(workstation_name_buffer == 64);
+    std.debug.assert(max_request_size == 260);
+    std.debug.assert(max_clients == 671);
+    std.debug.assert(response_result_ok == 0x3FF);
+    std.debug.assert(request_size == 236);
+    std.debug.assert(response_v4_size == 188);
+    std.debug.assert(response_v5_size == 240);
+    std.debug.assert(response_v6_size == 280);
+    std.debug.assert(version_size == 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +311,10 @@ const lcid_list = [_]u16{
 /// Minimum Unix time used as the upper bound for randomized ePID dates
 /// (C `BUILD_TIME` = 2013-10-17T13:00:11Z).
 const build_time: i64 = 1_538_922_811;
+
+comptime {
+    std.debug.assert(build_time == 1_538_922_811); // docs/migration.md §3.2
+}
 
 /// `HostBuildFlag.UseNdr64` (kms.h).
 const use_ndr64_flag: u32 = 1;
@@ -1026,23 +1051,17 @@ test "generateRandomPid random lang/build" {
 }
 
 const TestData = struct {
-    raw: []u8,
     data: kmsdata.KmsData,
 
     fn deinit(self: *TestData, allocator: std.mem.Allocator) void {
         self.data.deinit(allocator);
-        allocator.free(self.raw);
     }
 };
 
 fn loadTestData(allocator: std.mem.Allocator) !TestData {
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const raw = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, "reference/vlmcsd.kmd", allocator, .unlimited);
-    errdefer allocator.free(raw);
+    const raw: []const u8 = @embedFile("vlmcsd.kmd");
     const data = try kmsdata.parse(allocator, raw);
-    return .{ .raw = raw, .data = data };
+    return .{ .data = data };
 }
 
 fn makeBase(data: *const kmsdata.KmsData, version: u32) Request {
@@ -1131,6 +1150,136 @@ test "client list ring eviction" {
     try std.testing.expectEqual(@as(u32, 50), resp.count);
     try std.testing.expect(guidEqual(&lists.lists[0].guids[0], &newest));
     try std.testing.expectEqual(@as(usize, 1), lists.lists[0].current_position);
+}
+
+/// Build a minimal in-memory `KmsData` variant (1 CSVLC / 1 app / 1 kms / 1 sku /
+/// 1 host build) with the given CSVLC release date — for boundary tests that
+/// need data outside the embedded `.kmd` (docs/migration.md §5).
+fn makeVariantData(allocator: std.mem.Allocator, release_date: i64) !kmsdata.KmsData {
+    const csvlk = try allocator.alloc(kmsdata.CsvlkData, 1);
+    csvlk[0] = .{
+        .epid = "test",
+        .name = "test",
+        .release_date = release_date,
+        .group_id = 206,
+        .min_key_id = 1,
+        .max_key_id = 2,
+        .min_active_clients = 25,
+    };
+
+    const items = try allocator.alloc(kmsdata.VlmcsdData, 3);
+    items[0] = .{ .guid = [_]u8{1} ** 16, .name = "app", .app_index = 0, .kms_index = 0, .protocol_version = 0, .n_count_policy = 25, .is_retail = 0, .is_preview = 0, .epid_index = 0 };
+    items[1] = .{ .guid = [_]u8{2} ** 16, .name = "kms", .app_index = 0, .kms_index = 0, .protocol_version = 0, .n_count_policy = 25, .is_retail = 0, .is_preview = 0, .epid_index = 0 };
+    items[2] = .{ .guid = [_]u8{3} ** 16, .name = "sku", .app_index = 0, .kms_index = 0, .protocol_version = 6, .n_count_policy = 25, .is_retail = 0, .is_preview = 0, .epid_index = 0 };
+
+    const host_builds = try allocator.alloc(kmsdata.HostBuild, 1);
+    host_builds[0] = .{ .display_name = "test", .release_date = release_date, .build_number = 17763, .platform_id = 3612, .flags = 7 };
+
+    return .{
+        .minor_ver = 0,
+        .major_ver = 2,
+        .flags = 0,
+        .csvlk = csvlk,
+        .items = items,
+        .app_count = 1,
+        .kms_count = 1,
+        .sku_count = 1,
+        .host_builds = host_builds,
+    };
+}
+
+test "required_clients over 2000 rejected" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = ServerConfig{ .data = &td.data };
+    var base = makeBase(&td.data, 6 << 16);
+    base.n_policy = 1001; // required_clients = 2002 > 2000 — docs/migration.md §5
+
+    var prng = std.Random.DefaultPrng.init(0);
+    var resp: Response = undefined;
+    try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+}
+
+test "client time off by more than 4 hours rejected" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = ServerConfig{ .data = &td.data, .check_client_time = true };
+    var base = makeBase(&td.data, 6 << 16);
+    base.client_time = u64ToFileTime(unixTimeToFileTime(1_700_000_000 + 5 * 3600)); // +5 h — docs/migration.md §5
+
+    var prng = std.Random.DefaultPrng.init(0);
+    var resp: Response = undefined;
+    try std.testing.expectEqual(hresult.client_time_mismatch, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+}
+
+test "whitelist rejects unknown product" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = ServerConfig{ .data = &td.data, .whitelisting_level = 1 };
+    var base = makeBase(&td.data, 6 << 16);
+    base.kms_id = [_]u8{0xFF} ** 16; // not in the .kmd — docs/migration.md §5
+
+    var prng = std.Random.DefaultPrng.init(0);
+    var resp: Response = undefined;
+    try std.testing.expectEqual(hresult.product_rejected, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+}
+
+test "client list full rejected" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    const storage = try alloc.alloc(ClientList, td.data.apps().len);
+    defer alloc.free(storage);
+    var lists: ClientLists = .{ .lists = storage };
+    var prng = std.Random.DefaultPrng.init(0);
+    initClientLists(&lists, &td.data, true, prng.random()); // start empty
+
+    // Simulate a full list: count at the cap, empty slots still present.
+    lists.lists[0].current_count = max_clients;
+    lists.lists[0].max_count = max_clients;
+
+    var cfg = ServerConfig{ .data = &td.data, .maintain_clients = true, .client_lists = &lists };
+    var base = makeBase(&td.data, 6 << 16);
+    base.cmid = [_]u8{1} ** 16; // new CMID — docs/migration.md §5
+
+    var resp: Response = undefined;
+    try std.testing.expectEqual(hresult.too_many_clients, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+}
+
+test "overlong ePID rejected" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    // 64 ASCII chars exceed the 63 UCS-2 code unit limit — docs/migration.md §5.
+    const overlong = "0123456789012345678901234567890123456789012345678901234567890123";
+    const overrides = [_]?[]const u8{overlong};
+    var cfg = ServerConfig{ .data = &td.data, .epid_overrides = &overrides };
+    var base = makeBase(&td.data, 6 << 16);
+
+    var prng = std.Random.DefaultPrng.init(0);
+    var resp: Response = undefined;
+    try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+}
+
+test "ePID date span zero or negative" {
+    const alloc = std.testing.allocator;
+    const now: i64 = 1_700_000_000;
+    var data = try makeVariantData(alloc, now + 100); // release_date in the future — docs/migration.md §5
+    defer data.deinit(alloc);
+
+    var prng = std.Random.DefaultPrng.init(0);
+    var out: [pid_buffer_size]u8 = undefined;
+    // span <= 0 → take min_time directly, never `%0` (the C UB fix).
+    const pid = generateRandomPid(&data, 0, &out, 0, 0, prng.random(), true, now);
+    try std.testing.expect(pid.len > 0);
 }
 
 test "v4 request/response round-trip" {

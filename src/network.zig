@@ -1,5 +1,5 @@
-//! Network layer — an idiomatic `std.Io` / `std.Io.net` replacement for
-//! `reference/vlmcsd-src/network.c`.
+//! Network layer — idiomatic `std.Io` / `std.Io.net` socket I/O (the upstream
+//! vlmcsd `network.c` is a historical reference only).
 //!
 //! The C `network.c`/`rpc.c` boundary is reorganized here: `rpc.zig` holds the
 //! pure wire-format code, and this module adds the byte-stream I/O on top of
@@ -12,6 +12,7 @@ const std = @import("std");
 const Io = std.Io;
 const rpc = @import("rpc.zig");
 const kms = @import("kms.zig");
+const cli_helper = @import("cli_helper.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -38,6 +39,7 @@ pub fn writeAll(writer: *Io.Writer, buf: []const u8) !void {
 
 pub const ServeOptions = struct {
     cfg: *const kms.ServerConfig,
+    log: ?*cli_helper.Logger = null,
     rpc_assoc_group: u32 = 0,
     /// Port-number string to embed in BIND responses ("" → none).
     secondary_address: []const u8 = "",
@@ -125,6 +127,14 @@ pub fn serveRpc(
             }, &negotiation);
             defer allocator.free(resp_body);
 
+            if (action == 0) {
+                if (options.log) |l| {
+                    l.debug("BIND: negotiated {s}", .{
+                        if (negotiation.ndr64_ctx != rpc.invalid_ctx) "NDR64" else "NDR32",
+                    });
+                }
+            }
+
             const resp_packet: u8 = if (action == 0) rpc.packet_type.bind_ack else rpc.packet_type.alter_context_ack;
             // BIND_ACK echoes the request's packet flags (incl. MULTIPLEX);
             // ALTER_CONTEXT_ACK always uses FIRST|LAST (matches the reference).
@@ -132,13 +142,16 @@ pub fn serveRpc(
             try writePacket(writer, resp_packet, header.call_id, resp_body, resp_flags);
         } else {
             const dispatch = try rpc.dispatchKmsRequest(allocator, request_body, &negotiation, options.cfg, rng, now_unix);
-            switch (dispatch) {
+            switch (dispatch.kind) {
                 .fault => |nca| {
+                    if (options.log) |l| l.warn("RPC fault (NCA 0x{X:0>8})", .{nca});
                     const fault_body = rpc.buildFault(nca);
+                    // The C reference writes the server's global CallId (2)
+                    // into FAULT headers, not the request's CallId.
                     try writePacket(
                         writer,
                         rpc.packet_type.fault,
-                        header.call_id,
+                        2,
                         &fault_body,
                         rpc.packet_flags.first | rpc.packet_flags.last | rpc.packet_flags.not_exec,
                     );
@@ -146,6 +159,18 @@ pub fn serveRpc(
                 },
                 .response => |resp_body| {
                     defer allocator.free(resp_body);
+                    if (options.log) |l| {
+                        if (dispatch.response_size < 0) {
+                            const hr: u32 = @bitCast(dispatch.response_size);
+                            if (dispatch.major_version != 0) {
+                                l.warn("KMS v{d} request rejected (HRESULT 0x{X:0>8})", .{ dispatch.major_version, hr });
+                            } else {
+                                l.warn("invalid KMS request rejected (HRESULT 0x{X:0>8})", .{hr});
+                            }
+                        } else {
+                            l.debug("KMS v{d} request → {d}-byte response", .{ dispatch.major_version, dispatch.response_size });
+                        }
+                    }
                     // RESPONSE echoes the request's packet flags (incl. MULTIPLEX).
                     try writePacket(writer, rpc.packet_type.response, header.call_id, resp_body, header.packet_flags);
                     if (options.disconnect_per_request) return;
@@ -311,6 +336,25 @@ pub fn listen(io: Io, address: []const u8, port: u16) !Io.net.Server {
     return Io.net.IpAddress.listen(&ip, io, .{ .reuse_address = true });
 }
 
+/// True when the IPv4 address `ip` (numeric, host byte order) is
+/// private/reserved. Public addresses return false.
+fn isPrivateIpv4(ip: u32) bool {
+    return (ip & 0xff000000) == 0x7f000000 or // 127/8 localhost
+        (ip & 0xffff0000) == 0xc0a80000 or // 192.168/16
+        (ip & 0xffff0000) == 0xa9fe0000 or // 169.254/16 link-local
+        (ip & 0xff000000) == 0x0a000000 or // 10/8
+        (ip & 0xfff00000) == 0xac100000; // 172.16/12
+}
+
+/// True when `bytes` is an IPv4-mapped IPv6 address (::ffff:a.b.c.d), which a
+/// dual-stack IPv6 socket reports for IPv4 peers.
+fn isIpv4Mapped(bytes: [16]u8) bool {
+    for (bytes[0..10]) |b| {
+        if (b != 0) return false;
+    }
+    return bytes[10] == 0xff and bytes[11] == 0xff;
+}
+
 /// True when `addr` is a private/reserved IPv4 or IPv6 address (mirrors the
 /// C `isPrivateIPAddress` in network.c). Public addresses return false.
 pub fn isPrivateIPAddress(addr: *const std.posix.sockaddr) bool {
@@ -319,15 +363,15 @@ pub fn isPrivateIPAddress(addr: *const std.posix.sockaddr) bool {
             const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(addr));
             // sockaddr_in.addr is stored in network byte order; on a
             // little-endian host this yields the numeric value via byte swap.
-            const ip = @byteSwap(in.addr);
-            break :blk (ip & 0xff000000) == 0x7f000000 or // 127/8 localhost
-                (ip & 0xffff0000) == 0xc0a80000 or // 192.168/16
-                (ip & 0xffff0000) == 0xa9fe0000 or // 169.254/16 link-local
-                (ip & 0xff000000) == 0x0a000000 or // 10/8
-                (ip & 0xfff00000) == 0xac100000; // 172.16/12
+            break :blk isPrivateIpv4(@byteSwap(in.addr));
         },
         std.posix.AF.INET6 => blk: {
             const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
+            // A dual-stack socket presents IPv4 peers as IPv4-mapped
+            // addresses; judge them by the embedded IPv4 address.
+            if (isIpv4Mapped(in6.addr)) {
+                break :blk isPrivateIpv4(std.mem.readInt(u32, in6.addr[12..16], .big));
+            }
             const qword0 = std.mem.readInt(u64, in6.addr[0..8], .big);
             const qword1 = std.mem.readInt(u64, in6.addr[8..16], .big);
             const word0 = std.mem.readInt(u16, in6.addr[0..2], .big);
@@ -347,6 +391,17 @@ pub fn isClientPrivate(fd: std.posix.socket_t) bool {
     var addrlen: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
     std.posix.getpeername(fd, @ptrCast(&addr), &addrlen) catch return false;
     return isPrivateIPAddress(@ptrCast(&addr));
+}
+
+/// Format the connected socket's peer address into `buf` (e.g. "1.2.3.4:1688").
+/// Returns "unknown" when the peer address cannot be determined.
+pub fn formatPeer(fd: std.posix.socket_t, buf: []u8) []const u8 {
+    var addr: std.posix.sockaddr.storage align(8) = undefined;
+    var addrlen: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    std.posix.getpeername(fd, @ptrCast(&addr), &addrlen) catch return "unknown";
+    var w = Io.Writer.fixed(buf);
+    sockaddrToIpAddress(@ptrCast(&addr)).format(&w) catch return "unknown";
+    return w.buffered();
 }
 
 // ---------------------------------------------------------------------------
@@ -370,13 +425,13 @@ fn sockaddrToIpAddress(addr: *const std.posix.sockaddr) Io.net.IpAddress {
     switch (addr.family) {
         std.posix.AF.INET => {
             const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(addr));
-            var ip4: Io.net.Ip4Address = .{ .bytes = undefined, .port = 0 };
+            var ip4: Io.net.Ip4Address = .{ .bytes = undefined, .port = std.mem.bigToNative(u16, in.port) };
             @memcpy(&ip4.bytes, std.mem.asBytes(&in.addr));
             return .{ .ip4 = ip4 };
         },
         std.posix.AF.INET6 => {
             const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
-            return .{ .ip6 = .{ .bytes = in6.addr, .port = 0 } };
+            return .{ .ip6 = .{ .bytes = in6.addr, .port = std.mem.bigToNative(u16, in6.port) } };
         },
         else => unreachable,
     }
@@ -415,23 +470,17 @@ pub fn getPrivateIPAddresses(allocator: Allocator) ![]Io.net.IpAddress {
 const kmsdata = @import("kmsdata.zig");
 
 const TestData = struct {
-    raw: []u8,
     data: kmsdata.KmsData,
 
     fn deinit(self: *TestData, allocator: Allocator) void {
         self.data.deinit(allocator);
-        allocator.free(self.raw);
     }
 };
 
 fn loadTestData(allocator: Allocator) !TestData {
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const raw = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, "reference/vlmcsd.kmd", allocator, .unlimited);
-    errdefer allocator.free(raw);
+    const raw: []const u8 = @embedFile("vlmcsd.kmd");
     const data = try kmsdata.parse(allocator, raw);
-    return .{ .raw = raw, .data = data };
+    return .{ .data = data };
 }
 
 fn makeBase(data: *const kmsdata.KmsData) kms.Request {
@@ -480,6 +529,27 @@ test "isPrivateIPAddress ipv4" {
     }
 }
 
+test "IPv4-mapped address private detection" {
+    // A dual-stack socket reports IPv4 peers as ::ffff:a.b.c.d; extract the
+    // embedded IPv4 for an exact decision — docs/migration.md §5.
+    const mapped = struct {
+        fn addr(octets: [4]u8) std.posix.sockaddr.in6 {
+            var sa = std.mem.zeroes(std.posix.sockaddr.in6);
+            sa.family = std.posix.AF.INET6;
+            sa.addr[10] = 0xFF;
+            sa.addr[11] = 0xFF;
+            @memcpy(sa.addr[12..16], &octets);
+            return sa;
+        }
+    };
+
+    var pub6 = mapped.addr(.{ 8, 8, 8, 8 }); // public IPv4
+    try std.testing.expect(!isPrivateIPAddress(@ptrCast(&pub6)));
+
+    var priv6 = mapped.addr(.{ 10, 0, 0, 1 }); // 10/8 private
+    try std.testing.expect(isPrivateIPAddress(@ptrCast(&priv6)));
+}
+
 test "isPrivateIPAddress ipv6" {
     const ipv6 = struct {
         fn addr(bytes: [16]u8) std.posix.sockaddr.in6 {
@@ -506,6 +576,16 @@ test "isPrivateIPAddress ipv6" {
     {
         var sa = ipv6.addr([_]u8{ 0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
         try std.testing.expect(isPrivateIPAddress(@ptrCast(&sa)));
+    }
+    // ::ffff:127.0.0.1 (IPv4-mapped loopback) → private.
+    {
+        var sa = ipv6.addr([_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 });
+        try std.testing.expect(isPrivateIPAddress(@ptrCast(&sa)));
+    }
+    // ::ffff:8.8.8.8 (IPv4-mapped public) → public.
+    {
+        var sa = ipv6.addr([_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 8, 8, 8, 8 });
+        try std.testing.expect(!isPrivateIPAddress(@ptrCast(&sa)));
     }
 }
 

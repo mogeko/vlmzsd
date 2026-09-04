@@ -21,14 +21,14 @@ const build_options = @import("build_options");
 const version = build_options.version;
 const default_port: u16 = 1688;
 
-/// Embedded default `.kmd` data (mirrors `reference/vlmcsd.kmd`).
+/// Embedded default `.kmd` data (the vlmcsd default data file).
 const embedded_kmd: []const u8 = @embedFile("vlmcsd.kmd");
 
 const params = clap.parseParamsComptime(
     \\-h, --help                       Display this help and exit.
     \\-V, --version                    Output version information and exit.
     \\-p, --port <u16>                 TCP listen port (default 1688).
-    \\-L, --listen <str>...            Listen address, repeatable (default 0.0.0.0).
+    \\-L, --listen <str>...            Listen address, repeatable (default ::, dual-stack).
     \\    --timeout <str>              Idle timeout (default 30s, 0 disables).
     \\-m, --max-clients <u32>          Concurrent client cap (default unlimited).
     \\    --data <str>                 External .kmd data file (default embedded).
@@ -55,7 +55,7 @@ const params = clap.parseParamsComptime(
 /// Resolved server configuration (post three-tier precedence merge).
 const ServerOptions = struct {
     port: u16 = default_port,
-    listen: []const []const u8 = &.{"0.0.0.0"},
+    listen: []const []const u8 = &.{"::"},
     timeout_seconds: u64 = 30,
     max_clients: u32 = 0,
     data_file: ?[]const u8 = null,
@@ -293,14 +293,12 @@ const ClientContext = struct {
     use_btfn: bool,
     disconnect_per_request: bool,
     timeout_seconds: u32,
-    verbose: bool,
     sem: ?*Io.Semaphore,
     log: *cli_helper.Logger,
 };
 
-/// Serve one connection on its own thread (thread-per-connection, mirroring the
-/// C `serveClientThreadProc`). Releases the semaphore and frees the context on
-/// exit.
+/// Serve one connection as a pooled task (dispatched via `Group.concurrent`).
+/// Releases the semaphore and frees the context on exit.
 fn serveClientThread(ctx: *ClientContext) void {
     defer {
         ctx.stream.close(ctx.io);
@@ -308,7 +306,9 @@ fn serveClientThread(ctx: *ClientContext) void {
         ctx.gpa.destroy(ctx);
     }
 
-    if (ctx.verbose) ctx.log.info("connection accepted", .{});
+    var peer_buf: [64]u8 = undefined;
+    const peer = network.formatPeer(ctx.stream.socket.handle, &peer_buf);
+    ctx.log.debug("connection from {s} accepted", .{peer});
 
     const now_unix = cli_helper.nowUnix(ctx.io);
 
@@ -319,6 +319,7 @@ fn serveClientThread(ctx: *ClientContext) void {
 
     network.serveRpc(ctx.gpa, &reader.interface, &writer.interface, ctx.prng.random(), now_unix, .{
         .cfg = ctx.cfg,
+        .log = ctx.log,
         .secondary_address = ctx.port_str,
         .use_ndr64 = ctx.use_ndr64,
         .use_btfn = ctx.use_btfn,
@@ -326,8 +327,9 @@ fn serveClientThread(ctx: *ClientContext) void {
         .timeout_seconds = ctx.timeout_seconds,
         .socket_fd = ctx.stream.socket.handle,
     }) catch |e| switch (e) {
-        error.EndOfStream, error.Timeout => {},
-        else => ctx.log.warn("connection error: {s}", .{@errorName(e)}),
+        error.EndOfStream => ctx.log.debug("connection from {s} closed", .{peer}),
+        error.Timeout => ctx.log.debug("connection from {s} timed out", .{peer}),
+        else => ctx.log.warn("connection from {s} error: {s}", .{ peer, @errorName(e) }),
     };
 }
 
@@ -354,11 +356,13 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var log_buf: [4096]u8 = undefined;
-    var log = cli_helper.Logger.init(init.io, &log_buf);
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var log = cli_helper.Logger.init(init.io, &out_buf, &err_buf);
 
     var opts = try resolveOptions(init.gpa, init.environ_map, &res.args);
     defer opts.deinit(init.gpa);
+    log.min_level = if (opts.quiet) .warn else if (opts.verbose) .debug else .info;
 
     // Load the KMS data: external file overrides the embedded default.
     var kmd_owned = false;
@@ -373,6 +377,12 @@ pub fn main(init: std.process.Init) !void {
 
     var data = try kmsdata.parse(init.gpa, kmd_raw);
     defer data.deinit(init.gpa);
+
+    if (opts.data_file) |path| {
+        log.info("loaded KMS data from {s}", .{path});
+    } else {
+        log.debug("using embedded KMS data", .{});
+    }
 
     var prng = std.Random.DefaultPrng.init(cli_helper.makeSeed(init.io));
     const rng = prng.random();
@@ -414,7 +424,8 @@ pub fn main(init: std.process.Init) !void {
     const port_str = try std.fmt.bufPrint(&port_str_buf, "{d}", .{opts.port});
 
     // Create the listening sockets. ip-protection level 1 listens only on the
-    // host's private addresses; otherwise `--listen` (default 0.0.0.0).
+    // host's private addresses; otherwise `--listen` (default ::, a dual-stack
+    // socket covering both IPv4 and IPv6).
     var servers = std.ArrayList(Io.net.Server).empty;
     defer {
         for (servers.items) |*s| s.deinit(init.io);
@@ -437,6 +448,16 @@ pub fn main(init: std.process.Init) !void {
     } else {
         for (opts.listen) |addr| {
             const s = network.listen(init.io, addr, opts.port) catch |e| {
+                // Fallback: a default dual-stack "::" listen fails when the
+                // host has no IPv6 stack; retry on IPv4 only.
+                if (std.mem.eql(u8, addr, "::") and e == error.AddressFamilyUnsupported) {
+                    const s4 = network.listen(init.io, "0.0.0.0", opts.port) catch |e4| {
+                        log.err("failed to listen on 0.0.0.0:{d}: {s}", .{ opts.port, @errorName(e4) });
+                        return e4;
+                    };
+                    try servers.append(init.gpa, s4);
+                    continue;
+                }
                 log.err("failed to listen on {s}:{d}: {s}", .{ addr, opts.port, @errorName(e) });
                 return e;
             };
@@ -472,6 +493,11 @@ pub fn main(init: std.process.Init) !void {
     const sem_active = opts.max_clients != 0;
     var sem = Io.Semaphore{ .permits = if (sem_active) opts.max_clients else 0 };
 
+    // Long-lived task group: accepted connections are dispatched onto the
+    // `Io.Threaded` pool via `Group.concurrent`. Each task's resources are
+    // released when it returns, so the group never needs to be awaited.
+    var group = Io.Group.init;
+
     var poll_fds: [64]std.posix.pollfd = undefined;
     if (servers.items.len > poll_fds.len) return error.TooManyListenSockets;
 
@@ -497,7 +523,7 @@ pub fn main(init: std.process.Init) !void {
             if (opts.ip_protection & 2 != 0) {
                 if (!network.isClientPrivate(stream.socket.handle)) {
                     stream.close(init.io);
-                    if (opts.verbose) log.info("client with public IP address rejected", .{});
+                    log.debug("client with public IP address rejected", .{});
                     continue;
                 }
             }
@@ -522,19 +548,17 @@ pub fn main(init: std.process.Init) !void {
                 .use_btfn = opts.btfn,
                 .disconnect_per_request = opts.disconnect_per_request,
                 .timeout_seconds = @intCast(opts.timeout_seconds),
-                .verbose = opts.verbose,
                 .sem = if (sem_active) &sem else null,
                 .log = &log,
             };
 
-            const th = std.Thread.spawn(.{}, serveClientThread, .{ctx}) catch |e| {
+            group.concurrent(init.io, serveClientThread, .{ctx}) catch |e| {
                 ctx.stream.close(init.io);
                 if (sem_active) sem.post(init.io);
                 init.gpa.destroy(ctx);
-                log.warn("failed to spawn client thread: {s}", .{@errorName(e)});
+                log.warn("failed to dispatch client task: {s}", .{@errorName(e)});
                 continue;
             };
-            th.detach();
         }
     }
 }
