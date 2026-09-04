@@ -135,10 +135,12 @@ pub fn serveRpc(
             switch (dispatch) {
                 .fault => |nca| {
                     const fault_body = rpc.buildFault(nca);
+                    // The C reference writes the server's global CallId (2)
+                    // into FAULT headers, not the request's CallId.
                     try writePacket(
                         writer,
                         rpc.packet_type.fault,
-                        header.call_id,
+                        2,
                         &fault_body,
                         rpc.packet_flags.first | rpc.packet_flags.last | rpc.packet_flags.not_exec,
                     );

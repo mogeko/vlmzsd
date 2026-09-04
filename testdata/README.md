@@ -14,8 +14,9 @@ The remaining layers are verified without committed golden-byte files:
   underlying primitives are pinned by the `crypto/` vectors.
 - **`.kmd` parsing** — `src/kmsdata.zig` loads `reference/vlmcsd.kmd`
   at runtime and asserts header/field values directly.
-- **DCE/RPC** — not yet implemented; frames will be added under
-  `rpc/` when available.
+- **DCE/RPC** — `src/rpc.zig` is exercised via BIND negotiation, request
+  wrap/unwrap, and dispatch round-trip tests (no committed golden-byte files;
+  layout is pinned by compile-time size assertions).
 
 ## Data fixture
 

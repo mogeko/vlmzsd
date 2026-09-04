@@ -296,26 +296,38 @@ pub fn dispatchKmsRequest(
     if (!is_ndr32 and !is_ndr64) return .{ .fault = nca_unk_if };
 
     const data_offset: usize = if (is_ndr64) request64_fixed_size else request32_fixed_size;
-    if (request_body.len < data_offset + 4) return error.InvalidRequest;
 
-    // KMS major version (second WORD of the KMS payload).
-    const major_ver = readLe(u16, request_body, data_offset + 2);
-    if (major_ver < 4 or major_ver > 6) return .{ .fault = nca_proto_error };
-
-    const kms_request_size: usize = if (major_ver == 4) kms_request_v4_size else kms_request_v6_size;
-    if (request_body.len < data_offset + kms_request_size) return error.InvalidRequest;
+    // Rejection HRESULT (E_INVALIDARG). Mirrors the C `rpcRequest`: any
+    // invalid request (too short, unsupported version, non-zero minor) is
+    // answered with a normal RESPONSE carrying a zero-length payload and this
+    // status — not a FAULT and not a disconnect.
+    const e_invalid_arg: i32 = @bitCast(@as(u32, 0x8007000D));
 
     var kms_response_buf: [kms.max_response_size]u8 align(4) = undefined;
-    var response_size: i32 = undefined;
+    var response_size: i32 = e_invalid_arg;
 
-    if (major_ver == 4) {
-        var request_v4: kms.RequestV4 = undefined;
-        @memcpy(std.mem.asBytes(&request_v4)[0..kms_request_size], request_body[data_offset..][0..kms_request_size]);
-        response_size = kms.createResponseV4(&request_v4, &kms_response_buf, cfg, rng, now_unix);
-    } else {
-        var request_v6: kms.RequestV6 = undefined;
-        @memcpy(std.mem.asBytes(&request_v6)[0..kms_request_size], request_body[data_offset..][0..kms_request_size]);
-        response_size = kms.createResponseV6(&request_v6, &kms_response_buf, cfg, rng, now_unix);
+    // Mirror `checkRpcRequestSize` (rpc.c): only KMS v4.0/v5.0/v6.0 are
+    // supported. `major_index` wraps for major < 4 exactly like the C
+    // `uint16_t` arithmetic, so the `<= 2` test rejects those too.
+    if (request_body.len >= data_offset + 4) {
+        const version = readLe(u32, request_body, data_offset);
+        const major_index: u32 = (version >> 16) - 4;
+        const minor: u32 = version & 0xffff;
+        if (major_index <= 2 and minor == 0) {
+            const major_ver: u16 = @intCast(version >> 16);
+            const kms_request_size: usize = if (major_ver == 4) kms_request_v4_size else kms_request_v6_size;
+            if (request_body.len >= data_offset + kms_request_size) {
+                if (major_ver == 4) {
+                    var request_v4: kms.RequestV4 = undefined;
+                    @memcpy(std.mem.asBytes(&request_v4)[0..kms_request_size], request_body[data_offset..][0..kms_request_size]);
+                    response_size = kms.createResponseV4(&request_v4, &kms_response_buf, cfg, rng, now_unix);
+                } else {
+                    var request_v6: kms.RequestV6 = undefined;
+                    @memcpy(std.mem.asBytes(&request_v6)[0..kms_request_size], request_body[data_offset..][0..kms_request_size]);
+                    response_size = kms.createResponseV6(&request_v6, &kms_response_buf, cfg, rng, now_unix);
+                }
+            }
+        }
     }
 
     // Assemble the response body (NDR32 or NDR64).
@@ -343,16 +355,16 @@ pub fn dispatchKmsRequest(
         const data_len: u64 = if (response_size < 0) 0 else @intCast(response_size);
         writeLe(u64, body, 8, data_len); // DataLength
         writeLe(u64, body, 16, if (response_size < 0) 0 else 0x00020000); // DataSizeMax
-        writeLe(u64, body, 24, data_len); // DataSizeIs
         if (response_size >= 0) {
+            writeLe(u64, body, 24, data_len); // DataSizeIs
             @memcpy(body[response64_data_offset..][0..@intCast(response_size)], kms_response_buf[0..@intCast(response_size)]);
         }
     } else {
         const data_len: u32 = if (response_size < 0) 0 else @intCast(response_size);
         writeLe(u32, body, 8, data_len); // DataLength
         writeLe(u32, body, 12, if (response_size < 0) 0 else 0x00020000); // DataSizeMax
-        writeLe(u32, body, 16, data_len); // DataSizeIs
         if (response_size >= 0) {
+            writeLe(u32, body, 16, data_len); // DataSizeIs
             @memcpy(body[response32_data_offset..][0..@intCast(response_size)], kms_response_buf[0..@intCast(response_size)]);
         }
     }
@@ -520,14 +532,17 @@ pub fn parseKmsResponse(response_body: []const u8, use_ndr64: bool) KmsResponseP
     const data_offset: usize = if (use_ndr64) response64_data_offset else response32_data_offset;
 
     if (use_ndr64) {
-        if (response_body.len < 32) return .{ .data = "", .status = nca_proto_error };
+        // 24 bytes covers DataLength + DataSizeMax; a rejected request body is
+        // only 28 bytes (no DataSizeIs, status in its slot), so don't require 32.
+        if (response_body.len < 24) return .{ .data = "", .status = nca_proto_error };
         const data_length = readLe(u64, response_body, 8);
         const data_size_max = readLe(u64, response_body, 16);
         const response_size: usize = @intCast(data_length);
         if (data_size_max == 0) {
+            if (response_body.len < 28) return .{ .data = "", .status = nca_proto_error };
             return .{ .data = "", .status = readLe(i32, response_body, 24) };
         }
-        if (response_body.len < data_offset + response_size) return .{ .data = "", .status = nca_proto_error };
+        if (response_body.len < data_offset + response_size + 4) return .{ .data = "", .status = nca_proto_error };
         return .{
             .data = response_body[data_offset..][0..response_size],
             .status = readLe(i32, response_body, data_offset + response_size),
@@ -541,7 +556,7 @@ pub fn parseKmsResponse(response_body: []const u8, use_ndr64: bool) KmsResponseP
     if (data_size_max == 0) {
         return .{ .data = "", .status = readLe(i32, response_body, 16) };
     }
-    if (response_body.len < data_offset + response_size) return .{ .data = "", .status = nca_proto_error };
+    if (response_body.len < data_offset + response_size + 4) return .{ .data = "", .status = nca_proto_error };
     return .{
         .data = response_body[data_offset..][0..response_size],
         .status = readLe(i32, response_body, data_offset + response_size),
@@ -702,6 +717,55 @@ test "dispatch v6 request end-to-end" {
     var resp: kms.ResponseV6 = undefined;
     const result = kms.decryptResponseV6(&resp, parsed.data.len, @constCast(parsed.data), &request_client, null);
     try std.testing.expect(result.ok());
+}
+
+test "dispatch unsupported KMS version returns HRESULT" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = kms.ServerConfig{ .data = &td.data };
+    var base = makeBase(&td.data);
+    base.version = 7 << 16; // unsupported major version
+
+    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    const rng = prng.random();
+
+    var request_v6: kms.RequestV6 = undefined;
+    kms.createRequestV6(&request_v6, &base, rng);
+
+    var negotiation = BindNegotiation{ .ndr_ctx = 0, .ndr64_ctx = 1 };
+    const e_invalid_arg: i32 = @bitCast(@as(u32, 0x8007000D));
+
+    // NDR64 error path must not overrun the body (regression: DataSizeIs was
+    // written past the buffer when the payload was rejected).
+    {
+        const rpc_request = try wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), true, 2);
+        defer alloc.free(rpc_request);
+        const dispatch = try dispatchKmsRequest(alloc, rpc_request[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
+        const resp_body = switch (dispatch) {
+            .fault => return error.TestUnexpectedResult,
+            .response => |body| body,
+        };
+        defer alloc.free(resp_body);
+        const parsed = parseKmsResponse(resp_body, true);
+        try std.testing.expectEqual(e_invalid_arg, parsed.status);
+        try std.testing.expectEqual(@as(usize, 0), parsed.data.len);
+    }
+
+    // NDR32 error path.
+    {
+        const rpc_request = try wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), false, 2);
+        defer alloc.free(rpc_request);
+        const dispatch = try dispatchKmsRequest(alloc, rpc_request[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
+        const resp_body = switch (dispatch) {
+            .fault => return error.TestUnexpectedResult,
+            .response => |body| body,
+        };
+        defer alloc.free(resp_body);
+        const parsed = parseKmsResponse(resp_body, false);
+        try std.testing.expectEqual(e_invalid_arg, parsed.status);
+    }
 }
 
 test "BTFN bind negotiation round-trip" {

@@ -93,6 +93,9 @@ fn cString(raw: []const u8, offset: usize) error{InvalidFormat}![]const u8 {
 pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
     if (raw.len < header_size) return error.InvalidFormat;
     if (!std.mem.eql(u8, raw[0..4], "KMD\x00")) return error.InvalidFormat;
+    // Mirrors `loadKmsData` (`data[size-1] != 0` → format error when
+    // UNSAFE_DATA_LOAD is off).
+    if (raw[raw.len - 1] != 0) return error.InvalidFormat;
 
     const minor_ver = readLe(u16, raw, 4);
     const major_ver = readLe(u16, raw, 6);
