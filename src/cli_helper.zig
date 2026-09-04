@@ -70,38 +70,91 @@ pub fn parseGuid(str: []const u8) error{InvalidGuid}![16]u8 {
     return out;
 }
 
-/// Fixed-format logger writing to stdout. No CLI surface (see `docs/cli.md`):
-/// redirecting/persisting output is the supervisor's (systemd/Docker) job.
-pub const Logger = struct {
-    file_writer: std.Io.File.Writer,
-    mutex: std.atomic.Mutex = .unlocked,
+/// Log level, from most to least verbose.
+pub const Level = enum {
+    debug,
+    info,
+    warn,
+    err,
+};
 
-    pub fn init(io: Io, buffer: []u8) Logger {
-        return .{ .file_writer = std.Io.File.writer(std.Io.File.stdout(), io, buffer) };
+/// Timestamped, leveled logger. `debug`/`info` write to stdout; `warn`/`err`
+/// write to stderr (Unix convention). Every line is prefixed with a UTC
+/// ISO-8601 timestamp. The format is fixed — no CLI surface (see `docs/cli.md`).
+pub const Logger = struct {
+    io: Io,
+    out_writer: std.Io.File.Writer,
+    err_writer: std.Io.File.Writer,
+    mutex: std.atomic.Mutex = .unlocked,
+    /// Messages below this level are dropped.
+    min_level: Level = .info,
+
+    pub fn init(io: Io, out_buffer: []u8, err_buffer: []u8) Logger {
+        return .{
+            .io = io,
+            .out_writer = std.Io.File.writer(std.Io.File.stdout(), io, out_buffer),
+            .err_writer = std.Io.File.writer(std.Io.File.stderr(), io, err_buffer),
+        };
     }
 
-    fn emit(self: *Logger, level: []const u8, comptime fmt: []const u8, args: anytype) void {
+    fn emit(self: *Logger, level: Level, comptime fmt: []const u8, args: anytype) void {
+        if (@intFromEnum(level) < @intFromEnum(self.min_level)) return;
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
-        const w = &self.file_writer.interface;
-        w.writeAll(level) catch {};
+        const to_err = level == .warn or level == .err;
+        const w: *std.Io.Writer = if (to_err) &self.err_writer.interface else &self.out_writer.interface;
+        writeTimestamp(w, self.io);
+        w.writeAll(levelLabel(level)) catch {};
         w.print(fmt, args) catch {};
         w.writeAll("\n") catch {};
         w.flush() catch {};
     }
 
+    pub fn debug(self: *Logger, comptime fmt: []const u8, args: anytype) void {
+        self.emit(.debug, fmt, args);
+    }
+
     pub fn info(self: *Logger, comptime fmt: []const u8, args: anytype) void {
-        self.emit("", fmt, args);
+        self.emit(.info, fmt, args);
     }
 
     pub fn warn(self: *Logger, comptime fmt: []const u8, args: anytype) void {
-        self.emit("warning: ", fmt, args);
+        self.emit(.warn, fmt, args);
     }
 
     pub fn err(self: *Logger, comptime fmt: []const u8, args: anytype) void {
-        self.emit("error: ", fmt, args);
+        self.emit(.err, fmt, args);
     }
 };
+
+fn levelLabel(level: Level) []const u8 {
+    return switch (level) {
+        .debug => "debug: ",
+        .info => "",
+        .warn => "warning: ",
+        .err => "error: ",
+    };
+}
+
+/// Write a UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp followed by a space.
+fn writeTimestamp(w: *std.Io.Writer, io: Io) void {
+    const secs: u64 = @intCast(@divTrunc(Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_s));
+    const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
+    const yad = epoch.getEpochDay().calculateYearDay();
+    const mad = yad.calculateMonthDay();
+    const day_secs: u64 = secs % 86400;
+    var buf: [20]u8 = undefined;
+    const ts = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        @as(u32, yad.year),
+        @as(u32, @intFromEnum(mad.month)) + 1,
+        @as(u32, mad.day_index) + 1,
+        @as(u32, @intCast(day_secs / 3600)),
+        @as(u32, @intCast((day_secs % 3600) / 60)),
+        @as(u32, @intCast(day_secs % 60)),
+    }) catch unreachable;
+    w.writeAll(ts) catch {};
+    w.writeAll(" ") catch {};
+}
 
 /// Current Unix time in seconds (via the `realtime` clock).
 pub fn nowUnix(io: Io) i64 {

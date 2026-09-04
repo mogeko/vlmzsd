@@ -37,7 +37,7 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
 | Network | `src/network.zig` | `std.Io` sockets: server loop, client connect (DNS), private-IP detection |
 | Server | `src/main.zig` | `vlmzsd` CLI + accept loop + thread-per-connection |
 | Client | `src/vlmzs.zig` | `vlmzs` activation client |
-| Shared | `src/cli_helper.zig` | logger, value parsers (duration/bool/GUID) |
+| Shared | `src/cli_helper.zig` | timestamped logger (stdout/stderr split), value parsers (duration/bool/GUID) |
 | Tests | `src/testutil.zig` | byte-compare / hex-diff helpers |
 
 ## Wire compatibility (core invariant)
@@ -61,7 +61,9 @@ source linked above).
 - Idiomatic Zig first: `std.crypto`, `std.Io` / `std.net`, `std.unicode`, `std.mem` — not C-style logic.
 - No global state: pass context / allocator / RNG explicitly.
 - CLI: two binaries, no config file — `docs/cli.md` is the authoritative spec. Three-tier
-  precedence `default < VLMZSD_*/env < CLI`; logging is a fixed format on stdout only.
+  precedence `default < VLMZSD_*/env < CLI`.
+- Logging: fixed format with a UTC timestamp; `debug`/`info` → stdout, `warn`/`err` → stderr.
+  `--verbose` enables `debug`, `--quiet` drops `info` (see `docs/cli.md`).
 - Tests: byte-level round-trips and golden hex vectors (hard-coded in `src/crypto.zig`).
 
 ## Pitfalls

@@ -293,7 +293,6 @@ const ClientContext = struct {
     use_btfn: bool,
     disconnect_per_request: bool,
     timeout_seconds: u32,
-    verbose: bool,
     sem: ?*Io.Semaphore,
     log: *cli_helper.Logger,
 };
@@ -308,7 +307,7 @@ fn serveClientThread(ctx: *ClientContext) void {
         ctx.gpa.destroy(ctx);
     }
 
-    if (ctx.verbose) ctx.log.info("connection accepted", .{});
+    ctx.log.debug("connection accepted", .{});
 
     const now_unix = cli_helper.nowUnix(ctx.io);
 
@@ -354,11 +353,13 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var log_buf: [4096]u8 = undefined;
-    var log = cli_helper.Logger.init(init.io, &log_buf);
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var log = cli_helper.Logger.init(init.io, &out_buf, &err_buf);
 
     var opts = try resolveOptions(init.gpa, init.environ_map, &res.args);
     defer opts.deinit(init.gpa);
+    log.min_level = if (opts.quiet) .warn else if (opts.verbose) .debug else .info;
 
     // Load the KMS data: external file overrides the embedded default.
     var kmd_owned = false;
@@ -508,7 +509,7 @@ pub fn main(init: std.process.Init) !void {
             if (opts.ip_protection & 2 != 0) {
                 if (!network.isClientPrivate(stream.socket.handle)) {
                     stream.close(init.io);
-                    if (opts.verbose) log.info("client with public IP address rejected", .{});
+                    log.debug("client with public IP address rejected", .{});
                     continue;
                 }
             }
@@ -533,7 +534,6 @@ pub fn main(init: std.process.Init) !void {
                 .use_btfn = opts.btfn,
                 .disconnect_per_request = opts.disconnect_per_request,
                 .timeout_seconds = @intCast(opts.timeout_seconds),
-                .verbose = opts.verbose,
                 .sem = if (sem_active) &sem else null,
                 .log = &log,
             };

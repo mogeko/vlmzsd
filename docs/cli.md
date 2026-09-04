@@ -130,14 +130,17 @@ Grouped by concern (help is rendered in these groups).
 | Option | Short | Default | Env var | Notes |
 |---|---|---|---|---|
 | `--pid-file <file>` | | — | `VLMZSD_PID_FILE` | write PID to file |
-| `--verbose` / `--quiet` | `-v` / `-q` | off | `VLMZSD_VERBOSE` | verbosity of stdout logging |
+| `--verbose` / `--quiet` | `-v` / `-q` | off | `VLMZSD_VERBOSE` | enable `debug` / drop `info` |
 
 ### Logging
 
-Logging has **no CLI surface**. Output is a **fixed format** written to
-**stdout** only; there is no `--log`, `--log-timestamp`, or log-level flag.
-Redirecting/persisting logs is the job of the supervisor (systemd/journald,
-Docker). This is a deliberate simplification of the C `-l`/`-T`/`-e` options.
+Logging has **no CLI surface**. Output is a **fixed format** prefixed with a
+UTC ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`); the timestamp is always on and
+cannot be configured. `debug`/`info` messages go to **stdout**, `warn`/`err`
+messages go to **stderr** (Unix convention). `--verbose` enables `debug`;
+`--quiet` drops `info`. Redirecting/persisting logs is the job of the
+supervisor (systemd/journald, Docker). This is a deliberate simplification of
+the C `-l`/`-T`/`-e` options.
 
 ## 6. Client (`vlmzs`) options
 
@@ -187,8 +190,8 @@ The following C surface is intentionally **not** carried over, with rationale:
 | `-F0`/`-F1` (freebind) | exotic; revisit if requested |
 | `-x <level>` (exit-on-warning) | removed; warnings never terminate the server |
 | `-O <vpn>` (TAP adapter) | Windows/OpenVPN-specific; out of scope |
-| `-l syslog\|<file>`, `-T0`/`-T1` | logging is fixed-format stdout; supervisor handles files |
-| `-e` (log to stdout) | stdout is the only destination, so redundant |
+| `-l syslog\|<file>`, `-T0`/`-T1` | logging is fixed-format (timestamped); supervisor handles files |
+| `-e` (log to stdout) | redundant: `info`→stdout, `warn`/`err`→stderr is the default split |
 | `-Z` (SIGHUP restart) | internal; re-add only if signal handling is needed |
 
 ## 8. Implementation decisions
@@ -203,7 +206,8 @@ The following C surface is intentionally **not** carried over, with rationale:
   `src/vlmzs.zig` (`vlmzs`) both import the `vlmzsd` module; argument parsing
   and option-to-config mapping live in shared code (e.g. `src/cli_helper.zig`).
 - **Logging: no external library.** Zig has no community-standard log library,
-  and `std.log` does not match the "fixed format → stdout" requirement. Logging
-  is a small hand-written helper (~20 lines) writing a fixed format to stdout.
+  and `std.log` does not match the "fixed format, timestamped, stdout/stderr
+  split" requirement. Logging is a small hand-written helper in
+  `src/cli_helper.zig`.
 - **Version pinning risk:** zig-clap's `master` tracks Zig master; when adding
   the dependency, pin the release tag that supports Zig `0.16.0`.

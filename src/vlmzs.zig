@@ -320,10 +320,12 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var log_buf: [4096]u8 = undefined;
-    var log = cli_helper.Logger.init(init.io, &log_buf);
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var log = cli_helper.Logger.init(init.io, &out_buf, &err_buf);
 
     var opts = try resolveOptions(&res.args, res.positionals, &log);
+    if (opts.verbose) log.min_level = .debug;
 
     var data = try kmsdata.parse(init.gpa, embedded_kmd);
     defer data.deinit(init.gpa);
