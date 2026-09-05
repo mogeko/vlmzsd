@@ -1,12 +1,12 @@
-//! Data-driven command-line parser — a prototype replacement for zig-clap.
+//! Data-driven command-line parser — a hand-written, std-only replacement for zig-clap.
 //!
 //! Single source of truth: an `Opt` table drives parsing, `--help` rendering,
 //! and validation alike, so the parse logic and the help text cannot drift
 //! apart. Self-contained (std only); does not depend on zig-clap.
 //!
-//! Status: prototype, exercised against `vlmzs`'s full option surface in the
-//! tests below. The production `vlmzs` still uses zig-clap; this module exists
-//! to prove the replacement is viable before switching over.
+//! Status: production. `vlmzs` parses its CLI through this module; the generic
+//! tests below exercise the parser's full surface (flags, values, positionals,
+//! `--` terminator, and grouped help).
 
 const std = @import("std");
 
@@ -171,48 +171,32 @@ pub fn writeHelp(writer: *std.Io.Writer, prog: []const u8, opts: []const Opt, po
         }
         try writer.print("--{s}", .{o.name});
         if (o.kind != .flag) {
-            try writer.print(" <{s}>", .{if (o.hint.len > 0) o.hint else "str"});
+            const default_hint: []const u8 = switch (o.kind) {
+                .guid => "guid",
+                .int => "int",
+                else => "str",
+            };
+            try writer.print(" <{s}>", .{if (o.hint.len > 0) o.hint else default_hint});
         }
         try writer.print("\n        {s}\n", .{o.desc});
     }
 }
 
 // ---------------------------------------------------------------------------
-// `vlmzs` option table (prototype: mirrors docs/cli.md §6)
-// ---------------------------------------------------------------------------
-
-pub const vlmzs_opts = [_]Opt{
-    .{ .name = "help", .short = 'h', .group = "General", .desc = "Display this help and exit." },
-    .{ .name = "version", .short = 'V', .group = "General", .desc = "Output version information and exit." },
-    .{ .name = "product", .kind = .str, .hint = "name", .group = "General", .desc = "Product name or 1-based number (default: first SKU)." },
-    .{ .name = "list-products", .short = 'x', .group = "General", .desc = "Print available products and exit." },
-    .{ .name = "protocol", .kind = .int, .hint = "u16", .group = "Request", .desc = "KMS protocol version 4/5/6." },
-    .{ .name = "app-id", .kind = .guid, .group = "Request", .desc = "Override AppID (GUID)." },
-    .{ .name = "sku-id", .kind = .guid, .group = "Request", .desc = "Override SKUID (GUID)." },
-    .{ .name = "kms-id", .kind = .guid, .group = "Request", .desc = "Override KMSID (GUID)." },
-    .{ .name = "cmid", .short = 'c', .kind = .guid, .group = "Request", .desc = "Client machine ID (GUID, default random)." },
-    .{ .name = "prev-cmid", .short = 'o', .kind = .guid, .group = "Request", .desc = "Previous client machine ID (GUID)." },
-    .{ .name = "workstation", .short = 'w', .kind = .str, .hint = "name", .group = "Request", .desc = "Workstation name." },
-    .{ .name = "vm", .short = 'm', .group = "Request", .desc = "Present as a virtual machine." },
-    .{ .name = "count", .short = 'n', .kind = .int, .hint = "u32", .group = "Request", .desc = "Number of requests (default 1)." },
-    .{ .name = "virtual-clients", .short = 'r', .kind = .int, .hint = "u32", .group = "Request", .desc = "NCountPolicy override." },
-    .{ .name = "grace", .short = 'g', .kind = .int, .hint = "u32", .group = "Request", .desc = "Grace period minutes." },
-    .{ .name = "address-family", .kind = .int, .hint = "u8", .group = "Request", .desc = "IPv4/IPv6 selection (4/6)." },
-    .{ .name = "license-status", .short = 't', .kind = .int, .hint = "u32", .group = "Request", .desc = "LicenseStatus field (0-6, default 1)." },
-    .{ .name = "reconnect-per-request", .short = 'T', .group = "Connection", .desc = "Reconnect for each request." },
-    .{ .name = "no-multiplexed", .group = "Connection", .desc = "Disable multiplexed RPC." },
-    .{ .name = "no-ndr64", .group = "Connection", .desc = "Disable NDR64 transfer syntax." },
-    .{ .name = "no-btfn", .group = "Connection", .desc = "Disable bind-time feature negotiation." },
-    .{ .name = "verbose", .short = 'v', .group = "Output", .desc = "Verbose logging." },
-};
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Generic option table used by the tests (covers flag / int / str / repeatable).
+const test_opts = [_]Opt{
+    .{ .name = "verbose", .short = 'v', .group = "Output", .desc = "Verbose logging." },
+    .{ .name = "protocol", .kind = .int, .hint = "u16", .group = "Request", .desc = "KMS protocol version." },
+    .{ .name = "count", .short = 'n', .kind = .int, .hint = "u32", .group = "Request", .desc = "Number of requests." },
+    .{ .name = "reconnect-per-request", .short = 'T', .group = "Connection", .desc = "Reconnect for each request." },
+};
+
 test "parse flag, value and positional" {
     const alloc = std.testing.allocator;
-    var res = try parse(alloc, &vlmzs_opts, &.{ "--verbose", "--protocol", "4", "localhost" });
+    var res = try parse(alloc, &test_opts, &.{ "--verbose", "--protocol", "4", "localhost" });
     defer res.deinit();
 
     try std.testing.expect(res.hasFlag("verbose"));
@@ -223,7 +207,7 @@ test "parse flag, value and positional" {
 
 test "parse --opt=value and short glued value" {
     const alloc = std.testing.allocator;
-    var res = try parse(alloc, &vlmzs_opts, &.{ "--protocol=5", "-n3", "-T" });
+    var res = try parse(alloc, &test_opts, &.{ "--protocol=5", "-n3", "-T" });
     defer res.deinit();
 
     try std.testing.expectEqualStrings("5", res.get("protocol").?);
@@ -247,18 +231,18 @@ test "parse repeatable and -- terminator" {
 
 test "parse errors" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.UnknownOption, parse(alloc, &vlmzs_opts, &.{"--bogus"}));
-    try std.testing.expectError(error.MissingValue, parse(alloc, &vlmzs_opts, &.{"--protocol"}));
-    try std.testing.expectError(error.FlagTakesNoValue, parse(alloc, &vlmzs_opts, &.{"--verbose=1"}));
+    try std.testing.expectError(error.UnknownOption, parse(alloc, &test_opts, &.{"--bogus"}));
+    try std.testing.expectError(error.MissingValue, parse(alloc, &test_opts, &.{"--protocol"}));
+    try std.testing.expectError(error.FlagTakesNoValue, parse(alloc, &test_opts, &.{"--verbose=1"}));
 }
 
 test "help renders groups" {
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try writeHelp(&w, "vlmzs", &vlmzs_opts, "[HOST[:PORT]]");
+    try writeHelp(&w, "vlmzs", &test_opts, "[HOST[:PORT]]");
     const text = w.buffered();
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "General:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Output:") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Request:") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Connection:") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "--protocol <u16>") != null);

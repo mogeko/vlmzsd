@@ -4,9 +4,9 @@
 //! activation requests to an existing KMS server and prints the result.
 
 const std = @import("std");
-const clap = @import("clap");
 const vlmzsd = @import("vlmzsd");
 const cli_helper = vlmzsd.cli_helper;
+const argparse = vlmzsd.argparse;
 
 const kms = vlmzsd.kms;
 const kmsdata = vlmzsd.kmsdata;
@@ -120,32 +120,32 @@ fn formatUtc(unix: i64, buf: []u8) []const u8 {
     }) catch unreachable;
 }
 
-const params = clap.parseParamsComptime(
-    \\-h, --help                  Display this help and exit.
-    \\-V, --version               Output version information and exit.
-    \\    --product <str>         Product name or number (default: first SKU).
-    \\    --protocol <u16>        KMS protocol version 4/5/6.
-    \\    --app-id <str>          Override AppID (GUID).
-    \\    --sku-id <str>          Override SKUID (GUID).
-    \\    --kms-id <str>          Override KMSID (GUID).
-    \\-c, --cmid <str>            Client machine ID (GUID, default random).
-    \\-o, --prev-cmid <str>       Previous client machine ID (GUID).
-    \\-w, --workstation <str>     Workstation name.
-    \\-m, --vm                    Present as a virtual machine.
-    \\-n, --count <u32>           Number of requests (default 1).
-    \\-r, --virtual-clients <u32> NCountPolicy override.
-    \\-g, --grace <u32>           Grace period minutes.
-    \\    --address-family <u8>   IPv4/IPv6 selection (4/6).
-    \\-x, --list-products         Print available products and exit.
-    \\-t, --license-status <u32>  LicenseStatus field (0-6, default 1).
-    \\-T, --reconnect-per-request Reconnect for each request.
-    \\    --no-multiplexed        Disable multiplexed RPC (default on).
-    \\    --no-ndr64              Disable NDR64 (default on).
-    \\    --no-btfn               Disable bind-time feature negotiation (default on).
-    \\-v, --verbose               Verbose logging.
-    \\<str>                       KMS server host[:port].
-    \\
-);
+/// Data-driven option table for `vlmzs` (docs/cli.md §6). Single source of
+/// truth: drives parsing, `--help` rendering, and validation alike.
+const vlmzs_opts = [_]argparse.Opt{
+    .{ .name = "help", .short = 'h', .group = "General", .desc = "Display this help and exit." },
+    .{ .name = "version", .short = 'V', .group = "General", .desc = "Output version information and exit." },
+    .{ .name = "product", .kind = .str, .hint = "name", .group = "General", .desc = "Product name or 1-based number (default: first SKU)." },
+    .{ .name = "list-products", .short = 'x', .group = "General", .desc = "Print available products and exit." },
+    .{ .name = "protocol", .kind = .int, .hint = "u16", .group = "Request", .desc = "KMS protocol version 4/5/6." },
+    .{ .name = "app-id", .kind = .guid, .group = "Request", .desc = "Override AppID (GUID)." },
+    .{ .name = "sku-id", .kind = .guid, .group = "Request", .desc = "Override SKUID (GUID)." },
+    .{ .name = "kms-id", .kind = .guid, .group = "Request", .desc = "Override KMSID (GUID)." },
+    .{ .name = "cmid", .short = 'c', .kind = .guid, .group = "Request", .desc = "Client machine ID (GUID, default random)." },
+    .{ .name = "prev-cmid", .short = 'o', .kind = .guid, .group = "Request", .desc = "Previous client machine ID (GUID)." },
+    .{ .name = "workstation", .short = 'w', .kind = .str, .hint = "name", .group = "Request", .desc = "Workstation name." },
+    .{ .name = "vm", .short = 'm', .group = "Request", .desc = "Present as a virtual machine." },
+    .{ .name = "count", .short = 'n', .kind = .int, .hint = "u32", .group = "Request", .desc = "Number of requests (default 1)." },
+    .{ .name = "virtual-clients", .short = 'r', .kind = .int, .hint = "u32", .group = "Request", .desc = "NCountPolicy override." },
+    .{ .name = "grace", .short = 'g', .kind = .int, .hint = "u32", .group = "Request", .desc = "Grace period minutes." },
+    .{ .name = "address-family", .kind = .int, .hint = "u8", .group = "Request", .desc = "IPv4/IPv6 selection (4/6)." },
+    .{ .name = "license-status", .short = 't', .kind = .int, .hint = "u32", .group = "Request", .desc = "LicenseStatus field (0-6, default 1)." },
+    .{ .name = "reconnect-per-request", .short = 'T', .group = "Connection", .desc = "Reconnect for each request." },
+    .{ .name = "no-multiplexed", .group = "Connection", .desc = "Disable multiplexed RPC." },
+    .{ .name = "no-ndr64", .group = "Connection", .desc = "Disable NDR64 transfer syntax." },
+    .{ .name = "no-btfn", .group = "Connection", .desc = "Disable bind-time feature negotiation." },
+    .{ .name = "verbose", .short = 'v', .group = "Output", .desc = "Verbose logging." },
+};
 
 const ClientOptions = struct {
     host: ?[]const u8 = null,
@@ -196,53 +196,40 @@ fn parseHostPort(host_arg: []const u8) !struct { host: []const u8, port: u16 } {
     return .{ .host = host_arg, .port = default_port };
 }
 
-fn resolveOptions(args: anytype, positionals: anytype, out: *Output) !ClientOptions {
-    // zig-clap names hyphenated long options verbatim; access via @field.
-    const virtual_clients = @field(args, "virtual-clients");
-    const license_status = @field(args, "license-status");
-    const address_family = @field(args, "address-family");
-    const prev_cmid = @field(args, "prev-cmid");
-    const list_products = @field(args, "list-products");
-    const reconnect_per_request = @field(args, "reconnect-per-request");
-    const no_multiplexed = @field(args, "no-multiplexed");
-    const no_ndr64 = @field(args, "no-ndr64");
-    const no_btfn = @field(args, "no-btfn");
-    const app_id = @field(args, "app-id");
-    const sku_id = @field(args, "sku-id");
-    const kms_id = @field(args, "kms-id");
-
-    const host_arg = positionals[0];
-
+fn resolveOptions(res: *const argparse.Result, out: *Output) !ClientOptions {
     var opts = ClientOptions{};
-    if (host_arg) |ha| {
-        const hp = try parseHostPort(ha);
+
+    // Positional HOST[:PORT].
+    if (res.positionals.items.len > 0) {
+        const hp = try parseHostPort(res.positionals.items[0]);
         opts.host = hp.host;
         opts.port = hp.port;
     }
-    opts.product = args.product;
-    opts.protocol = args.protocol orelse 0;
-    if (app_id) |s| opts.app_id = try cli_helper.parseGuid(s);
-    if (sku_id) |s| opts.sku_id = try cli_helper.parseGuid(s);
-    if (kms_id) |s| opts.kms_id = try cli_helper.parseGuid(s);
-    if (args.cmid) |s| opts.cmid = try cli_helper.parseGuid(s);
-    if (prev_cmid) |s| opts.prev_cmid = try cli_helper.parseGuid(s);
-    opts.workstation = args.workstation;
-    opts.vm = args.vm != 0;
-    opts.count = args.count orelse 1;
-    opts.virtual_clients = virtual_clients orelse 0;
-    opts.grace = args.grace orelse default_grace_minutes;
-    opts.address_family = address_family orelse 0;
+
+    opts.product = res.get("product");
+    opts.protocol = if (res.get("protocol")) |s| try std.fmt.parseInt(u16, s, 10) else 0;
+    if (res.get("app-id")) |s| opts.app_id = try cli_helper.parseGuid(s);
+    if (res.get("sku-id")) |s| opts.sku_id = try cli_helper.parseGuid(s);
+    if (res.get("kms-id")) |s| opts.kms_id = try cli_helper.parseGuid(s);
+    if (res.get("cmid")) |s| opts.cmid = try cli_helper.parseGuid(s);
+    if (res.get("prev-cmid")) |s| opts.prev_cmid = try cli_helper.parseGuid(s);
+    opts.workstation = res.get("workstation");
+    opts.vm = res.hasFlag("vm");
+    opts.count = if (res.get("count")) |s| try std.fmt.parseInt(u32, s, 10) else 1;
+    opts.virtual_clients = if (res.get("virtual-clients")) |s| try std.fmt.parseInt(u32, s, 10) else 0;
+    opts.grace = if (res.get("grace")) |s| try std.fmt.parseInt(u32, s, 10) else default_grace_minutes;
+    opts.address_family = if (res.get("address-family")) |s| try std.fmt.parseInt(u8, s, 10) else 0;
     if (opts.address_family != 0 and opts.address_family != 4 and opts.address_family != 6) {
         out.eprint("error: --address-family must be 4 or 6\n", .{});
         return error.InvalidAddressFamily;
     }
-    opts.list_products = list_products != 0;
-    opts.license_status = license_status orelse 1;
-    opts.reconnect_per_request = reconnect_per_request != 0;
-    opts.multiplexed = no_multiplexed == 0;
-    opts.ndr64 = no_ndr64 == 0;
-    opts.btfn = no_btfn == 0;
-    opts.verbose = args.verbose != 0;
+    opts.list_products = res.hasFlag("list-products");
+    opts.license_status = if (res.get("license-status")) |s| try std.fmt.parseInt(u32, s, 10) else 1;
+    opts.reconnect_per_request = res.hasFlag("reconnect-per-request");
+    opts.multiplexed = !res.hasFlag("no-multiplexed");
+    opts.ndr64 = !res.hasFlag("no-ndr64");
+    opts.btfn = !res.hasFlag("no-btfn");
+    opts.verbose = res.hasFlag("verbose");
 
     return opts;
 }
@@ -562,21 +549,33 @@ fn listProducts(data: *const kmsdata.KmsData, out: *Output) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var diag = clap.Diagnostic{};
-    var res = clap.parse(clap.Help, &params, clap.parsers.default, init.minimal.args, .{
-        .diagnostic = &diag,
-        .allocator = init.gpa,
-    }) catch |err| {
-        try diag.reportToFile(init.io, .stderr(), err);
+    // Collect the raw arguments (skip argv[0]).
+    var args_list: std.ArrayList([]const u8) = .empty;
+    defer args_list.deinit(init.gpa);
+    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+    _ = args_iter.skip();
+    while (args_iter.next()) |arg| {
+        try args_list.append(init.gpa, arg);
+    }
+
+    var res = argparse.parse(init.gpa, &vlmzs_opts, args_list.items) catch |err| {
+        // Short diagnostic; the full help is one `--help` away.
+        var ebuf: [256]u8 = undefined;
+        var ew = std.Io.File.writer(std.Io.File.stderr(), init.io, &ebuf);
+        try ew.interface.print("vlmzs: error: {s}\n", .{@errorName(err)});
+        try ew.interface.flush();
         return err;
     };
     defer res.deinit();
 
-    if (res.args.help != 0) {
-        try clap.helpToFile(init.io, .stderr(), clap.Help, &params, .{});
+    if (res.hasFlag("help")) {
+        var hbuf: [4096]u8 = undefined;
+        var hw = std.Io.File.writer(std.Io.File.stderr(), init.io, &hbuf);
+        try argparse.writeHelp(&hw.interface, "vlmzs", &vlmzs_opts, "[HOST[:PORT]]");
+        try hw.interface.flush();
         return;
     }
-    if (res.args.version != 0) {
+    if (res.hasFlag("version")) {
         var buf: [64]u8 = undefined;
         var fw = std.Io.File.writer(std.Io.File.stdout(), init.io, &buf);
         try fw.interface.print("vlmzs {s}\n", .{version});
@@ -588,7 +587,7 @@ pub fn main(init: std.process.Init) !void {
     var err_buf: [4096]u8 = undefined;
     var out = Output.init(init.io, &out_buf, &err_buf);
 
-    var opts = try resolveOptions(&res.args, res.positionals, &out);
+    var opts = try resolveOptions(&res, &out);
 
     var data = try kmsdata.parse(init.gpa, embedded_kmd);
     defer data.deinit(init.gpa);

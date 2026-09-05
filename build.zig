@@ -50,7 +50,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "vlmzsd", .module = mod },
-                .{ .name = "clap", .module = clap_mod },
             },
         }),
     });

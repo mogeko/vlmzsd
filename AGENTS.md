@@ -16,7 +16,8 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
   `std.Io` APIs — do not regress to the older `std.process.argsAlloc` style.
 - **Package**: module `vlmzsd` (root `src/root.zig`), executables `src/main.zig` (`vlmzsd` server)
   and `src/vlmzs.zig` (`vlmzs` client).
-- **Dependencies**: `zig-clap` (Hejsil/zig-clap) — the only external dependency, for CLI parsing.
+- **Dependencies**: `zig-clap` (Hejsil/zig-clap) — the only external dependency; used only by the
+  `vlmzsd` server (`src/main.zig`). The `vlmzs` client uses the std-only `src/argparse.zig`.
   Pin the tag compatible with Zig `0.16.0`.
 
 ## Build / test
@@ -38,6 +39,7 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
 | Server | `src/main.zig` | `vlmzsd` CLI + accept loop + thread-per-connection |
 | Client | `src/vlmzs.zig` | `vlmzs` activation client |
 | Shared | `src/cli_helper.zig` | timestamped logger (stdout/stderr split), value parsers (duration/bool/GUID) |
+| CLI parser | `src/argparse.zig` | std-only data-driven parser (Opt table → parse/help/validate); used by `vlmzs` |
 | Tests | `src/testutil.zig` | byte-compare / hex-diff helpers |
 
 ## Wire compatibility (core invariant)
@@ -68,11 +70,12 @@ source linked above).
 
 ## CLI implementation decisions
 
-- **Argument parsing: `zig-clap`** (Hejsil/zig-clap) — the closest thing Zig has to a
-  community-standard CLI library (à la Rust `clap`): short/long options, repeatable options,
-  `--opt=value`, and automatic help generation. It is the project's first external dependency
-  (added to `build.zig.zon`). The three-tier env-var precedence is implemented as a thin layer
-  on top of zig-clap's parsed result — independent of the parser choice.
+- **Argument parsing: data-driven, std-only.** `vlmzs` uses `src/argparse.zig` — a hand-written
+  parser where a single `Opt` table drives parsing, `--help` rendering, and validation (so the
+  parse logic and help text cannot drift apart). The `vlmzsd` server (`src/main.zig`) still uses
+  `zig-clap` (Hejsil/zig-clap), the project's only external dependency, added to `build.zig.zon`.
+  The three-tier env-var precedence is implemented as a thin layer on top of the parsed result —
+  independent of the parser choice.
 - **Two entry points share one module.** `src/main.zig` (`vlmzsd`) and `src/vlmzs.zig` (`vlmzs`)
   both import the `vlmzsd` module; argument parsing and option-to-config mapping live in shared
   code (e.g. `src/cli_helper.zig`).
