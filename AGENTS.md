@@ -17,7 +17,7 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
 - **Package**: module `vlmzsd` (root `src/root.zig`), executables `src/main.zig` (`vlmzsd` server)
   and `src/vlmzs.zig` (`vlmzs` client).
 - **Dependencies**: `zig-clap` (Hejsil/zig-clap) — the only external dependency; used only by the
-  `vlmzsd` server (`src/main.zig`). The `vlmzs` client uses the std-only `src/argparse.zig`.
+  `vlmzsd` server (`src/main.zig`). The `vlmzs` client uses the std-only `src/cli_helper.zig`.
   Pin the tag compatible with Zig `0.16.0`.
 
 ## Build / test
@@ -38,8 +38,7 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
 | Network | `src/network.zig` | `std.Io` sockets: server loop, client connect (DNS), private-IP detection |
 | Server | `src/main.zig` | `vlmzsd` CLI + accept loop + thread-per-connection |
 | Client | `src/vlmzs.zig` | `vlmzs` activation client |
-| Shared | `src/cli_helper.zig` | timestamped logger (stdout/stderr split), value parsers (duration/bool/GUID) |
-| CLI parser | `src/argparse.zig` | std-only data-driven parser (Opt table → parse/help/validate); used by `vlmzs` |
+| Shared | `src/cli_helper.zig` | data-driven CLI parser (Opt table → parse/help/validate), value parsers (duration/bool/GUID), timestamped logger |
 | Tests | `src/testutil.zig` | byte-compare / hex-diff helpers |
 
 ## Wire compatibility (core invariant)
@@ -70,7 +69,7 @@ source linked above).
 
 ## CLI implementation decisions
 
-- **Argument parsing: data-driven, std-only.** `vlmzs` uses `src/argparse.zig` — a hand-written
+- **Argument parsing: data-driven, std-only.** `vlmzs` uses `src/cli_helper.zig` — a hand-written
   parser where a single `Opt` table drives parsing, `--help` rendering, and validation (so the
   parse logic and help text cannot drift apart). The `vlmzsd` server (`src/main.zig`) still uses
   `zig-clap` (Hejsil/zig-clap), the project's only external dependency, added to `build.zig.zon`.

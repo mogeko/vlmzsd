@@ -6,7 +6,6 @@ pub const kms = @import("kms.zig");
 pub const rpc = @import("rpc.zig");
 pub const network = @import("network.zig");
 pub const cli_helper = @import("cli_helper.zig");
-pub const argparse = @import("argparse.zig");
 
 const std = @import("std");
 const testutil = @import("testutil.zig");
@@ -29,5 +28,4 @@ test {
     _ = rpc;
     _ = network;
     _ = cli_helper;
-    _ = argparse;
 }

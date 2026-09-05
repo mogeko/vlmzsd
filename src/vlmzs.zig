@@ -6,7 +6,6 @@
 const std = @import("std");
 const vlmzsd = @import("vlmzsd");
 const cli_helper = vlmzsd.cli_helper;
-const argparse = vlmzsd.argparse;
 
 const kms = vlmzsd.kms;
 const kmsdata = vlmzsd.kmsdata;
@@ -122,7 +121,7 @@ fn formatUtc(unix: i64, buf: []u8) []const u8 {
 
 /// Data-driven option table for `vlmzs` (docs/cli.md §6). Single source of
 /// truth: drives parsing, `--help` rendering, and validation alike.
-const vlmzs_opts = [_]argparse.Opt{
+const vlmzs_opts = [_]cli_helper.Opt{
     .{ .name = "help", .short = 'h', .group = "General", .desc = "Display this help and exit." },
     .{ .name = "version", .short = 'V', .group = "General", .desc = "Output version information and exit." },
     .{ .name = "product", .kind = .str, .hint = "name", .group = "General", .desc = "Product name or 1-based number (default: first SKU)." },
@@ -196,7 +195,7 @@ fn parseHostPort(host_arg: []const u8) !struct { host: []const u8, port: u16 } {
     return .{ .host = host_arg, .port = default_port };
 }
 
-fn resolveOptions(res: *const argparse.Result, out: *Output) !ClientOptions {
+fn resolveOptions(res: *const cli_helper.Result, out: *Output) !ClientOptions {
     var opts = ClientOptions{};
 
     // Positional HOST[:PORT].
@@ -558,7 +557,7 @@ pub fn main(init: std.process.Init) !void {
         try args_list.append(init.gpa, arg);
     }
 
-    var res = argparse.parse(init.gpa, &vlmzs_opts, args_list.items) catch |err| {
+    var res = cli_helper.parse(init.gpa, &vlmzs_opts, args_list.items) catch |err| {
         // Short diagnostic; the full help is one `--help` away.
         var ebuf: [256]u8 = undefined;
         var ew = std.Io.File.writer(std.Io.File.stderr(), init.io, &ebuf);
@@ -571,7 +570,7 @@ pub fn main(init: std.process.Init) !void {
     if (res.hasFlag("help")) {
         var hbuf: [4096]u8 = undefined;
         var hw = std.Io.File.writer(std.Io.File.stderr(), init.io, &hbuf);
-        try argparse.writeHelp(&hw.interface, "vlmzs", &vlmzs_opts, "[HOST[:PORT]]");
+        try cli_helper.writeHelp(&hw.interface, "vlmzs", &vlmzs_opts, "[HOST[:PORT]]");
         try hw.interface.flush();
         return;
     }
