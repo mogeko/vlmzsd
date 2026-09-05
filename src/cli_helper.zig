@@ -148,35 +148,62 @@ pub fn parse(allocator: Allocator, opts: []const Opt, args: []const []const u8) 
     return res;
 }
 
+/// Placeholder shown for a value-taking option when no explicit `hint` is set.
+fn defaultHint(kind: ValueKind) []const u8 {
+    return switch (kind) {
+        .guid => "guid",
+        .int => "int",
+        else => "str",
+    };
+}
+
+/// Width of the option spec column (`-x, --long <hint>`), excluding the
+/// leading indent. The `--name` part is aligned across options with and
+/// without a short flag.
+fn optColumnWidth(o: Opt) usize {
+    var w: usize = 4; // "-x, " or a four-space placeholder
+    w += 2 + o.name.len; // "--name"
+    if (o.kind != .flag) w += 3 + (if (o.hint.len > 0) o.hint else defaultHint(o.kind)).len; // " <hint>"
+    return w;
+}
+
 /// Render grouped `--help` text. `positional_hint` is the usage line's
-/// positional (e.g. "[HOST[:PORT]]").
+/// positional (e.g. "[HOST[:PORT]]"). Options are expected to be ordered by
+/// `group` (contiguous runs), so each group renders as one block.
 pub fn writeHelp(writer: *std.Io.Writer, prog: []const u8, opts: []const Opt, positional_hint: []const u8) !void {
     try writer.print("Usage: {s} [OPTIONS]", .{prog});
     if (positional_hint.len > 0) try writer.print(" {s}", .{positional_hint});
     try writer.print("\n\n", .{});
 
-    var current_group: ?[]const u8 = null;
-    for (opts) |o| {
-        if (current_group == null or !std.mem.eql(u8, current_group.?, o.group)) {
-            try writer.print("{s}:\n", .{o.group});
-            current_group = o.group;
+    // Per-group two passes: measure the group's widest option spec, then
+    // render the group with every description aligned to that column.
+    var i: usize = 0;
+    while (i < opts.len) {
+        const group = opts[i].group;
+
+        var max_width: usize = 0;
+        var j = i;
+        while (j < opts.len and std.mem.eql(u8, opts[j].group, group)) : (j += 1) {
+            const w = optColumnWidth(opts[j]);
+            if (w > max_width) max_width = w;
         }
-        try writer.print("    ", .{});
-        if (o.short) |s| {
-            try writer.print("-{c}, ", .{s});
-        } else {
+
+        try writer.print("{s}:\n", .{group});
+        while (i < j) : (i += 1) {
+            const o = opts[i];
             try writer.print("    ", .{});
+            if (o.short) |s| {
+                try writer.print("-{c}, ", .{s});
+            } else {
+                try writer.print("    ", .{});
+            }
+            try writer.print("--{s}", .{o.name});
+            if (o.kind != .flag) {
+                try writer.print(" <{s}>", .{if (o.hint.len > 0) o.hint else defaultHint(o.kind)});
+            }
+            try writer.splatByteAll(' ', max_width - optColumnWidth(o) + 2);
+            try writer.print("{s}\n", .{o.desc});
         }
-        try writer.print("--{s}", .{o.name});
-        if (o.kind != .flag) {
-            const default_hint: []const u8 = switch (o.kind) {
-                .guid => "guid",
-                .int => "int",
-                else => "str",
-            };
-            try writer.print(" <{s}>", .{if (o.hint.len > 0) o.hint else default_hint});
-        }
-        try writer.print("\n        {s}\n", .{o.desc});
     }
 }
 
