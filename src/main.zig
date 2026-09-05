@@ -5,10 +5,9 @@
 //! stdout logging, and a foreground accept/serve loop over `network.serveRpc`.
 
 const std = @import("std");
-const clap = @import("clap");
 const vlmzsd = @import("vlmzsd");
-const cli_helper = vlmzsd.cli_helper;
 
+const cli_helper = vlmzsd.cli_helper;
 const kms = vlmzsd.kms;
 const kmsdata = vlmzsd.kmsdata;
 const network = vlmzsd.network;
@@ -23,34 +22,6 @@ const default_port: u16 = 1688;
 
 /// Embedded default `.kmd` data (the vlmcsd default data file).
 const embedded_kmd: []const u8 = @embedFile("vlmcsd.kmd");
-
-const params = clap.parseParamsComptime(
-    \\-h, --help                       Display this help and exit.
-    \\-V, --version                    Output version information and exit.
-    \\-p, --port <u16>                 TCP listen port (default 1688).
-    \\-L, --listen <str>...            Listen address, repeatable (default ::, dual-stack).
-    \\    --timeout <str>              Idle timeout (default 30s, 0 disables).
-    \\-m, --max-clients <u32>          Concurrent client cap (default unlimited).
-    \\    --data <str>                 External .kmd data file (default embedded).
-    \\    --epid <str>...              ePID override name=epid, repeatable.
-    \\    --randomize <u8>             ePID randomization level 0/1/2 (default 1).
-    \\    --lcid <u32>                 Fixed LCID for randomized ePIDs.
-    \\    --build <u32>                Fixed build number for randomized ePIDs.
-    \\    --activation-interval <str>  VL activation interval (default 2h).
-    \\    --renewal-interval <str>     VL renewal interval (default 7d).
-    \\    --whitelist <u32>            Whitelisting level 0-3 (default 0).
-    \\    --ip-protection <u8>         Public-IP protection level 0-3 (default 0).
-    \\    --check-client-time          Validate client timestamp.
-    \\    --maintain-clients           Keep client list across requests.
-    \\    --start-empty                Start with empty client list.
-    \\    --no-ndr64                   Disable NDR64 transfer syntax (default on).
-    \\    --no-btfn                    Disable bind-time feature negotiation (default on).
-    \\    --disconnect-per-request     Disconnect after each request.
-    \\    --pid-file <str>             Write PID to file.
-    \\-v, --verbose                    Verbose logging.
-    \\-q, --quiet                      Quiet logging (warnings/errors only).
-    \\
-);
 
 /// Data-driven option table for `vlmzsd` (docs/cli.md §5). Single source of
 /// truth: drives parsing, `--help` rendering, and validation alike. The
@@ -590,92 +561,5 @@ pub fn main(init: std.process.Init) !void {
                 continue;
             };
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Parallel validation: the hand-written parser must agree with zig-clap.
-// `zig-clap` stays linked (vlmzsd no longer parses with it, but this test
-// keeps it as an independent oracle during the transition).
-// ---------------------------------------------------------------------------
-
-fn expectIntOpt(comptime T: type, clap_val: ?T, ap_val: ?[]const u8) !void {
-    if (clap_val) |cv| {
-        const av = try std.fmt.parseInt(T, ap_val.?, 10);
-        try std.testing.expectEqual(cv, av);
-    } else {
-        try std.testing.expect(ap_val == null);
-    }
-}
-
-fn expectStrOpt(clap_val: ?[]const u8, ap_val: ?[]const u8) !void {
-    if (clap_val) |cv| {
-        try std.testing.expectEqualStrings(cv, ap_val.?);
-    } else {
-        try std.testing.expect(ap_val == null);
-    }
-}
-
-fn expectList(clap_val: []const []const u8, ap_val: []const []const u8) !void {
-    try std.testing.expectEqual(clap_val.len, ap_val.len);
-    for (clap_val, ap_val) |cv, av| try std.testing.expectEqualStrings(cv, av);
-}
-
-test "cli_helper.parse agrees with zig-clap" {
-    const alloc = std.testing.allocator;
-    const cases = [_][]const []const u8{
-        &.{},
-        &.{ "--port", "1689", "--verbose" },
-        &.{ "-p1689", "-L", "0.0.0.0", "-L", "::", "--no-ndr64" },
-        &.{ "--timeout", "60s", "--max-clients", "10", "--data", "/tmp/x.kmd" },
-        &.{ "--epid", "Windows=xyz", "--epid", "Office=abc", "--randomize", "2" },
-        &.{ "--lcid", "1033", "--build", "9600", "--activation-interval", "3h" },
-        &.{ "--renewal-interval", "14d", "--whitelist", "2", "--ip-protection", "3" },
-        &.{ "--check-client-time", "--maintain-clients", "--start-empty" },
-        &.{ "--no-btfn", "--disconnect-per-request", "--pid-file", "/tmp/vlmzsd.pid" },
-        &.{"--quiet"},
-    };
-
-    for (cases) |argv| {
-        // zig-clap path (independent oracle).
-        var iter = clap.args.SliceIterator{ .args = argv };
-        var cres = try clap.parseEx(clap.Help, &params, clap.parsers.default, &iter, .{ .allocator = alloc });
-        defer cres.deinit();
-
-        // Hand-written parser path.
-        var ares = try cli_helper.parse(alloc, &vlmzsd_opts, argv);
-        defer ares.deinit();
-
-        // Flags.
-        try std.testing.expectEqual(cres.args.help != 0, ares.hasFlag("help"));
-        try std.testing.expectEqual(cres.args.version != 0, ares.hasFlag("version"));
-        try std.testing.expectEqual(@field(cres.args, "check-client-time") != 0, ares.hasFlag("check-client-time"));
-        try std.testing.expectEqual(@field(cres.args, "maintain-clients") != 0, ares.hasFlag("maintain-clients"));
-        try std.testing.expectEqual(@field(cres.args, "start-empty") != 0, ares.hasFlag("start-empty"));
-        try std.testing.expectEqual(@field(cres.args, "no-ndr64") != 0, ares.hasFlag("no-ndr64"));
-        try std.testing.expectEqual(@field(cres.args, "no-btfn") != 0, ares.hasFlag("no-btfn"));
-        try std.testing.expectEqual(@field(cres.args, "disconnect-per-request") != 0, ares.hasFlag("disconnect-per-request"));
-        try std.testing.expectEqual(cres.args.verbose != 0, ares.hasFlag("verbose"));
-        try std.testing.expectEqual(cres.args.quiet != 0, ares.hasFlag("quiet"));
-
-        // Integers.
-        try expectIntOpt(u16, cres.args.port, ares.get("port"));
-        try expectIntOpt(u32, @field(cres.args, "max-clients"), ares.get("max-clients"));
-        try expectIntOpt(u8, cres.args.randomize, ares.get("randomize"));
-        try expectIntOpt(u32, cres.args.lcid, ares.get("lcid"));
-        try expectIntOpt(u32, cres.args.build, ares.get("build"));
-        try expectIntOpt(u32, cres.args.whitelist, ares.get("whitelist"));
-        try expectIntOpt(u8, @field(cres.args, "ip-protection"), ares.get("ip-protection"));
-
-        // Strings.
-        try expectStrOpt(cres.args.timeout, ares.get("timeout"));
-        try expectStrOpt(cres.args.data, ares.get("data"));
-        try expectStrOpt(@field(cres.args, "activation-interval"), ares.get("activation-interval"));
-        try expectStrOpt(@field(cres.args, "renewal-interval"), ares.get("renewal-interval"));
-        try expectStrOpt(@field(cres.args, "pid-file"), ares.get("pid-file"));
-
-        // Repeatable lists.
-        try expectList(cres.args.listen, ares.getAll("listen"));
-        try expectList(cres.args.epid, ares.getAll("epid"));
     }
 }

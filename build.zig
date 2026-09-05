@@ -11,13 +11,6 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // External dependency: zig-clap for CLI argument parsing.
-    const clap_dep = b.dependency("clap", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const clap_mod = clap_dep.module("clap");
-
     // Expose the project version to source via `@import("build_options")`.
     const version_options = b.addOptions();
     version_options.addOption([]const u8, "version", version);
@@ -30,7 +23,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "vlmzsd", .module = mod },
-                .{ .name = "clap", .module = clap_mod },
             },
         }),
     });
