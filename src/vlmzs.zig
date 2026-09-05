@@ -122,28 +122,28 @@ fn formatUtc(unix: i64, buf: []u8) []const u8 {
 /// Data-driven option table for `vlmzs` (docs/cli.md §6). Single source of
 /// truth: drives parsing, `--help` rendering, and validation alike.
 const vlmzs_opts = [_]cli_helper.Opt{
-    .{ .name = "help", .short = 'h', .group = "General", .desc = "Display this help and exit." },
-    .{ .name = "version", .short = 'V', .group = "General", .desc = "Output version information and exit." },
-    .{ .name = "product", .kind = .str, .hint = "name", .group = "General", .desc = "Product name or 1-based number (default: first SKU)." },
-    .{ .name = "list-products", .short = 'x', .group = "General", .desc = "Print available products and exit." },
-    .{ .name = "protocol", .kind = .int, .hint = "u16", .group = "Request", .desc = "KMS protocol version 4/5/6." },
-    .{ .name = "app-id", .kind = .guid, .group = "Request", .desc = "Override AppID (GUID)." },
-    .{ .name = "sku-id", .kind = .guid, .group = "Request", .desc = "Override SKUID (GUID)." },
-    .{ .name = "kms-id", .kind = .guid, .group = "Request", .desc = "Override KMSID (GUID)." },
-    .{ .name = "cmid", .short = 'c', .kind = .guid, .group = "Request", .desc = "Client machine ID (GUID, default random)." },
-    .{ .name = "prev-cmid", .short = 'o', .kind = .guid, .group = "Request", .desc = "Previous client machine ID (GUID)." },
-    .{ .name = "workstation", .short = 'w', .kind = .str, .hint = "name", .group = "Request", .desc = "Workstation name." },
-    .{ .name = "vm", .short = 'm', .group = "Request", .desc = "Present as a virtual machine." },
-    .{ .name = "count", .short = 'n', .kind = .int, .hint = "u32", .group = "Request", .desc = "Number of requests (default 1)." },
-    .{ .name = "virtual-clients", .short = 'r', .kind = .int, .hint = "u32", .group = "Request", .desc = "NCountPolicy override." },
-    .{ .name = "grace", .short = 'g', .kind = .int, .hint = "u32", .group = "Request", .desc = "Grace period minutes." },
-    .{ .name = "address-family", .kind = .int, .hint = "u8", .group = "Request", .desc = "IPv4/IPv6 selection (4/6)." },
-    .{ .name = "license-status", .short = 't', .kind = .int, .hint = "u32", .group = "Request", .desc = "LicenseStatus field (0-6, default 1)." },
-    .{ .name = "reconnect-per-request", .short = 'T', .group = "Connection", .desc = "Reconnect for each request." },
-    .{ .name = "no-multiplexed", .group = "Connection", .desc = "Disable multiplexed RPC." },
-    .{ .name = "no-ndr64", .group = "Connection", .desc = "Disable NDR64 transfer syntax." },
-    .{ .name = "no-btfn", .group = "Connection", .desc = "Disable bind-time feature negotiation." },
-    .{ .name = "verbose", .short = 'v', .group = "Output", .desc = "Verbose logging." },
+    .{ .name = "help", .short = 'h', .group = "General", .desc = "Display this help and exit" },
+    .{ .name = "version", .short = 'V', .group = "General", .desc = "Output version information and exit" },
+    .{ .name = "product", .kind = .str, .hint = "name", .group = "General", .desc = "Product name or 1-based number (default: first SKU)" },
+    .{ .name = "list-products", .short = 'x', .group = "General", .desc = "Print available products and exit" },
+    .{ .name = "protocol", .kind = .int, .hint = "u16", .group = "Request", .desc = "KMS protocol version 4/5/6" },
+    .{ .name = "app-id", .kind = .guid, .group = "Request", .desc = "Override AppID (GUID)" },
+    .{ .name = "sku-id", .kind = .guid, .group = "Request", .desc = "Override SKUID (GUID)" },
+    .{ .name = "kms-id", .kind = .guid, .group = "Request", .desc = "Override KMSID (GUID)" },
+    .{ .name = "cmid", .short = 'c', .kind = .guid, .group = "Request", .desc = "Client machine ID (GUID, default random)" },
+    .{ .name = "prev-cmid", .short = 'o', .kind = .guid, .group = "Request", .desc = "Previous client machine ID (GUID)" },
+    .{ .name = "workstation", .short = 'w', .kind = .str, .hint = "name", .group = "Request", .desc = "Workstation name" },
+    .{ .name = "vm", .short = 'm', .group = "Request", .desc = "Present as a virtual machine" },
+    .{ .name = "count", .short = 'n', .kind = .int, .hint = "u32", .group = "Request", .desc = "Number of requests (default 1)" },
+    .{ .name = "virtual-clients", .short = 'r', .kind = .int, .hint = "u32", .group = "Request", .desc = "NCountPolicy override" },
+    .{ .name = "grace", .short = 'g', .kind = .int, .hint = "u32", .group = "Request", .desc = "Grace period minutes" },
+    .{ .name = "address-family", .kind = .int, .hint = "u8", .group = "Request", .desc = "IPv4/IPv6 selection (4/6)" },
+    .{ .name = "license-status", .short = 't', .kind = .int, .hint = "u32", .group = "Request", .desc = "LicenseStatus field (0-6, default 1)" },
+    .{ .name = "reconnect-per-request", .short = 'T', .group = "Connection", .desc = "Reconnect for each request" },
+    .{ .name = "no-multiplexed", .group = "Connection", .desc = "Disable multiplexed RPC" },
+    .{ .name = "no-ndr64", .group = "Connection", .desc = "Disable NDR64 transfer syntax" },
+    .{ .name = "no-btfn", .group = "Connection", .desc = "Disable bind-time feature negotiation" },
+    .{ .name = "verbose", .short = 'v', .group = "Output", .desc = "Verbose logging" },
 };
 
 const ClientOptions = struct {
@@ -195,7 +195,7 @@ fn parseHostPort(host_arg: []const u8) !struct { host: []const u8, port: u16 } {
     return .{ .host = host_arg, .port = default_port };
 }
 
-fn resolveOptions(res: *const cli_helper.Result, out: *Output) !ClientOptions {
+fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
     var opts = ClientOptions{};
 
     // Positional HOST[:PORT].
@@ -219,7 +219,6 @@ fn resolveOptions(res: *const cli_helper.Result, out: *Output) !ClientOptions {
     opts.grace = if (res.get("grace")) |s| try std.fmt.parseInt(u32, s, 10) else default_grace_minutes;
     opts.address_family = if (res.get("address-family")) |s| try std.fmt.parseInt(u8, s, 10) else 0;
     if (opts.address_family != 0 and opts.address_family != 4 and opts.address_family != 6) {
-        out.eprint("error: --address-family must be 4 or 6\n", .{});
         return error.InvalidAddressFamily;
     }
     opts.list_products = res.hasFlag("list-products");
@@ -561,9 +560,9 @@ pub fn main(init: std.process.Init) !void {
         // Short diagnostic; the full help is one `--help` away.
         var ebuf: [256]u8 = undefined;
         var ew = std.Io.File.writer(std.Io.File.stderr(), init.io, &ebuf);
-        try ew.interface.print("vlmzs: error: {s}\n", .{@errorName(err)});
-        try ew.interface.flush();
-        return err;
+        ew.interface.print("vlmzs: error: {s}\n", .{@errorName(err)}) catch {};
+        ew.interface.flush() catch {};
+        std.process.exit(1);
     };
     defer res.deinit();
 
@@ -586,7 +585,10 @@ pub fn main(init: std.process.Init) !void {
     var err_buf: [4096]u8 = undefined;
     var out = Output.init(init.io, &out_buf, &err_buf);
 
-    var opts = try resolveOptions(&res, &out);
+    var opts = resolveOptions(&res) catch |e| {
+        out.eprint("error: {s}\n", .{@errorName(e)});
+        std.process.exit(1);
+    };
 
     var data = try kmsdata.parse(init.gpa, embedded_kmd);
     defer data.deinit(init.gpa);
@@ -602,9 +604,9 @@ pub fn main(init: std.process.Init) !void {
         opts.host = if (opts.address_family == 6) "::1" else "127.0.0.1";
     }
 
-    const sku_index = findSku(&data, opts.product) catch |e| {
+    const sku_index = findSku(&data, opts.product) catch {
         out.eprint("error: invalid product selector\n", .{});
-        return e;
+        std.process.exit(1);
     };
 
     var prng = std.Random.DefaultPrng.init(cli_helper.makeSeed(init.io));
@@ -623,15 +625,18 @@ pub fn main(init: std.process.Init) !void {
                 init.gpa, init.io, &opts, base, seed, &out, &data,
             }) catch |e| {
                 out.eprint("failed to dispatch request: {s}\n", .{@errorName(e)});
-                return e;
+                std.process.exit(1);
             };
         }
-        try group.await(init.io);
+        group.await(init.io) catch |e| {
+            out.eprint("request failed: {s}\n", .{@errorName(e)});
+            std.process.exit(1);
+        };
     } else {
         // Reuse one connection for all requests (keep-alive), sent sequentially.
         sendRequestsReused(init.gpa, init.io, &opts, &data, sku_index, prng.random(), &out) catch |e| {
             out.eprint("request failed: {s}\n", .{@errorName(e)});
-            return e;
+            std.process.exit(1);
         };
     }
 }

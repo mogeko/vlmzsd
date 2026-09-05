@@ -29,7 +29,7 @@ COPY ./build.zig.zon /opt/app/build.zig.zon
 COPY ./LICENSE /opt/app/LICENSE
 COPY ./README.md /opt/app/README.md
 
-RUN /opt/builder/zig build --release=safe
+RUN /opt/builder/zig build --release=safe -Dcpu=baseline
 
 FROM gcr.io/distroless/cc-debian13:latest
 

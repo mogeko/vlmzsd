@@ -27,30 +27,30 @@ const embedded_kmd: []const u8 = @embedFile("vlmcsd.kmd");
 /// truth: drives parsing, `--help` rendering, and validation alike. The
 /// groups mirror the "Grouped by concern" spec in `docs/cli.md`.
 const vlmzsd_opts = [_]cli_helper.Opt{
-    .{ .name = "help", .short = 'h', .group = "General", .desc = "Display this help and exit." },
-    .{ .name = "version", .short = 'V', .group = "General", .desc = "Output version information and exit." },
-    .{ .name = "port", .short = 'p', .kind = .int, .hint = "u16", .group = "Network", .desc = "TCP listen port (default 1688)." },
-    .{ .name = "listen", .short = 'L', .kind = .str, .hint = "addr", .group = "Network", .desc = "Listen address, repeatable (default ::, dual-stack).", .repeatable = true },
-    .{ .name = "timeout", .kind = .str, .hint = "dur", .group = "Network", .desc = "Idle timeout (default 30s, 0 disables)." },
-    .{ .name = "max-clients", .short = 'm', .kind = .int, .hint = "u32", .group = "Network", .desc = "Concurrent client cap (default unlimited)." },
-    .{ .name = "data", .kind = .str, .hint = "file", .group = "Data", .desc = "External .kmd data file (default embedded)." },
-    .{ .name = "epid", .kind = .str, .hint = "name=epid", .group = "ePID", .desc = "ePID override name=epid, repeatable.", .repeatable = true },
-    .{ .name = "randomize", .kind = .int, .hint = "u8", .group = "ePID", .desc = "ePID randomization level 0/1/2 (default 1)." },
-    .{ .name = "lcid", .kind = .int, .hint = "u32", .group = "ePID", .desc = "Fixed LCID for randomized ePIDs." },
-    .{ .name = "build", .kind = .int, .hint = "u32", .group = "ePID", .desc = "Fixed build number for randomized ePIDs." },
-    .{ .name = "activation-interval", .kind = .str, .hint = "dur", .group = "Activation policy", .desc = "VL activation interval (default 2h)." },
-    .{ .name = "renewal-interval", .kind = .str, .hint = "dur", .group = "Activation policy", .desc = "VL renewal interval (default 7d)." },
-    .{ .name = "whitelist", .kind = .int, .hint = "u32", .group = "Activation policy", .desc = "Whitelisting level 0-3 (default 0)." },
-    .{ .name = "ip-protection", .kind = .int, .hint = "u8", .group = "Activation policy", .desc = "Public-IP protection level 0-3 (default 0)." },
-    .{ .name = "check-client-time", .group = "Activation policy", .desc = "Validate client timestamp." },
-    .{ .name = "maintain-clients", .group = "Activation policy", .desc = "Keep client list across requests." },
-    .{ .name = "start-empty", .group = "Activation policy", .desc = "Start with empty client list." },
-    .{ .name = "no-ndr64", .group = "Protocol", .desc = "Disable NDR64 transfer syntax (default on)." },
-    .{ .name = "no-btfn", .group = "Protocol", .desc = "Disable bind-time feature negotiation (default on)." },
-    .{ .name = "disconnect-per-request", .group = "Protocol", .desc = "Disconnect after each request." },
-    .{ .name = "pid-file", .kind = .str, .hint = "file", .group = "Process", .desc = "Write PID to file." },
-    .{ .name = "verbose", .short = 'v', .group = "Process", .desc = "Verbose logging." },
-    .{ .name = "quiet", .short = 'q', .group = "Process", .desc = "Quiet logging (warnings/errors only)." },
+    .{ .name = "help", .short = 'h', .group = "General", .desc = "Display this help and exit" },
+    .{ .name = "version", .short = 'V', .group = "General", .desc = "Output version information and exit" },
+    .{ .name = "port", .short = 'p', .kind = .int, .hint = "u16", .group = "Network", .desc = "TCP listen port (default 1688)" },
+    .{ .name = "listen", .short = 'L', .kind = .str, .hint = "addr", .group = "Network", .desc = "Listen address, repeatable (default ::, dual-stack)", .repeatable = true },
+    .{ .name = "timeout", .kind = .str, .hint = "dur", .group = "Network", .desc = "Idle timeout (default 30s, 0 disables)" },
+    .{ .name = "max-clients", .short = 'm', .kind = .int, .hint = "u32", .group = "Network", .desc = "Concurrent client cap (default unlimited)" },
+    .{ .name = "data", .kind = .str, .hint = "file", .group = "Data", .desc = "External .kmd data file (default embedded)" },
+    .{ .name = "epid", .kind = .str, .hint = "name=epid", .group = "ePID", .desc = "ePID override name=epid, repeatable", .repeatable = true },
+    .{ .name = "randomize", .kind = .int, .hint = "u8", .group = "ePID", .desc = "ePID randomization level 0/1/2 (default 1)" },
+    .{ .name = "lcid", .kind = .int, .hint = "u32", .group = "ePID", .desc = "Fixed LCID for randomized ePIDs" },
+    .{ .name = "build", .kind = .int, .hint = "u32", .group = "ePID", .desc = "Fixed build number for randomized ePIDs" },
+    .{ .name = "activation-interval", .kind = .str, .hint = "dur", .group = "Activation policy", .desc = "VL activation interval (default 2h)" },
+    .{ .name = "renewal-interval", .kind = .str, .hint = "dur", .group = "Activation policy", .desc = "VL renewal interval (default 7d)" },
+    .{ .name = "whitelist", .kind = .int, .hint = "u32", .group = "Activation policy", .desc = "Whitelisting level 0-3 (default 0)" },
+    .{ .name = "ip-protection", .kind = .int, .hint = "u8", .group = "Activation policy", .desc = "Public-IP protection level 0-3 (default 0)" },
+    .{ .name = "check-client-time", .group = "Activation policy", .desc = "Validate client timestamp" },
+    .{ .name = "maintain-clients", .group = "Activation policy", .desc = "Keep client list across requests" },
+    .{ .name = "start-empty", .group = "Activation policy", .desc = "Start with empty client list" },
+    .{ .name = "no-ndr64", .group = "Protocol", .desc = "Disable NDR64 transfer syntax (default on)" },
+    .{ .name = "no-btfn", .group = "Protocol", .desc = "Disable bind-time feature negotiation (default on)" },
+    .{ .name = "disconnect-per-request", .group = "Protocol", .desc = "Disconnect after each request" },
+    .{ .name = "pid-file", .kind = .str, .hint = "file", .group = "Process", .desc = "Write PID to file" },
+    .{ .name = "verbose", .short = 'v', .group = "Process", .desc = "Verbose logging" },
+    .{ .name = "quiet", .short = 'q', .group = "Process", .desc = "Quiet logging (warnings/errors only)" },
 };
 
 /// Resolved server configuration (post three-tier precedence merge).
@@ -322,6 +322,49 @@ fn serveClientThread(ctx: *ClientContext) void {
     };
 }
 
+/// Self-pipe write end (`[1]`): the SIGINT/SIGTERM handler writes one byte here
+/// (async-signal-safe) to wake the poll loop; the read end (`[0]`) is polled
+/// like a listen socket. This is the classic self-pipe trick — the handler does
+/// no cleanup itself, so the normal control flow (and its defers) runs the
+/// shutdown. The pipe is the one piece of unavoidable global state: a signal
+/// handler cannot take a context pointer.
+var shutdown_pipe: [2]std.posix.fd_t = .{ -1, -1 };
+
+fn handleShutdown(sig: std.posix.SIG) callconv(.c) void {
+    _ = sig;
+    // The only async-signal-safe work: write one byte to wake poll(). A flag
+    // alone would not work — std.posix.poll swallows EINTR and keeps blocking.
+    const byte: [1]u8 = .{1};
+    _ = std.c.write(shutdown_pipe[1], &byte, 1);
+}
+
+/// Create the self-pipe and install handlers so Ctrl-C / `docker stop` shut the
+/// server down cleanly.
+fn installSignalHandlers(log: *cli_helper.Logger) void {
+    if (std.c.pipe(&shutdown_pipe) != 0) {
+        log.err("failed to create shutdown pipe", .{});
+        std.process.exit(1);
+    }
+    // Make the write end non-blocking so the handler never blocks when the
+    // pipe is full (it only writes one byte, but correctness first). The
+    // O_NONBLOCK bit lives at a platform-dependent offset — derive it instead
+    // of hard-coding a value.
+    const nonblock_mask: i32 = @as(i32, 1) << @intCast(@bitOffsetOf(std.posix.O, "NONBLOCK"));
+    const flags = std.c.fcntl(shutdown_pipe[1], std.c.F.GETFL, @as(i32, 0));
+    if (flags < 0 or std.c.fcntl(shutdown_pipe[1], std.c.F.SETFL, flags | nonblock_mask) < 0) {
+        log.err("failed to make shutdown pipe non-blocking", .{});
+        std.process.exit(1);
+    }
+
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = handleShutdown },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+}
+
 pub fn main(init: std.process.Init) !void {
     // Collect the raw arguments (skip argv[0]).
     var args_list: std.ArrayList([]const u8) = .empty;
@@ -336,9 +379,9 @@ pub fn main(init: std.process.Init) !void {
         // Short diagnostic; the full help is one `--help` away.
         var ebuf: [256]u8 = undefined;
         var ew = std.Io.File.writer(std.Io.File.stderr(), init.io, &ebuf);
-        try ew.interface.print("vlmzsd: error: {s}\n", .{@errorName(err)});
-        try ew.interface.flush();
-        return err;
+        ew.interface.print("vlmzsd: error: {s}\n", .{@errorName(err)}) catch {};
+        ew.interface.flush() catch {};
+        std.process.exit(1);
     };
     defer res.deinit();
 
@@ -361,7 +404,10 @@ pub fn main(init: std.process.Init) !void {
     var err_buf: [4096]u8 = undefined;
     var log = cli_helper.Logger.init(init.io, &out_buf, &err_buf);
 
-    var opts = try resolveOptions(init.gpa, init.environ_map, &res);
+    var opts = resolveOptions(init.gpa, init.environ_map, &res) catch |e| {
+        log.err("invalid configuration: {s}", .{@errorName(e)});
+        std.process.exit(1);
+    };
     defer opts.deinit(init.gpa);
     log.min_level = if (opts.quiet) .warn else if (opts.verbose) .debug else .info;
 
@@ -369,14 +415,20 @@ pub fn main(init: std.process.Init) !void {
     var kmd_owned = false;
     var kmd_raw: []const u8 = undefined;
     if (opts.data_file) |path| {
-        kmd_raw = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, path, init.gpa, .unlimited);
+        kmd_raw = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, path, init.gpa, .unlimited) catch |e| {
+            log.err("failed to read data file {s}: {s}", .{ path, @errorName(e) });
+            std.process.exit(1);
+        };
         kmd_owned = true;
     } else {
         kmd_raw = embedded_kmd;
     }
     defer if (kmd_owned) init.gpa.free(@constCast(kmd_raw));
 
-    var data = try kmsdata.parse(init.gpa, kmd_raw);
+    var data = kmsdata.parse(init.gpa, kmd_raw) catch |e| {
+        log.err("invalid KMS data: {s}", .{@errorName(e)});
+        std.process.exit(1);
+    };
     defer data.deinit(init.gpa);
 
     if (opts.data_file) |path| {
@@ -454,13 +506,13 @@ pub fn main(init: std.process.Init) !void {
                 if (std.mem.eql(u8, addr, "::") and e == error.AddressFamilyUnsupported) {
                     const s4 = network.listen(init.io, "0.0.0.0", opts.port) catch |e4| {
                         log.err("failed to listen on 0.0.0.0:{d}: {s}", .{ opts.port, @errorName(e4) });
-                        return e4;
+                        std.process.exit(1);
                     };
                     try servers.append(init.gpa, s4);
                     continue;
                 }
                 log.err("failed to listen on {s}:{d}: {s}", .{ addr, opts.port, @errorName(e) });
-                return e;
+                std.process.exit(1);
             };
             try servers.append(init.gpa, s);
         }
@@ -468,15 +520,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (servers.items.len == 0) {
         log.err("could not listen on any socket", .{});
-        return error.NoListenSocket;
+        std.process.exit(1);
     }
 
-    log.info("vlmzsd {s} listening on port {d} ({d} socket{s})", .{
-        version,
-        opts.port,
-        servers.items.len,
-        if (servers.items.len == 1) "" else "s",
-    });
+    log.info("vlmzsd {s} listening on port {d}", .{ version, opts.port });
 
     // Write the PID file (best effort; mirrors the C `writePidFile`, which
     // only logs on failure).
@@ -499,23 +546,43 @@ pub fn main(init: std.process.Init) !void {
     // released when it returns, so the group never needs to be awaited.
     var group = Io.Group.init;
 
-    var poll_fds: [64]std.posix.pollfd = undefined;
-    if (servers.items.len > poll_fds.len) return error.TooManyListenSockets;
+    // 64 listen sockets + 1 shutdown-pipe read end.
+    var poll_fds: [65]std.posix.pollfd = undefined;
+    if (servers.items.len > 64) {
+        log.err("too many listen sockets (max 64)", .{});
+        std.process.exit(1);
+    }
+
+    installSignalHandlers(&log);
+    defer {
+        _ = std.c.close(shutdown_pipe[0]);
+        _ = std.c.close(shutdown_pipe[1]);
+    }
+    const pipe_index = servers.items.len; // the shutdown pipe's slot in `fds`
 
     while (true) {
-        const fds = poll_fds[0..servers.items.len];
+        const fds = poll_fds[0 .. pipe_index + 1];
         for (servers.items, 0..) |*s, i| {
             fds[i] = .{ .fd = s.socket.handle, .events = std.posix.POLL.IN, .revents = 0 };
         }
+        fds[pipe_index] = .{ .fd = shutdown_pipe[0], .events = std.posix.POLL.IN, .revents = 0 };
+
         const nready = std.posix.poll(fds, -1) catch |e| {
             log.err("poll failed: {s}", .{@errorName(e)});
             return e;
         };
         if (nready == 0) continue;
 
-        for (fds, 0..) |f, i| {
-            if (f.revents & std.posix.POLL.IN == 0) continue;
-            const stream = servers.items[i].accept(init.io) catch |e| {
+        // A byte on the shutdown pipe means SIGINT/SIGTERM arrived: return so
+        // the defers run their cleanup.
+        if (fds[pipe_index].revents & std.posix.POLL.IN != 0) {
+            log.info("shutdown signal received, exiting", .{});
+            return;
+        }
+
+        for (servers.items, 0..) |*s, i| {
+            if (fds[i].revents & std.posix.POLL.IN == 0) continue;
+            const stream = s.accept(init.io) catch |e| {
                 log.warn("accept failed: {s}", .{@errorName(e)});
                 continue;
             };
