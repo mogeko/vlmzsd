@@ -1,14 +1,9 @@
 .{
     .name = .vlmzsd,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0xee9c981fd0f67155,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{
-        .clap = .{
-            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.12.0.tar.gz",
-            .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",

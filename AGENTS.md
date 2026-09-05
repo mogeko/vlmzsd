@@ -16,8 +16,7 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
   `std.Io` APIs — do not regress to the older `std.process.argsAlloc` style.
 - **Package**: module `vlmzsd` (root `src/root.zig`), executables `src/main.zig` (`vlmzsd` server)
   and `src/vlmzs.zig` (`vlmzs` client).
-- **Dependencies**: `zig-clap` (Hejsil/zig-clap) — the only external dependency, for CLI parsing.
-  Pin the tag compatible with Zig `0.16.0`.
+- **Dependencies**: none — std-only.
 
 ## Build / test
 
@@ -37,7 +36,7 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
 | Network | `src/network.zig` | `std.Io` sockets: server loop, client connect (DNS), private-IP detection |
 | Server | `src/main.zig` | `vlmzsd` CLI + accept loop + thread-per-connection |
 | Client | `src/vlmzs.zig` | `vlmzs` activation client |
-| Shared | `src/cli_helper.zig` | timestamped logger (stdout/stderr split), value parsers (duration/bool/GUID) |
+| Shared | `src/cli_helper.zig` | data-driven CLI parser (Opt table → parse/help/validate), value parsers (duration/bool/GUID), timestamped logger |
 | Tests | `src/testutil.zig` | byte-compare / hex-diff helpers |
 
 ## Wire compatibility (core invariant)
@@ -68,11 +67,11 @@ source linked above).
 
 ## CLI implementation decisions
 
-- **Argument parsing: `zig-clap`** (Hejsil/zig-clap) — the closest thing Zig has to a
-  community-standard CLI library (à la Rust `clap`): short/long options, repeatable options,
-  `--opt=value`, and automatic help generation. It is the project's first external dependency
-  (added to `build.zig.zon`). The three-tier env-var precedence is implemented as a thin layer
-  on top of zig-clap's parsed result — independent of the parser choice.
+- **Argument parsing: data-driven, std-only.** Both binaries parse their CLI with `src/cli_helper.zig`
+  — a hand-written parser where a single `Opt` table drives parsing, `--help` rendering, and
+  validation (so the parse logic and help text cannot drift apart). The three-tier env-var
+  precedence is implemented as a thin layer on top of the parsed result — independent of the
+  parser choice.
 - **Two entry points share one module.** `src/main.zig` (`vlmzsd`) and `src/vlmzs.zig` (`vlmzs`)
   both import the `vlmzsd` module; argument parsing and option-to-config mapping live in shared
   code (e.g. `src/cli_helper.zig`).
@@ -80,8 +79,6 @@ source linked above).
   not match the "fixed format, timestamped, stdout/stderr split" requirement. The server uses a
   hand-written `cli_helper.Logger`; the client (`vlmzs`) is a CLI debugging tool and writes a bare
   `Output` (stdout/stderr, no timestamp) instead.
-- **Version pinning risk:** zig-clap's `master` tracks Zig master; pin the release tag that
-  supports Zig `0.16.0`.
 
 ## Pitfalls
 
@@ -89,6 +86,5 @@ source linked above).
   - `std.fs.cwd` is gone; file I/O goes through an `Io` instance: `std.Io.Threaded.init(alloc, .{})` → `.io()`.
   - `@embedFile` only reaches files inside the module's package path (`src/`).
 - `minimum_zig_version` is `0.16.0`; keep `build.zig` in line with that version.
-- `zig-clap`'s `master` tracks Zig master — pin a release tag compatible with `0.16.0`.
 - The `zig-fmt` (PostToolUse) and `zig-build-test` (Stop) hooks auto-format and run tests; keep
   `.zig` files formatted and tests green.

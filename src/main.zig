@@ -5,10 +5,9 @@
 //! stdout logging, and a foreground accept/serve loop over `network.serveRpc`.
 
 const std = @import("std");
-const clap = @import("clap");
 const vlmzsd = @import("vlmzsd");
-const cli_helper = vlmzsd.cli_helper;
 
+const cli_helper = vlmzsd.cli_helper;
 const kms = vlmzsd.kms;
 const kmsdata = vlmzsd.kmsdata;
 const network = vlmzsd.network;
@@ -24,33 +23,35 @@ const default_port: u16 = 1688;
 /// Embedded default `.kmd` data (the vlmcsd default data file).
 const embedded_kmd: []const u8 = @embedFile("vlmcsd.kmd");
 
-const params = clap.parseParamsComptime(
-    \\-h, --help                       Display this help and exit.
-    \\-V, --version                    Output version information and exit.
-    \\-p, --port <u16>                 TCP listen port (default 1688).
-    \\-L, --listen <str>...            Listen address, repeatable (default ::, dual-stack).
-    \\    --timeout <str>              Idle timeout (default 30s, 0 disables).
-    \\-m, --max-clients <u32>          Concurrent client cap (default unlimited).
-    \\    --data <str>                 External .kmd data file (default embedded).
-    \\    --epid <str>...              ePID override name=epid, repeatable.
-    \\    --randomize <u8>             ePID randomization level 0/1/2 (default 1).
-    \\    --lcid <u32>                 Fixed LCID for randomized ePIDs.
-    \\    --build <u32>                Fixed build number for randomized ePIDs.
-    \\    --activation-interval <str>  VL activation interval (default 2h).
-    \\    --renewal-interval <str>     VL renewal interval (default 7d).
-    \\    --whitelist <u32>            Whitelisting level 0-3 (default 0).
-    \\    --ip-protection <u8>         Public-IP protection level 0-3 (default 0).
-    \\    --check-client-time          Validate client timestamp.
-    \\    --maintain-clients           Keep client list across requests.
-    \\    --start-empty                Start with empty client list.
-    \\    --no-ndr64                   Disable NDR64 transfer syntax (default on).
-    \\    --no-btfn                    Disable bind-time feature negotiation (default on).
-    \\    --disconnect-per-request     Disconnect after each request.
-    \\    --pid-file <str>             Write PID to file.
-    \\-v, --verbose                    Verbose logging.
-    \\-q, --quiet                      Quiet logging (warnings/errors only).
-    \\
-);
+/// Data-driven option table for `vlmzsd` (docs/cli.md §5). Single source of
+/// truth: drives parsing, `--help` rendering, and validation alike. The
+/// groups mirror the "Grouped by concern" spec in `docs/cli.md`.
+const vlmzsd_opts = [_]cli_helper.Opt{
+    .{ .name = "help", .short = 'h', .group = "General", .desc = "Display this help and exit." },
+    .{ .name = "version", .short = 'V', .group = "General", .desc = "Output version information and exit." },
+    .{ .name = "port", .short = 'p', .kind = .int, .hint = "u16", .group = "Network", .desc = "TCP listen port (default 1688)." },
+    .{ .name = "listen", .short = 'L', .kind = .str, .hint = "addr", .group = "Network", .desc = "Listen address, repeatable (default ::, dual-stack).", .repeatable = true },
+    .{ .name = "timeout", .kind = .str, .hint = "dur", .group = "Network", .desc = "Idle timeout (default 30s, 0 disables)." },
+    .{ .name = "max-clients", .short = 'm', .kind = .int, .hint = "u32", .group = "Network", .desc = "Concurrent client cap (default unlimited)." },
+    .{ .name = "data", .kind = .str, .hint = "file", .group = "Data", .desc = "External .kmd data file (default embedded)." },
+    .{ .name = "epid", .kind = .str, .hint = "name=epid", .group = "ePID", .desc = "ePID override name=epid, repeatable.", .repeatable = true },
+    .{ .name = "randomize", .kind = .int, .hint = "u8", .group = "ePID", .desc = "ePID randomization level 0/1/2 (default 1)." },
+    .{ .name = "lcid", .kind = .int, .hint = "u32", .group = "ePID", .desc = "Fixed LCID for randomized ePIDs." },
+    .{ .name = "build", .kind = .int, .hint = "u32", .group = "ePID", .desc = "Fixed build number for randomized ePIDs." },
+    .{ .name = "activation-interval", .kind = .str, .hint = "dur", .group = "Activation policy", .desc = "VL activation interval (default 2h)." },
+    .{ .name = "renewal-interval", .kind = .str, .hint = "dur", .group = "Activation policy", .desc = "VL renewal interval (default 7d)." },
+    .{ .name = "whitelist", .kind = .int, .hint = "u32", .group = "Activation policy", .desc = "Whitelisting level 0-3 (default 0)." },
+    .{ .name = "ip-protection", .kind = .int, .hint = "u8", .group = "Activation policy", .desc = "Public-IP protection level 0-3 (default 0)." },
+    .{ .name = "check-client-time", .group = "Activation policy", .desc = "Validate client timestamp." },
+    .{ .name = "maintain-clients", .group = "Activation policy", .desc = "Keep client list across requests." },
+    .{ .name = "start-empty", .group = "Activation policy", .desc = "Start with empty client list." },
+    .{ .name = "no-ndr64", .group = "Protocol", .desc = "Disable NDR64 transfer syntax (default on)." },
+    .{ .name = "no-btfn", .group = "Protocol", .desc = "Disable bind-time feature negotiation (default on)." },
+    .{ .name = "disconnect-per-request", .group = "Protocol", .desc = "Disconnect after each request." },
+    .{ .name = "pid-file", .kind = .str, .hint = "file", .group = "Process", .desc = "Write PID to file." },
+    .{ .name = "verbose", .short = 'v', .group = "Process", .desc = "Verbose logging." },
+    .{ .name = "quiet", .short = 'q', .group = "Process", .desc = "Quiet logging (warnings/errors only)." },
+};
 
 /// Resolved server configuration (post three-tier precedence merge).
 const ServerOptions = struct {
@@ -94,24 +95,24 @@ fn envGet(env: *const EnvironMap, name: []const u8) ?[]const u8 {
 /// Resolve a single boolean flag: the flag flips the default; the env var
 /// supplies an explicit value.
 fn resolveFlag(
-    cli_flag: usize,
+    cli_flag: bool,
     env: *const EnvironMap,
     env_name: []const u8,
     default: bool,
 ) !bool {
-    if (cli_flag != 0) return !default;
+    if (cli_flag) return !default;
     if (envGet(env, env_name)) |s| return cli_helper.parseBool(s);
     return default;
 }
 
 fn resolveInt(
     comptime T: type,
-    cli_val: ?T,
+    cli_val: ?[]const u8,
     env: *const EnvironMap,
     env_name: []const u8,
     default: T,
 ) !T {
-    if (cli_val) |v| return v;
+    if (cli_val) |v| return std.fmt.parseInt(T, v, 10);
     if (envGet(env, env_name)) |s| return std.fmt.parseInt(T, s, 10);
     return default;
 }
@@ -159,68 +160,56 @@ fn splitList(gpa: Allocator, s: []const u8) ![]const []const u8 {
     return out[0..i];
 }
 
-fn resolveOptions(gpa: Allocator, env: *const EnvironMap, args: anytype) !ServerOptions {
-    // zig-clap names each argument field after its longest (long) name,
-    // preserving hyphens; pull them out via `@field` into snake_case locals.
-    const max_clients = @field(args, "max-clients");
-    const activation_interval = @field(args, "activation-interval");
-    const renewal_interval = @field(args, "renewal-interval");
-    const ip_protection = @field(args, "ip-protection");
-    const check_client_time = @field(args, "check-client-time");
-    const maintain_clients = @field(args, "maintain-clients");
-    const start_empty = @field(args, "start-empty");
-    const no_ndr64 = @field(args, "no-ndr64");
-    const no_btfn = @field(args, "no-btfn");
-    const disconnect_per_request = @field(args, "disconnect-per-request");
-    const pid_file = @field(args, "pid-file");
-
+fn resolveOptions(gpa: Allocator, env: *const EnvironMap, res: *const cli_helper.Result) !ServerOptions {
     var opts = ServerOptions{};
 
-    opts.port = try resolveInt(u16, args.port, env, "VLMZSD_PORT", default_port);
+    opts.port = try resolveInt(u16, res.get("port"), env, "VLMZSD_PORT", default_port);
 
     // --listen (repeatable) > VLMZSD_LISTEN (comma-separated) > default.
-    if (args.listen.len > 0) {
-        opts.listen = args.listen;
+    const listen = res.getAll("listen");
+    if (listen.len > 0) {
+        opts.listen = listen;
     } else if (envGet(env, "VLMZSD_LISTEN")) |s| {
         opts.listen_backing = try splitList(gpa, s);
         opts.listen = opts.listen_backing.?;
     }
 
     opts.timeout_seconds = blk: {
-        const raw = args.timeout orelse envGet(env, "VLMZSD_TIMEOUT") orelse "30s";
+        const raw = res.get("timeout") orelse envGet(env, "VLMZSD_TIMEOUT") orelse "30s";
         break :blk try cli_helper.parseDurationSeconds(raw);
     };
 
-    opts.max_clients = try resolveInt(u32, max_clients, env, "VLMZSD_MAX_CLIENTS", 0);
-    opts.data_file = resolveStr(args.data, env, "VLMZSD_DATA", null);
+    opts.max_clients = try resolveInt(u32, res.get("max-clients"), env, "VLMZSD_MAX_CLIENTS", 0);
+    opts.data_file = resolveStr(res.get("data"), env, "VLMZSD_DATA", null);
 
-    if (args.epid.len > 0) {
-        opts.epids = args.epid;
+    const epids = res.getAll("epid");
+    if (epids.len > 0) {
+        opts.epids = epids;
     } else if (envGet(env, "VLMZSD_EPID")) |s| {
         opts.epid_backing = try splitList(gpa, s);
         opts.epids = opts.epid_backing.?;
     }
 
-    opts.randomize = try resolveInt(u8, args.randomize, env, "VLMZSD_RANDOMIZE", 1);
-    opts.lcid = try resolveInt(u32, args.lcid, env, "VLMZSD_LCID", 0);
-    opts.build = try resolveInt(u32, args.build, env, "VLMZSD_BUILD", 0);
+    opts.randomize = try resolveInt(u8, res.get("randomize"), env, "VLMZSD_RANDOMIZE", 1);
+    opts.lcid = try resolveInt(u32, res.get("lcid"), env, "VLMZSD_LCID", 0);
+    opts.build = try resolveInt(u32, res.get("build"), env, "VLMZSD_BUILD", 0);
 
-    opts.activation_interval_minutes = try resolveDurationMinutes(activation_interval, env, "VLMZSD_ACTIVATION_INTERVAL", "2h");
-    opts.renewal_interval_minutes = try resolveDurationMinutes(renewal_interval, env, "VLMZSD_RENEWAL_INTERVAL", "7d");
-    opts.whitelist = try resolveInt(u32, args.whitelist, env, "VLMZSD_WHITELIST", 0);
-    opts.ip_protection = try resolveInt(u8, ip_protection, env, "VLMZSD_IP_PROTECTION", 0);
+    opts.activation_interval_minutes = try resolveDurationMinutes(res.get("activation-interval"), env, "VLMZSD_ACTIVATION_INTERVAL", "2h");
+    opts.renewal_interval_minutes = try resolveDurationMinutes(res.get("renewal-interval"), env, "VLMZSD_RENEWAL_INTERVAL", "7d");
+    opts.whitelist = try resolveInt(u32, res.get("whitelist"), env, "VLMZSD_WHITELIST", 0);
+    opts.ip_protection = try resolveInt(u8, res.get("ip-protection"), env, "VLMZSD_IP_PROTECTION", 0);
 
-    opts.check_client_time = try resolveFlag(check_client_time, env, "VLMZSD_CHECK_CLIENT_TIME", false);
-    opts.maintain_clients = try resolveFlag(maintain_clients, env, "VLMZSD_MAINTAIN_CLIENTS", false);
-    opts.start_empty = try resolveFlag(start_empty, env, "VLMZSD_START_EMPTY", false);
+    opts.check_client_time = try resolveFlag(res.hasFlag("check-client-time"), env, "VLMZSD_CHECK_CLIENT_TIME", false);
+    opts.maintain_clients = try resolveFlag(res.hasFlag("maintain-clients"), env, "VLMZSD_MAINTAIN_CLIENTS", false);
+    opts.start_empty = try resolveFlag(res.hasFlag("start-empty"), env, "VLMZSD_START_EMPTY", false);
 
-    opts.ndr64 = try resolveFlag(no_ndr64, env, "VLMZSD_NDR64", true);
-    opts.btfn = try resolveFlag(no_btfn, env, "VLMZSD_BTFN", true);
-    opts.disconnect_per_request = try resolveFlag(disconnect_per_request, env, "VLMZSD_DISCONNECT_PER_REQUEST", false);
+    opts.ndr64 = try resolveFlag(res.hasFlag("no-ndr64"), env, "VLMZSD_NDR64", true);
+    opts.btfn = try resolveFlag(res.hasFlag("no-btfn"), env, "VLMZSD_BTFN", true);
+    opts.disconnect_per_request = try resolveFlag(res.hasFlag("disconnect-per-request"), env, "VLMZSD_DISCONNECT_PER_REQUEST", false);
 
-    opts.pid_file = resolveStr(pid_file, env, "VLMZSD_PID_FILE", null);
-    opts.verbose = args.verbose != 0;
-    opts.quiet = args.quiet != 0;
+    opts.pid_file = resolveStr(res.get("pid-file"), env, "VLMZSD_PID_FILE", null);
+    opts.verbose = res.hasFlag("verbose");
+    opts.quiet = res.hasFlag("quiet");
 
     return opts;
 }
@@ -334,21 +323,33 @@ fn serveClientThread(ctx: *ClientContext) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var diag = clap.Diagnostic{};
-    var res = clap.parse(clap.Help, &params, clap.parsers.default, init.minimal.args, .{
-        .diagnostic = &diag,
-        .allocator = init.gpa,
-    }) catch |err| {
-        try diag.reportToFile(init.io, .stderr(), err);
+    // Collect the raw arguments (skip argv[0]).
+    var args_list: std.ArrayList([]const u8) = .empty;
+    defer args_list.deinit(init.gpa);
+    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+    _ = args_iter.skip();
+    while (args_iter.next()) |arg| {
+        try args_list.append(init.gpa, arg);
+    }
+
+    var res = cli_helper.parse(init.gpa, &vlmzsd_opts, args_list.items) catch |err| {
+        // Short diagnostic; the full help is one `--help` away.
+        var ebuf: [256]u8 = undefined;
+        var ew = std.Io.File.writer(std.Io.File.stderr(), init.io, &ebuf);
+        try ew.interface.print("vlmzsd: error: {s}\n", .{@errorName(err)});
+        try ew.interface.flush();
         return err;
     };
     defer res.deinit();
 
-    if (res.args.help != 0) {
-        try clap.helpToFile(init.io, .stderr(), clap.Help, &params, .{});
+    if (res.hasFlag("help")) {
+        var hbuf: [4096]u8 = undefined;
+        var hw = std.Io.File.writer(std.Io.File.stderr(), init.io, &hbuf);
+        try cli_helper.writeHelp(&hw.interface, "vlmzsd", &vlmzsd_opts, "");
+        try hw.interface.flush();
         return;
     }
-    if (res.args.version != 0) {
+    if (res.hasFlag("version")) {
         var buf: [64]u8 = undefined;
         var fw = std.Io.File.writer(std.Io.File.stdout(), init.io, &buf);
         try fw.interface.print("vlmzsd {s}\n", .{version});
@@ -360,7 +361,7 @@ pub fn main(init: std.process.Init) !void {
     var err_buf: [4096]u8 = undefined;
     var log = cli_helper.Logger.init(init.io, &out_buf, &err_buf);
 
-    var opts = try resolveOptions(init.gpa, init.environ_map, &res.args);
+    var opts = try resolveOptions(init.gpa, init.environ_map, &res);
     defer opts.deinit(init.gpa);
     log.min_level = if (opts.quiet) .warn else if (opts.verbose) .debug else .info;
 

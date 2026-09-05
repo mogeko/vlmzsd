@@ -1,6 +1,7 @@
 //! Byte-comparison and hex helpers for wire-compatibility tests.
 
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 
 /// Compare `actual` against the golden `expected` bytes.

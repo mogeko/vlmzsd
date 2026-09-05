@@ -217,7 +217,8 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 ### 4.6 `src/main.zig` / `src/vlmzs.zig` / `src/cli_helper.zig`
 
 - **CLI redesign** (`docs/cli.md`): no config file; three-tier precedence `default < VLMZSD_*/env < CLI`;
-  zig-clap parsing; fixed-format stdout logging (`Logger` guarded by `std.atomic.Mutex`).
+  data-driven `Opt`-table parsing (`src/cli_helper.zig`, std-only); fixed-format stdout logging
+  (`Logger` guarded by `std.atomic.Mutex`).
 - **Concurrency**: thread-per-connection (`std.Thread.spawn` + `detach`) + `Io.Semaphore` cap (`--max-clients`).
 - **Timeout**: `std.posix.poll` (replacing C's `SO_RCVTIMEO`; checks `reader.bufferedLen()` before polling to
   avoid the buffered-reader read-ahead pitfall).
