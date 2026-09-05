@@ -86,5 +86,8 @@ source linked above).
   - `std.fs.cwd` is gone; file I/O goes through an `Io` instance: `std.Io.Threaded.init(alloc, .{})` → `.io()`.
   - `@embedFile` only reaches files inside the module's package path (`src/`).
 - `minimum_zig_version` is `0.16.0`; keep `build.zig` in line with that version.
+- **Container builds must use `-Dcpu=baseline`.** `zig build` defaults to the *native* CPU model;
+  a CI ARM runner (e.g. Graviton) then emits SVE instructions that crash with SIGILL on CPUs
+  without SVE (e.g. Apple Silicon). The `Dockerfile` pins `-Dcpu=baseline` for portability.
 - The `zig-fmt` (PostToolUse) and `zig-build-test` (Stop) hooks auto-format and run tests; keep
   `.zig` files formatted and tests green.
