@@ -322,6 +322,49 @@ fn serveClientThread(ctx: *ClientContext) void {
     };
 }
 
+/// Self-pipe write end (`[1]`): the SIGINT/SIGTERM handler writes one byte here
+/// (async-signal-safe) to wake the poll loop; the read end (`[0]`) is polled
+/// like a listen socket. This is the classic self-pipe trick — the handler does
+/// no cleanup itself, so the normal control flow (and its defers) runs the
+/// shutdown. The pipe is the one piece of unavoidable global state: a signal
+/// handler cannot take a context pointer.
+var shutdown_pipe: [2]std.posix.fd_t = .{ -1, -1 };
+
+fn handleShutdown(sig: std.posix.SIG) callconv(.c) void {
+    _ = sig;
+    // The only async-signal-safe work: write one byte to wake poll(). A flag
+    // alone would not work — std.posix.poll swallows EINTR and keeps blocking.
+    const byte: [1]u8 = .{1};
+    _ = std.c.write(shutdown_pipe[1], &byte, 1);
+}
+
+/// Create the self-pipe and install handlers so Ctrl-C / `docker stop` shut the
+/// server down cleanly.
+fn installSignalHandlers(log: *cli_helper.Logger) void {
+    if (std.c.pipe(&shutdown_pipe) != 0) {
+        log.err("failed to create shutdown pipe", .{});
+        std.process.exit(1);
+    }
+    // Make the write end non-blocking so the handler never blocks when the
+    // pipe is full (it only writes one byte, but correctness first). The
+    // O_NONBLOCK bit lives at a platform-dependent offset — derive it instead
+    // of hard-coding a value.
+    const nonblock_mask: i32 = @as(i32, 1) << @intCast(@bitOffsetOf(std.posix.O, "NONBLOCK"));
+    const flags = std.c.fcntl(shutdown_pipe[1], std.c.F.GETFL, @as(i32, 0));
+    if (flags < 0 or std.c.fcntl(shutdown_pipe[1], std.c.F.SETFL, flags | nonblock_mask) < 0) {
+        log.err("failed to make shutdown pipe non-blocking", .{});
+        std.process.exit(1);
+    }
+
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = handleShutdown },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+}
+
 pub fn main(init: std.process.Init) !void {
     // Collect the raw arguments (skip argv[0]).
     var args_list: std.ArrayList([]const u8) = .empty;
@@ -503,26 +546,43 @@ pub fn main(init: std.process.Init) !void {
     // released when it returns, so the group never needs to be awaited.
     var group = Io.Group.init;
 
-    var poll_fds: [64]std.posix.pollfd = undefined;
-    if (servers.items.len > poll_fds.len) {
+    // 64 listen sockets + 1 shutdown-pipe read end.
+    var poll_fds: [65]std.posix.pollfd = undefined;
+    if (servers.items.len > 64) {
         log.err("too many listen sockets (max 64)", .{});
         std.process.exit(1);
     }
 
+    installSignalHandlers(&log);
+    defer {
+        _ = std.c.close(shutdown_pipe[0]);
+        _ = std.c.close(shutdown_pipe[1]);
+    }
+    const pipe_index = servers.items.len; // the shutdown pipe's slot in `fds`
+
     while (true) {
-        const fds = poll_fds[0..servers.items.len];
+        const fds = poll_fds[0 .. pipe_index + 1];
         for (servers.items, 0..) |*s, i| {
             fds[i] = .{ .fd = s.socket.handle, .events = std.posix.POLL.IN, .revents = 0 };
         }
+        fds[pipe_index] = .{ .fd = shutdown_pipe[0], .events = std.posix.POLL.IN, .revents = 0 };
+
         const nready = std.posix.poll(fds, -1) catch |e| {
             log.err("poll failed: {s}", .{@errorName(e)});
             return e;
         };
         if (nready == 0) continue;
 
-        for (fds, 0..) |f, i| {
-            if (f.revents & std.posix.POLL.IN == 0) continue;
-            const stream = servers.items[i].accept(init.io) catch |e| {
+        // A byte on the shutdown pipe means SIGINT/SIGTERM arrived: return so
+        // the defers run their cleanup.
+        if (fds[pipe_index].revents & std.posix.POLL.IN != 0) {
+            log.info("shutdown signal received, exiting", .{});
+            return;
+        }
+
+        for (servers.items, 0..) |*s, i| {
+            if (fds[i].revents & std.posix.POLL.IN == 0) continue;
+            const stream = s.accept(init.io) catch |e| {
                 log.warn("accept failed: {s}", .{@errorName(e)});
                 continue;
             };
