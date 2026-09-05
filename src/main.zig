@@ -336,9 +336,9 @@ pub fn main(init: std.process.Init) !void {
         // Short diagnostic; the full help is one `--help` away.
         var ebuf: [256]u8 = undefined;
         var ew = std.Io.File.writer(std.Io.File.stderr(), init.io, &ebuf);
-        try ew.interface.print("vlmzsd: error: {s}\n", .{@errorName(err)});
-        try ew.interface.flush();
-        return err;
+        ew.interface.print("vlmzsd: error: {s}\n", .{@errorName(err)}) catch {};
+        ew.interface.flush() catch {};
+        std.process.exit(1);
     };
     defer res.deinit();
 
@@ -361,7 +361,10 @@ pub fn main(init: std.process.Init) !void {
     var err_buf: [4096]u8 = undefined;
     var log = cli_helper.Logger.init(init.io, &out_buf, &err_buf);
 
-    var opts = try resolveOptions(init.gpa, init.environ_map, &res);
+    var opts = resolveOptions(init.gpa, init.environ_map, &res) catch |e| {
+        log.err("invalid configuration: {s}", .{@errorName(e)});
+        std.process.exit(1);
+    };
     defer opts.deinit(init.gpa);
     log.min_level = if (opts.quiet) .warn else if (opts.verbose) .debug else .info;
 
@@ -369,14 +372,20 @@ pub fn main(init: std.process.Init) !void {
     var kmd_owned = false;
     var kmd_raw: []const u8 = undefined;
     if (opts.data_file) |path| {
-        kmd_raw = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, path, init.gpa, .unlimited);
+        kmd_raw = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, path, init.gpa, .unlimited) catch |e| {
+            log.err("failed to read data file {s}: {s}", .{ path, @errorName(e) });
+            std.process.exit(1);
+        };
         kmd_owned = true;
     } else {
         kmd_raw = embedded_kmd;
     }
     defer if (kmd_owned) init.gpa.free(@constCast(kmd_raw));
 
-    var data = try kmsdata.parse(init.gpa, kmd_raw);
+    var data = kmsdata.parse(init.gpa, kmd_raw) catch |e| {
+        log.err("invalid KMS data: {s}", .{@errorName(e)});
+        std.process.exit(1);
+    };
     defer data.deinit(init.gpa);
 
     if (opts.data_file) |path| {
@@ -454,13 +463,13 @@ pub fn main(init: std.process.Init) !void {
                 if (std.mem.eql(u8, addr, "::") and e == error.AddressFamilyUnsupported) {
                     const s4 = network.listen(init.io, "0.0.0.0", opts.port) catch |e4| {
                         log.err("failed to listen on 0.0.0.0:{d}: {s}", .{ opts.port, @errorName(e4) });
-                        return e4;
+                        std.process.exit(1);
                     };
                     try servers.append(init.gpa, s4);
                     continue;
                 }
                 log.err("failed to listen on {s}:{d}: {s}", .{ addr, opts.port, @errorName(e) });
-                return e;
+                std.process.exit(1);
             };
             try servers.append(init.gpa, s);
         }
@@ -468,7 +477,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (servers.items.len == 0) {
         log.err("could not listen on any socket", .{});
-        return error.NoListenSocket;
+        std.process.exit(1);
     }
 
     log.info("vlmzsd {s} listening on port {d} ({d} socket{s})", .{
@@ -500,7 +509,10 @@ pub fn main(init: std.process.Init) !void {
     var group = Io.Group.init;
 
     var poll_fds: [64]std.posix.pollfd = undefined;
-    if (servers.items.len > poll_fds.len) return error.TooManyListenSockets;
+    if (servers.items.len > poll_fds.len) {
+        log.err("too many listen sockets (max 64)", .{});
+        std.process.exit(1);
+    }
 
     while (true) {
         const fds = poll_fds[0..servers.items.len];

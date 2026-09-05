@@ -195,7 +195,7 @@ fn parseHostPort(host_arg: []const u8) !struct { host: []const u8, port: u16 } {
     return .{ .host = host_arg, .port = default_port };
 }
 
-fn resolveOptions(res: *const cli_helper.Result, out: *Output) !ClientOptions {
+fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
     var opts = ClientOptions{};
 
     // Positional HOST[:PORT].
@@ -219,7 +219,6 @@ fn resolveOptions(res: *const cli_helper.Result, out: *Output) !ClientOptions {
     opts.grace = if (res.get("grace")) |s| try std.fmt.parseInt(u32, s, 10) else default_grace_minutes;
     opts.address_family = if (res.get("address-family")) |s| try std.fmt.parseInt(u8, s, 10) else 0;
     if (opts.address_family != 0 and opts.address_family != 4 and opts.address_family != 6) {
-        out.eprint("error: --address-family must be 4 or 6\n", .{});
         return error.InvalidAddressFamily;
     }
     opts.list_products = res.hasFlag("list-products");
@@ -561,9 +560,9 @@ pub fn main(init: std.process.Init) !void {
         // Short diagnostic; the full help is one `--help` away.
         var ebuf: [256]u8 = undefined;
         var ew = std.Io.File.writer(std.Io.File.stderr(), init.io, &ebuf);
-        try ew.interface.print("vlmzs: error: {s}\n", .{@errorName(err)});
-        try ew.interface.flush();
-        return err;
+        ew.interface.print("vlmzs: error: {s}\n", .{@errorName(err)}) catch {};
+        ew.interface.flush() catch {};
+        std.process.exit(1);
     };
     defer res.deinit();
 
@@ -586,7 +585,10 @@ pub fn main(init: std.process.Init) !void {
     var err_buf: [4096]u8 = undefined;
     var out = Output.init(init.io, &out_buf, &err_buf);
 
-    var opts = try resolveOptions(&res, &out);
+    var opts = resolveOptions(&res) catch |e| {
+        out.eprint("error: {s}\n", .{@errorName(e)});
+        std.process.exit(1);
+    };
 
     var data = try kmsdata.parse(init.gpa, embedded_kmd);
     defer data.deinit(init.gpa);
@@ -602,9 +604,9 @@ pub fn main(init: std.process.Init) !void {
         opts.host = if (opts.address_family == 6) "::1" else "127.0.0.1";
     }
 
-    const sku_index = findSku(&data, opts.product) catch |e| {
+    const sku_index = findSku(&data, opts.product) catch {
         out.eprint("error: invalid product selector\n", .{});
-        return e;
+        std.process.exit(1);
     };
 
     var prng = std.Random.DefaultPrng.init(cli_helper.makeSeed(init.io));
@@ -623,15 +625,18 @@ pub fn main(init: std.process.Init) !void {
                 init.gpa, init.io, &opts, base, seed, &out, &data,
             }) catch |e| {
                 out.eprint("failed to dispatch request: {s}\n", .{@errorName(e)});
-                return e;
+                std.process.exit(1);
             };
         }
-        try group.await(init.io);
+        group.await(init.io) catch |e| {
+            out.eprint("request failed: {s}\n", .{@errorName(e)});
+            std.process.exit(1);
+        };
     } else {
         // Reuse one connection for all requests (keep-alive), sent sequentially.
         sendRequestsReused(init.gpa, init.io, &opts, &data, sku_index, prng.random(), &out) catch |e| {
             out.eprint("request failed: {s}\n", .{@errorName(e)});
-            return e;
+            std.process.exit(1);
         };
     }
 }
