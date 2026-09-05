@@ -157,53 +157,52 @@ fn defaultHint(kind: ValueKind) []const u8 {
     };
 }
 
-/// Width of the option spec column (`-x, --long <hint>`), excluding the
-/// leading indent. The `--name` part is aligned across options with and
-/// without a short flag.
+/// Width of the option spec column (`-x, --long [hint]`), excluding the
+/// leading indent. Options without a short flag render as just `--long`.
 fn optColumnWidth(o: Opt) usize {
-    var w: usize = 4; // "-x, " or a four-space placeholder
+    var w: usize = if (o.short != null) 4 else 0; // "-x, "
     w += 2 + o.name.len; // "--name"
-    if (o.kind != .flag) w += 3 + (if (o.hint.len > 0) o.hint else defaultHint(o.kind)).len; // " <hint>"
+    if (o.kind != .flag) w += 3 + (if (o.hint.len > 0) o.hint else defaultHint(o.kind)).len; // " [hint]"
     return w;
 }
 
-/// Render grouped `--help` text. `positional_hint` is the usage line's
-/// positional (e.g. "[HOST[:PORT]]"). Options are expected to be ordered by
-/// `group` (contiguous runs), so each group renders as one block.
+/// Groups are separated by a blank line, value placeholders use square brackets
+/// (`--port [u16]`), and every description aligns to the single widest option
+/// column. `positional_hint` is the usage line's positional (e.g.
+/// "[HOST[:PORT]]"). Options are expected to be ordered by `group` (contiguous
+/// runs).
 pub fn writeHelp(writer: *std.Io.Writer, prog: []const u8, opts: []const Opt, positional_hint: []const u8) !void {
     try writer.print("Usage: {s} [OPTIONS]", .{prog});
     if (positional_hint.len > 0) try writer.print(" {s}", .{positional_hint});
     try writer.print("\n\n", .{});
 
-    // Per-group two passes: measure the group's widest option spec, then
-    // render the group with every description aligned to that column.
-    var i: usize = 0;
-    while (i < opts.len) {
-        const group = opts[i].group;
+    // Two passes: measure the widest option spec, then render every option
+    // with its description aligned to the same (global) column.
+    var max_width: usize = 0;
+    for (opts) |o| {
+        const w = optColumnWidth(o);
+        if (w > max_width) max_width = w;
+    }
 
-        var max_width: usize = 0;
-        var j = i;
-        while (j < opts.len and std.mem.eql(u8, opts[j].group, group)) : (j += 1) {
-            const w = optColumnWidth(opts[j]);
-            if (w > max_width) max_width = w;
+    var current_group: ?[]const u8 = null;
+    for (opts) |o| {
+        if (current_group == null or !std.mem.eql(u8, current_group.?, o.group)) {
+            // A blank line separates groups (not before the first, since the
+            // usage line already ends with one).
+            if (current_group != null) try writer.print("\n", .{});
+            try writer.print("{s}:\n", .{o.group});
+            current_group = o.group;
         }
-
-        try writer.print("{s}:\n", .{group});
-        while (i < j) : (i += 1) {
-            const o = opts[i];
-            try writer.print("    ", .{});
-            if (o.short) |s| {
-                try writer.print("-{c}, ", .{s});
-            } else {
-                try writer.print("    ", .{});
-            }
-            try writer.print("--{s}", .{o.name});
-            if (o.kind != .flag) {
-                try writer.print(" <{s}>", .{if (o.hint.len > 0) o.hint else defaultHint(o.kind)});
-            }
-            try writer.splatByteAll(' ', max_width - optColumnWidth(o) + 2);
-            try writer.print("{s}\n", .{o.desc});
+        try writer.print("    ", .{});
+        if (o.short) |s| {
+            try writer.print("-{c}, ", .{s});
         }
+        try writer.print("--{s}", .{o.name});
+        if (o.kind != .flag) {
+            try writer.print(" [{s}]", .{if (o.hint.len > 0) o.hint else defaultHint(o.kind)});
+        }
+        try writer.splatByteAll(' ', max_width - optColumnWidth(o) + 2);
+        try writer.print("{s}\n", .{o.desc});
     }
 }
 
@@ -399,10 +398,10 @@ test "parseGuid" {
 
 /// Generic option table used by the tests (covers flag / int / str / repeatable).
 const test_opts = [_]Opt{
-    .{ .name = "verbose", .short = 'v', .group = "Output", .desc = "Verbose logging." },
-    .{ .name = "protocol", .kind = .int, .hint = "u16", .group = "Request", .desc = "KMS protocol version." },
-    .{ .name = "count", .short = 'n', .kind = .int, .hint = "u32", .group = "Request", .desc = "Number of requests." },
-    .{ .name = "reconnect-per-request", .short = 'T', .group = "Connection", .desc = "Reconnect for each request." },
+    .{ .name = "verbose", .short = 'v', .group = "Output", .desc = "Verbose logging" },
+    .{ .name = "protocol", .kind = .int, .hint = "u16", .group = "Request", .desc = "KMS protocol version" },
+    .{ .name = "count", .short = 'n', .kind = .int, .hint = "u32", .group = "Request", .desc = "Number of requests" },
+    .{ .name = "reconnect-per-request", .short = 'T', .group = "Connection", .desc = "Reconnect for each request" },
 };
 
 test "parse flag, value and positional" {
@@ -456,6 +455,6 @@ test "help renders groups" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Output:") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Request:") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Connection:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "--protocol <u16>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "--protocol [u16]") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "-v, --verbose") != null);
 }
