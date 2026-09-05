@@ -5,8 +5,8 @@
 
 const std = @import("std");
 const vlmzsd = @import("vlmzsd");
-const cli_helper = vlmzsd.cli_helper;
 
+const cli_helper = vlmzsd.cli_helper;
 const kms = vlmzsd.kms;
 const kmsdata = vlmzsd.kmsdata;
 const network = vlmzsd.network;

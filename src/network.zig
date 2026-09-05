@@ -9,12 +9,12 @@
 //! loops.
 
 const std = @import("std");
-const Io = std.Io;
+const cli_helper = @import("cli_helper.zig");
 const rpc = @import("rpc.zig");
 const kms = @import("kms.zig");
-const cli_helper = @import("cli_helper.zig");
 
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 
 // ---------------------------------------------------------------------------
 // `sendrecv` equivalents
