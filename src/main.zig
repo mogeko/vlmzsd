@@ -480,12 +480,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    log.info("vlmzsd {s} listening on port {d} ({d} socket{s})", .{
-        version,
-        opts.port,
-        servers.items.len,
-        if (servers.items.len == 1) "" else "s",
-    });
+    log.info("vlmzsd {s} listening on port {d}", .{ version, opts.port });
 
     // Write the PID file (best effort; mirrors the C `writePidFile`, which
     // only logs on failure).
