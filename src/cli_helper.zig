@@ -370,10 +370,6 @@ test "parseGuid" {
     try std.testing.expectError(error.InvalidGuid, parseGuid("00112233-4455-6677-8899-aabbccddee"));
 }
 
-// ---------------------------------------------------------------------------
-// Argument-parser tests
-// ---------------------------------------------------------------------------
-
 /// Generic option table used by the tests (covers flag / int / str / repeatable).
 const test_opts = [_]Opt{
     .{ .name = "verbose", .short = 'v', .group = "Output", .desc = "Verbose logging." },

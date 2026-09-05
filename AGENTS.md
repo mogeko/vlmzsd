@@ -16,9 +16,10 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
   `std.Io` APIs — do not regress to the older `std.process.argsAlloc` style.
 - **Package**: module `vlmzsd` (root `src/root.zig`), executables `src/main.zig` (`vlmzsd` server)
   and `src/vlmzs.zig` (`vlmzs` client).
-- **Dependencies**: `zig-clap` (Hejsil/zig-clap) — the only external dependency; used only by the
-  `vlmzsd` server (`src/main.zig`). The `vlmzs` client uses the std-only `src/cli_helper.zig`.
-  Pin the tag compatible with Zig `0.16.0`.
+- **Dependencies**: `zig-clap` (Hejsil/zig-clap) — the only external dependency. Both binaries
+  parse their CLI with the std-only `src/cli_helper.zig`; `zig-clap` remains linked as an
+  independent oracle in `src/main.zig`'s parallel-validation test. Pin the tag compatible with
+  Zig `0.16.0`.
 
 ## Build / test
 
@@ -69,12 +70,12 @@ source linked above).
 
 ## CLI implementation decisions
 
-- **Argument parsing: data-driven, std-only.** `vlmzs` uses `src/cli_helper.zig` — a hand-written
-  parser where a single `Opt` table drives parsing, `--help` rendering, and validation (so the
-  parse logic and help text cannot drift apart). The `vlmzsd` server (`src/main.zig`) still uses
-  `zig-clap` (Hejsil/zig-clap), the project's only external dependency, added to `build.zig.zon`.
-  The three-tier env-var precedence is implemented as a thin layer on top of the parsed result —
-  independent of the parser choice.
+- **Argument parsing: data-driven, std-only.** Both binaries parse their CLI with `src/cli_helper.zig`
+  — a hand-written parser where a single `Opt` table drives parsing, `--help` rendering, and
+  validation (so the parse logic and help text cannot drift apart). `zig-clap` (Hejsil/zig-clap)
+  remains the project's only external dependency, linked only as an independent oracle in a
+  parallel-validation test in `src/main.zig`. The three-tier env-var precedence is implemented as
+  a thin layer on top of the parsed result — independent of the parser choice.
 - **Two entry points share one module.** `src/main.zig` (`vlmzsd`) and `src/vlmzs.zig` (`vlmzs`)
   both import the `vlmzsd` module; argument parsing and option-to-config mapping live in shared
   code (e.g. `src/cli_helper.zig`).
