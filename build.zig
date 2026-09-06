@@ -11,9 +11,11 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // Expose the project version to source via `@import("build_options")`.
+    // Expose the project version and embedded-data flag to source via
+    // `@import("build_options")`.
     const version_options = b.addOptions();
     version_options.addOption([]const u8, "version", version);
+    version_options.addOption(bool, "embedded_data", !(b.option(bool, "no-embedded-data", "Do not embed the default .kmd data; vlmzsd then requires --data <file>") orelse false));
 
     const exe = b.addExecutable(.{
         .name = "vlmzsd",

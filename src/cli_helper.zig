@@ -369,6 +369,80 @@ pub fn makeSeed(io: Io) u64 {
     return @as(u64, @truncate(nanos)) ^ ptr_entropy;
 }
 
+/// FHS/XDG system search directories for external `.kmd` data files, highest
+/// priority first. The user-level `$HOME/.local/share/vlmzsd` directory is
+/// searched before these (see `loadFhsKmd`).
+const fhs_system_dirs = [_][]const u8{
+    "/etc/vlmzsd",
+    "/var/lib/vlmzsd",
+    "/usr/local/share/vlmzsd",
+    "/usr/share/vlmzsd",
+};
+
+/// A `.kmd` data file found on the FHS/XDG search path.
+pub const FhsKmd = struct {
+    path: []u8,
+    data: []u8,
+};
+
+/// Read the `.kmd` data file found by the FHS/XDG search, or null when none
+/// exists. Directories are searched highest priority first (user-level
+/// `$HOME/.local/share/vlmzsd` → `/etc/vlmzsd` → `/var/lib/vlmzsd` →
+/// `/usr/local/share/vlmzsd` → `/usr/share/vlmzsd`); within a directory, the
+/// alphabetically greatest `*.kmd` name wins. On success the caller owns
+/// `path` and `data`.
+pub fn loadFhsKmd(io: Io, gpa: Allocator) !?FhsKmd {
+    // 1. User-level: $HOME/.local/share/vlmzsd
+    if (std.c.getenv("HOME")) |home_c| {
+        const home: []const u8 = std.mem.span(home_c);
+        const dir = try std.fmt.allocPrint(gpa, "{s}/.local/share/vlmzsd", .{home});
+        defer gpa.free(dir);
+        if (try findLastKmd(io, gpa, dir)) |name| {
+            defer gpa.free(name);
+            return try loadKmdFrom(io, gpa, dir, name);
+        }
+    }
+    // 2. System-level directories.
+    for (fhs_system_dirs) |dir| {
+        if (try findLastKmd(io, gpa, dir)) |name| {
+            defer gpa.free(name);
+            return try loadKmdFrom(io, gpa, dir, name);
+        }
+    }
+    return null;
+}
+
+/// Return the alphabetically greatest `*.kmd` file name in `dir`, or null when
+/// the directory has none (or does not exist).
+fn findLastKmd(io: Io, gpa: Allocator, dir_path: []const u8) !?[]u8 {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return e,
+    };
+    defer dir.close(io);
+
+    var best: ?[]u8 = null;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".kmd")) continue;
+        const better = if (best) |b| std.mem.order(u8, entry.name, b) == .gt else true;
+        if (better) {
+            if (best) |b| gpa.free(b);
+            best = try gpa.dupe(u8, entry.name);
+        }
+    }
+    return best;
+}
+
+/// Load the `.kmd` file at `dir_path/name`.
+fn loadKmdFrom(io: Io, gpa: Allocator, dir_path: []const u8, name: []const u8) !FhsKmd {
+    const full_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_path, name });
+    errdefer gpa.free(full_path);
+    const data = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, full_path, gpa, .unlimited);
+    return .{ .path = full_path, .data = data };
+}
+
 test "parseDurationSeconds" {
     try std.testing.expectEqual(@as(u64, 30), try parseDurationSeconds("30s"));
     try std.testing.expectEqual(@as(u64, 7200), try parseDurationSeconds("2h"));

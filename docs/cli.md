@@ -34,7 +34,7 @@ request to an existing KMS server. When `HOST` is omitted, `vlmzs` targets
 ## 3. Configuration precedence
 
 Every `vlmzsd` option is settable via CLI and via an environment variable. The
-client is interactive and is configured almost entirely through CLI arguments
+client is interactive and is configured entirely through CLI arguments
 (environment variables are not defined for `vlmzs`).
 
 Precedence, highest to lowest:
@@ -90,6 +90,19 @@ Grouped by concern (help is rendered in these groups).
 |---|---|---|---|---|
 | `--data <file>` | | embedded | `VLMZSD_DATA` | external `.kmd` file; default is the `@embedFile`d data |
 
+When `--data` is not given, both binaries search the FHS/XDG data directories
+for a `.kmd` file, highest priority first:
+
+1. `$HOME/.local/share/vlmzsd/*.kmd` (user level)
+2. `/etc/vlmzsd/*.kmd` (admin override)
+3. `/var/lib/vlmzsd/*.kmd` (state data)
+4. `/usr/local/share/vlmzsd/*.kmd` (locally installed)
+5. `/usr/share/vlmzsd/*.kmd` (distribution-packaged)
+
+Within a directory, the alphabetically greatest `*.kmd` name wins. If no
+`.kmd` file is found anywhere, the embedded default is used — or, when built
+with `-Dno-embedded-data`, startup fails with an error.
+
 ### ePID
 
 | Option | Short | Default | Env var | Notes |
@@ -142,6 +155,7 @@ the C `-l`/`-T`/`-e` options.
 |---|---|---|---|
 | `HOST[:PORT]` | — | `127.0.0.1` | positional; port defaults to `1688` |
 | `--product <name>` | | first SKU | product name or 1-based number; looks up GUIDs from `.kmd` |
+| `--data <file>` | | embedded | external `.kmd` file |
 | `--protocol <4\|5\|6>` | | from product | KMS protocol version (derived from the selected SKU) |
 | `--app-id <guid>` | | from product | override AppID |
 | `--sku-id <guid>` | | from product | override SKUID |
