@@ -102,7 +102,8 @@ def main(argv):
         )
     if hb_offset != expected_hb:
         errors.append(
-            f"HostBuildOffset {hb_offset} != app_offset + {items_total}*32 = {expected_hb}"
+            f"HostBuildOffset {hb_offset} != app_offset + "
+            f"{items_total}*32 = {expected_hb}"
         )
     if app_offset + items_total * ITEM_SIZE > len(d):
         errors.append("item array extends past end of file")
