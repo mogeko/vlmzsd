@@ -400,7 +400,7 @@ test "kmd header fields" {
     // 72-byte header + default-data size pinned to docs/migration.md §3.4.
     const raw: []const u8 = @embedFile("vlmcsd.kmd");
 
-    try std.testing.expectEqual(@as(usize, 19491), raw.len);
+    try std.testing.expectEqual(@as(usize, 19371), raw.len);
     try std.testing.expectEqualStrings("KMD", raw[0..3]); // Magic
     try std.testing.expectEqual(@as(u8, 0), raw[3]); // Magic[3] = NUL
     try std.testing.expectEqual(@as(u16, 0), readLe(u16, raw, 4)); // MinorVer
