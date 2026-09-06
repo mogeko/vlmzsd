@@ -1,0 +1,67 @@
+---
+name: kmd-upgrade
+description: 'Validate and propagate a change to the embedded KMS data file (src/vlmcsd.kmd) in vlmzsd. Use whenever src/vlmcsd.kmd is modified — upgraded, regenerated, or hand-edited — to check the new data is a legal .kmd file, then update the tests and docs that pin the default data. Works with the kmd-format agent for layout analysis. Keywords: .kmd, vlmcsd.kmd, KMS data, upgrade, kmsdata, CSVLC, HostBuild, default data, record count.'
+argument-hint: '<what changed in src/vlmcsd.kmd>'
+---
+
+# KMS Data (.kmd) Upgrade
+
+Validate a changed `src/vlmcsd.kmd` and propagate the new default data into the
+byte-level tests and documentation. The embedded `.kmd` is a wire-visible
+artifact: every change must be checked for legality, then pinned.
+
+## When to Use
+
+- `src/vlmcsd.kmd` was replaced, regenerated, or hand-edited.
+- You changed a CSVLC, app/KMS/SKU item, or HostBuild record in the data.
+- `zig build test` fails in `src/kmsdata.zig` after a data change.
+
+## Procedure
+
+1. **Establish what changed.** `git diff --stat src/vlmcsd.kmd` and note whether
+   it is a regeneration (record counts changed) or a targeted edit (values changed).
+
+2. **Analyze the new layout.** Run [dump_kmd.py](../../../scripts/dump_kmd.py) on the
+   changed file to dump the header, record values, and string-pool fields; it
+   also runs the legality checks. Then invoke the `kmd-format` subagent to map
+   the new header/record layout against `docs/kmd-format.md` (canonical) and
+   `docs/migration.md` §3.4 (summary), and report the header fields (magic,
+   major/minor version, counts, offsets) and record values that moved.
+
+3. **Validate legality.** [dump_kmd.py](../../../scripts/dump_kmd.py) reports these
+   checks automatically (see `docs/kmd-format.md` §8):
+   - `Magic[0..4] == "KMD\0"` and the last byte of the file is `0`.
+   - `MajorVer == 2` (minor may vary).
+   - Offsets (`AppItemOffset@32`, `HostBuildOffset@56`) and counts are
+     self-consistent with the file size: `72 + csvlk*32`, `app_offset +
+     items*32`, `hostbuild_offset + hostbuilds*32` all fit within the file.
+   - Every string offset (ePID, name, display name) points to a NUL-terminated
+     region.
+   Then run `zig build test --summary all`. The `parse embedded .kmd data` and
+   `kmd header fields` tests are the authoritative legality check; any
+   failure means the data is illegal (or the test is stale — fix the data first).
+
+4. **Update the pinning tests** (only after the data itself is legal):
+   - `src/kmsdata.zig` — update `parse embedded .kmd data` field values and
+     `kmd header fields` size (`raw.len`) and record counts.
+   - `src/kms.zig` / `src/root.zig` / `src/rpc.zig` — any golden value derived
+     from the default data (e.g. `@embedFile("vlmcsd.kmd")` round-trips).
+
+5. **Update the docs**:
+   - `docs/kmd-format.md` — default-data byte size and record counts
+     (CSVLC / app / kms / sku / hostbuild), and any format change.
+   - `docs/migration.md` §3.4 — keep the format summary in sync (data stats
+     live only in `docs/kmd-format.md`).
+   - `README.md` / `docs/cli.md` — only if the change alters the user-visible
+     surface (e.g. the product list).
+
+6. **Verify.** `zig fmt` and `zig build test --summary all` must pass; every
+   updated assert carries a `// from docs/kmd-format.md` provenance comment.
+
+## Checklist
+
+- [ ] New `.kmd` is legal: magic, `MajorVer == 2`, trailing NUL, consistent offsets/counts.
+- [ ] `kmd-format` agent report reviewed; layout matches `docs/kmd-format.md`.
+- [ ] All field/count/size asserts in `src/kmsdata.zig` updated with provenance comments.
+- [ ] `docs/kmd-format.md` default-data numbers updated; `docs/migration.md` §3.4 format summary in sync.
+- [ ] `zig fmt` + `zig build test --summary all` pass.

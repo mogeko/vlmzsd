@@ -17,7 +17,7 @@ test "embedded .kmd data pipeline" {
     try std.testing.expectEqual(@as(u8, 0), kmd[3]);
     try testutil.expectBytes(kmd[4..6], "\x00\x00");
     try testutil.expectBytes(kmd[6..8], "\x02\x00");
-    try std.testing.expectEqual(@as(usize, 15079), kmd.len);
+    try std.testing.expectEqual(@as(usize, 19491), kmd.len);
 }
 
 test {
