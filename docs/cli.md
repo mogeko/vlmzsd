@@ -34,9 +34,8 @@ request to an existing KMS server. When `HOST` is omitted, `vlmzs` targets
 ## 3. Configuration precedence
 
 Every `vlmzsd` option is settable via CLI and via an environment variable. The
-client is interactive and is configured almost entirely through CLI arguments
-(environment variables are not defined for `vlmzs`, with one exception:
-`VLMZS_DATA`, which mirrors `--data`).
+client is interactive and is configured entirely through CLI arguments
+(environment variables are not defined for `vlmzs`).
 
 Precedence, highest to lowest:
 
@@ -143,7 +142,7 @@ the C `-l`/`-T`/`-e` options.
 |---|---|---|---|
 | `HOST[:PORT]` | — | `127.0.0.1` | positional; port defaults to `1688` |
 | `--product <name>` | | first SKU | product name or 1-based number; looks up GUIDs from `.kmd` |
-| `--data <file>` | | embedded | external `.kmd` file (also `VLMZS_DATA`) |
+| `--data <file>` | | embedded | external `.kmd` file |
 | `--protocol <4\|5\|6>` | | from product | KMS protocol version (derived from the selected SKU) |
 | `--app-id <guid>` | | from product | override AppID |
 | `--sku-id <guid>` | | from product | override SKUID |

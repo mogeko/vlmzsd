@@ -13,7 +13,6 @@ const network = vlmzsd.network;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const EnvironMap = std.process.Environ.Map;
 
 const build_options = @import("build_options");
 const version = build_options.version;
@@ -200,7 +199,7 @@ fn parseHostPort(host_arg: []const u8) !struct { host: []const u8, port: u16 } {
     return .{ .host = host_arg, .port = default_port };
 }
 
-fn resolveOptions(res: *const cli_helper.Result, env: *const EnvironMap) !ClientOptions {
+fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
     var opts = ClientOptions{};
 
     // Positional HOST[:PORT].
@@ -211,7 +210,7 @@ fn resolveOptions(res: *const cli_helper.Result, env: *const EnvironMap) !Client
     }
 
     opts.product = res.get("product");
-    opts.data_file = res.get("data") orelse env.get("VLMZS_DATA");
+    opts.data_file = res.get("data");
     opts.protocol = if (res.get("protocol")) |s| try std.fmt.parseInt(u16, s, 10) else 0;
     if (res.get("app-id")) |s| opts.app_id = try cli_helper.parseGuid(s);
     if (res.get("sku-id")) |s| opts.sku_id = try cli_helper.parseGuid(s);
@@ -591,13 +590,13 @@ pub fn main(init: std.process.Init) !void {
     var err_buf: [4096]u8 = undefined;
     var out = Output.init(init.io, &out_buf, &err_buf);
 
-    var opts = resolveOptions(&res, init.environ_map) catch |e| {
+    var opts = resolveOptions(&res) catch |e| {
         out.eprint("error: {s}\n", .{@errorName(e)});
         std.process.exit(1);
     };
 
-    // Load the KMS data: explicit path (--data / VLMZS_DATA) → FHS/XDG search
-    // → embedded default.
+    // Load the KMS data: explicit path (--data) → FHS/XDG search → embedded
+    // default.
     var kmd_owned = false;
     var kmd_raw: []const u8 = undefined;
     var fhs_loaded: ?cli_helper.FhsKmd = null;
