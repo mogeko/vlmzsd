@@ -13,12 +13,15 @@ const network = vlmzsd.network;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const EnvironMap = std.process.Environ.Map;
 
 const build_options = @import("build_options");
 const version = build_options.version;
 const default_port: u16 = 1688;
 const default_grace_minutes: u32 = 43200;
-const embedded_kmd: []const u8 = @embedFile("vlmcsd.kmd");
+/// Embedded default `.kmd` data, unless built with `-Dno-embedded-data`
+/// (then `--data <file>` is required at runtime).
+const embedded_kmd: []const u8 = if (build_options.embedded_data) @embedFile("vlmcsd.kmd") else &.{};
 
 /// Bare stdout/stderr writers for the client. The client is a CLI debugging
 /// tool, not a service: its answer (ePID) and `--verbose` protocol dumps go to
@@ -126,6 +129,7 @@ const vlmzs_opts = [_]cli_helper.Opt{
     .{ .name = "version", .short = 'V', .group = "General", .desc = "Output version information and exit" },
     .{ .name = "product", .kind = .str, .hint = "name", .group = "General", .desc = "Product name or 1-based number (default: first SKU)" },
     .{ .name = "list-products", .short = 'x', .group = "General", .desc = "Print available products and exit" },
+    .{ .name = "data", .kind = .str, .hint = "file", .group = "General", .desc = "External .kmd data file (default embedded)" },
     .{ .name = "protocol", .kind = .int, .hint = "u16", .group = "Request", .desc = "KMS protocol version 4/5/6" },
     .{ .name = "app-id", .kind = .guid, .group = "Request", .desc = "Override AppID (GUID)" },
     .{ .name = "sku-id", .kind = .guid, .group = "Request", .desc = "Override SKUID (GUID)" },
@@ -150,6 +154,7 @@ const ClientOptions = struct {
     host: ?[]const u8 = null,
     port: u16 = default_port,
     product: ?[]const u8 = null,
+    data_file: ?[]const u8 = null,
     protocol: u16 = 0, // 0 = derive from the selected SKU
     app_id: ?[16]u8 = null,
     sku_id: ?[16]u8 = null,
@@ -195,7 +200,7 @@ fn parseHostPort(host_arg: []const u8) !struct { host: []const u8, port: u16 } {
     return .{ .host = host_arg, .port = default_port };
 }
 
-fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
+fn resolveOptions(res: *const cli_helper.Result, env: *const EnvironMap) !ClientOptions {
     var opts = ClientOptions{};
 
     // Positional HOST[:PORT].
@@ -206,6 +211,7 @@ fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
     }
 
     opts.product = res.get("product");
+    opts.data_file = res.get("data") orelse env.get("VLMZS_DATA");
     opts.protocol = if (res.get("protocol")) |s| try std.fmt.parseInt(u16, s, 10) else 0;
     if (res.get("app-id")) |s| opts.app_id = try cli_helper.parseGuid(s);
     if (res.get("sku-id")) |s| opts.sku_id = try cli_helper.parseGuid(s);
@@ -585,12 +591,32 @@ pub fn main(init: std.process.Init) !void {
     var err_buf: [4096]u8 = undefined;
     var out = Output.init(init.io, &out_buf, &err_buf);
 
-    var opts = resolveOptions(&res) catch |e| {
+    var opts = resolveOptions(&res, init.environ_map) catch |e| {
         out.eprint("error: {s}\n", .{@errorName(e)});
         std.process.exit(1);
     };
 
-    var data = try kmsdata.parse(init.gpa, embedded_kmd);
+    // Load the KMS data: external file overrides the embedded default.
+    var kmd_owned = false;
+    var kmd_raw: []const u8 = undefined;
+    if (opts.data_file) |path| {
+        kmd_raw = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, path, init.gpa, .unlimited) catch |e| {
+            out.eprint("error: failed to read data file {s}: {s}\n", .{ path, @errorName(e) });
+            std.process.exit(1);
+        };
+        kmd_owned = true;
+    } else if (embedded_kmd.len > 0) {
+        kmd_raw = embedded_kmd;
+    } else {
+        out.eprint("error: no embedded KMS data; specify --data <file>\n", .{});
+        std.process.exit(1);
+    }
+    defer if (kmd_owned) init.gpa.free(@constCast(kmd_raw));
+
+    var data = kmsdata.parse(init.gpa, kmd_raw) catch |e| {
+        out.eprint("error: invalid KMS data: {s}\n", .{@errorName(e)});
+        std.process.exit(1);
+    };
     defer data.deinit(init.gpa);
 
     if (opts.list_products) {
@@ -643,7 +669,7 @@ pub fn main(init: std.process.Init) !void {
 
 test "buildRequestBase binding expiration" {
     const alloc = std.testing.allocator;
-    var data = try kmsdata.parse(alloc, embedded_kmd);
+    var data = try kmsdata.parse(alloc, @embedFile("vlmcsd.kmd"));
     defer data.deinit(alloc);
 
     var prng = std.Random.DefaultPrng.init(0);
