@@ -596,20 +596,34 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    // Load the KMS data: external file overrides the embedded default.
+    // Load the KMS data: explicit path (--data / VLMZS_DATA) → FHS/XDG search
+    // → embedded default.
     var kmd_owned = false;
     var kmd_raw: []const u8 = undefined;
+    var fhs_loaded: ?cli_helper.FhsKmd = null;
+    defer if (fhs_loaded) |*f| {
+        init.gpa.free(f.path);
+        init.gpa.free(f.data);
+    };
     if (opts.data_file) |path| {
         kmd_raw = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, path, init.gpa, .unlimited) catch |e| {
             out.eprint("error: failed to read data file {s}: {s}\n", .{ path, @errorName(e) });
             std.process.exit(1);
         };
         kmd_owned = true;
-    } else if (embedded_kmd.len > 0) {
-        kmd_raw = embedded_kmd;
     } else {
-        out.eprint("error: no embedded KMS data; specify --data <file>\n", .{});
-        std.process.exit(1);
+        fhs_loaded = cli_helper.loadFhsKmd(init.io, init.gpa) catch |e| {
+            out.eprint("error: failed to read FHS data file: {s}\n", .{@errorName(e)});
+            std.process.exit(1);
+        };
+        if (fhs_loaded) |*f| {
+            kmd_raw = f.data;
+        } else if (embedded_kmd.len > 0) {
+            kmd_raw = embedded_kmd;
+        } else {
+            out.eprint("error: no KMS data found; specify --data <file>\n", .{});
+            std.process.exit(1);
+        }
     }
     defer if (kmd_owned) init.gpa.free(@constCast(kmd_raw));
 

@@ -412,20 +412,37 @@ pub fn main(init: std.process.Init) !void {
     defer opts.deinit(init.gpa);
     log.min_level = if (opts.quiet) .warn else if (opts.verbose) .debug else .info;
 
-    // Load the KMS data: external file overrides the embedded default.
+    // Load the KMS data: explicit path (--data / VLMZSD_DATA) → FHS/XDG search
+    // → embedded default.
     var kmd_owned = false;
     var kmd_raw: []const u8 = undefined;
+    var loaded_from: ?[]const u8 = null; // null = embedded
+    var fhs_loaded: ?cli_helper.FhsKmd = null;
+    defer if (fhs_loaded) |*f| {
+        init.gpa.free(f.path);
+        init.gpa.free(f.data);
+    };
     if (opts.data_file) |path| {
         kmd_raw = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, path, init.gpa, .unlimited) catch |e| {
             log.err("failed to read data file {s}: {s}", .{ path, @errorName(e) });
             std.process.exit(1);
         };
         kmd_owned = true;
-    } else if (embedded_kmd.len > 0) {
-        kmd_raw = embedded_kmd;
+        loaded_from = path;
     } else {
-        log.err("no embedded KMS data; specify --data <file>", .{});
-        std.process.exit(1);
+        fhs_loaded = cli_helper.loadFhsKmd(init.io, init.gpa) catch |e| {
+            log.err("failed to read FHS data file: {s}", .{@errorName(e)});
+            std.process.exit(1);
+        };
+        if (fhs_loaded) |*f| {
+            kmd_raw = f.data;
+            loaded_from = f.path;
+        } else if (embedded_kmd.len > 0) {
+            kmd_raw = embedded_kmd;
+        } else {
+            log.err("no KMS data found; specify --data <file>", .{});
+            std.process.exit(1);
+        }
     }
     defer if (kmd_owned) init.gpa.free(@constCast(kmd_raw));
 
@@ -435,7 +452,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer data.deinit(init.gpa);
 
-    if (opts.data_file) |path| {
+    if (loaded_from) |path| {
         log.info("loaded KMS data from {s}", .{path});
     } else {
         log.debug("using embedded KMS data", .{});

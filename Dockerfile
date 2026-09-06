@@ -29,14 +29,18 @@ COPY ./build.zig.zon /opt/app/build.zig.zon
 COPY ./LICENSE /opt/app/LICENSE
 COPY ./README.md /opt/app/README.md
 
-RUN /opt/builder/zig build --release=safe -Dcpu=baseline
+RUN /opt/builder/zig build vlmzsd vlmzs \
+        --release=safe -Dcpu=baseline -Dno-embedded-data
 
 FROM gcr.io/distroless/cc-debian13:latest
 
 COPY --from=builder /opt/app/zig-out/bin/vlmzsd /usr/bin/vlmzsd
 COPY --from=builder /opt/app/zig-out/bin/vlmzs /usr/bin/vlmzs
+COPY --from=builder /opt/app/src/vlmcsd.kmd /usr/share/vlmzsd/data.kmd
 COPY --from=builder /opt/app/LICENSE /usr/share/doc/vlmzsd/copyright
 COPY --from=builder /opt/app/README.md /usr/share/doc/vlmzsd/README.md
+
+ENV VLMZSD_PORT="1688"
 
 EXPOSE 1688/tcp
 
