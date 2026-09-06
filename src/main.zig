@@ -20,8 +20,9 @@ const build_options = @import("build_options");
 const version = build_options.version;
 const default_port: u16 = 1688;
 
-/// Embedded default `.kmd` data (the vlmcsd default data file).
-const embedded_kmd: []const u8 = @embedFile("vlmcsd.kmd");
+/// Embedded default `.kmd` data, unless built with `-Dno-embedded-data`
+/// (then `--data <file>` is required at runtime).
+const embedded_kmd: []const u8 = if (build_options.embedded_data) @embedFile("vlmcsd.kmd") else &.{};
 
 /// Data-driven option table for `vlmzsd` (docs/cli.md §5). Single source of
 /// truth: drives parsing, `--help` rendering, and validation alike. The
@@ -420,8 +421,11 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         kmd_owned = true;
-    } else {
+    } else if (embedded_kmd.len > 0) {
         kmd_raw = embedded_kmd;
+    } else {
+        log.err("no embedded KMS data; specify --data <file>", .{});
+        std.process.exit(1);
     }
     defer if (kmd_owned) init.gpa.free(@constCast(kmd_raw));
 
