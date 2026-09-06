@@ -143,7 +143,7 @@ default data, follow the `kmd-upgrade` skill.
 
 ## 9. Default data
 
-`src/vlmcsd.kmd` (embedded) — 19,491 bytes:
+`src/vlmcsd.kmd` (embedded) — 19,371 bytes:
 
 | Count | Value |
 |---|---|
