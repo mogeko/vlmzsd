@@ -32,7 +32,7 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
 | KMS protocol | `src/kms.zig` | v4/v5/v6 REQUEST/RESPONSE structs, ePID generation, response build & decrypt |
 | RPC transport | `src/rpc.zig` | Hand-written DCE/RPC: BIND, NDR32/NDR64, FAULT, framing |
 | Crypto | `src/crypto.zig` | From-scratch AES (FIPS-197) + `std.crypto` SHA-256 / HMAC-SHA256 |
-| Data | `src/kmsdata.zig` | `.kmd` binary data parsing (embedded `src/vlmcsd.kmd`) |
+| Data | `src/kmsdata.zig` | `.kmd` binary data parsing (embedded `src/vlmcsd.kmd`); format spec in `docs/kmd-format.md` |
 | Network | `src/network.zig` | `std.Io` sockets: server loop, client connect (DNS), private-IP detection |
 | Server | `src/main.zig` | `vlmzsd` CLI + accept loop + thread-per-connection |
 | Client | `src/vlmzs.zig` | `vlmzs` activation client |
@@ -53,7 +53,7 @@ source linked above).
 - DCE/RPC: single-fragment packets, BIND/ALTER-CONTEXT negotiation, NDR32/NDR64 wrapping, FAULT
   with `CallId=2`. Invalid requests return a RESPONSE with HRESULT `0x8007000D`, not a disconnect.
 - The embedded default data is `src/vlmcsd.kmd` (`@embedFile`); external `.kmd` files load at
-  runtime via `--data`.
+  runtime via `--data`. The `.kmd` layout is specified in `docs/kmd-format.md`.
 
 ## Conventions
 

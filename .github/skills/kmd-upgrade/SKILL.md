@@ -22,11 +22,11 @@ artifact: every change must be checked for legality, then pinned.
    it is a regeneration (record counts changed) or a targeted edit (values changed).
 
 2. **Analyze the new layout.** Invoke the `kmd-format` subagent to map the new
-   header/record layout against `docs/migration.md` §3.4, and report the
-   header fields (magic, major/minor version, counts, offsets) and record
-   values that moved.
+   header/record layout against `docs/kmd-format.md` (canonical) and
+   `docs/migration.md` §3.4 (summary), and report the header fields (magic,
+   major/minor version, counts, offsets) and record values that moved.
 
-3. **Validate legality.** Confirm all of these against `docs/migration.md` §3.4
+3. **Validate legality.** Confirm all of these against `docs/kmd-format.md`
    and `src/kmsdata.zig`:
    - `Magic[0..4] == "KMD\0"` and the last byte of the file is `0`.
    - `MajorVer == 2` (minor may vary).
@@ -46,18 +46,20 @@ artifact: every change must be checked for legality, then pinned.
      from the default data (e.g. `@embedFile("vlmcsd.kmd")` round-trips).
 
 5. **Update the docs**:
-   - `docs/migration.md` §3.4 — default-data byte size and record counts
+   - `docs/kmd-format.md` — default-data byte size and record counts
      (CSVLC / app / kms / sku / hostbuild), and any format change.
+   - `docs/migration.md` §3.4 — keep the format summary in sync (data stats
+     live only in `docs/kmd-format.md`).
    - `README.md` / `docs/cli.md` — only if the change alters the user-visible
      surface (e.g. the product list).
 
 6. **Verify.** `zig fmt` and `zig build test --summary all` must pass; every
-   updated assert carries a `// from docs/migration.md §3.4` provenance comment.
+   updated assert carries a `// from docs/kmd-format.md` provenance comment.
 
 ## Checklist
 
 - [ ] New `.kmd` is legal: magic, `MajorVer == 2`, trailing NUL, consistent offsets/counts.
-- [ ] `kmd-format` agent report reviewed; layout matches `docs/migration.md` §3.4.
+- [ ] `kmd-format` agent report reviewed; layout matches `docs/kmd-format.md`.
 - [ ] All field/count/size asserts in `src/kmsdata.zig` updated with provenance comments.
-- [ ] `docs/migration.md` §3.4 default-data numbers updated.
+- [ ] `docs/kmd-format.md` default-data numbers updated; `docs/migration.md` §3.4 format summary in sync.
 - [ ] `zig fmt` + `zig build test --summary all` pass.

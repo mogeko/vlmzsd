@@ -144,7 +144,7 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
   `IsRetail@28` `IsPreview@29` `EPidIndex@30`.
 - HostBuild record, 32 bytes: `DisplayNameOffset@0` (u64) `ReleaseDate@8` (i64)
   `BuildNumber@16` (i32) `PlatformId@20` (i32) `Flags@24` (u32, `UseNdr64=1<<0`).
-- Default data: `src/vlmcsd.kmd` (embedded; 19,491 bytes, 8 CSVLC / 3 app / 36 kms / 261 sku / 8 hostbuild).
+- Full specification: `docs/kmd-format.md`.
 
 ---
 
