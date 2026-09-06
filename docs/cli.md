@@ -90,6 +90,19 @@ Grouped by concern (help is rendered in these groups).
 |---|---|---|---|---|
 | `--data <file>` | | embedded | `VLMZSD_DATA` | external `.kmd` file; default is the `@embedFile`d data |
 
+When `--data` is not given, both binaries search the FHS/XDG data directories
+for a `.kmd` file, highest priority first:
+
+1. `$HOME/.local/share/vlmzsd/*.kmd` (user level)
+2. `/etc/vlmzsd/*.kmd` (admin override)
+3. `/var/lib/vlmzsd/*.kmd` (state data)
+4. `/usr/local/share/vlmzsd/*.kmd` (locally installed)
+5. `/usr/share/vlmzsd/*.kmd` (distribution-packaged)
+
+Within a directory, the alphabetically greatest `*.kmd` name wins. If no
+`.kmd` file is found anywhere, the embedded default is used — or, when built
+with `-Dno-embedded-data`, startup fails with an error.
+
 ### ePID
 
 | Option | Short | Default | Env var | Notes |
