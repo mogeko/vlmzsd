@@ -21,13 +21,15 @@ artifact: every change must be checked for legality, then pinned.
 1. **Establish what changed.** `git diff --stat src/vlmcsd.kmd` and note whether
    it is a regeneration (record counts changed) or a targeted edit (values changed).
 
-2. **Analyze the new layout.** Invoke the `kmd-format` subagent to map the new
-   header/record layout against `docs/kmd-format.md` (canonical) and
+2. **Analyze the new layout.** Run [dump_kmd.py](../../../scripts/dump_kmd.py) on the
+   changed file to dump the header, record values, and string-pool fields; it
+   also runs the legality checks. Then invoke the `kmd-format` subagent to map
+   the new header/record layout against `docs/kmd-format.md` (canonical) and
    `docs/migration.md` §3.4 (summary), and report the header fields (magic,
    major/minor version, counts, offsets) and record values that moved.
 
-3. **Validate legality.** Confirm all of these against `docs/kmd-format.md`
-   and `src/kmsdata.zig`:
+3. **Validate legality.** [dump_kmd.py](../../../scripts/dump_kmd.py) reports these
+   checks automatically (see `docs/kmd-format.md` §8):
    - `Magic[0..4] == "KMD\0"` and the last byte of the file is `0`.
    - `MajorVer == 2` (minor may vary).
    - Offsets (`AppItemOffset@32`, `HostBuildOffset@56`) and counts are
@@ -35,9 +37,9 @@ artifact: every change must be checked for legality, then pinned.
      items*32`, `hostbuild_offset + hostbuilds*32` all fit within the file.
    - Every string offset (ePID, name, display name) points to a NUL-terminated
      region.
-   - Run `zig build test --summary all`. The `parse embedded .kmd data` and
-     `kmd header fields` tests are the authoritative legality check; any
-     failure means the data is illegal (or the test is stale — fix the data first).
+   Then run `zig build test --summary all`. The `parse embedded .kmd data` and
+   `kmd header fields` tests are the authoritative legality check; any
+   failure means the data is illegal (or the test is stale — fix the data first).
 
 4. **Update the pinning tests** (only after the data itself is legal):
    - `src/kmsdata.zig` — update `parse embedded .kmd data` field values and
