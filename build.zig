@@ -55,6 +55,26 @@ pub fn build(b: *std.Build) void {
     const vlmzs_step = b.step("vlmzs", "Build the vlmzs client only");
     vlmzs_step.dependOn(&vlmzs_install.step);
 
+    // kmdconv: developer tool (JSON <-> .kmd). Not installed by default — it
+    // is not part of the user-facing surface, only built via `zig build kmdconv`.
+    const kmdconv_exe = b.addExecutable(.{
+        .name = "kmdconv",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/kmdconv.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vlmzsd", .module = mod },
+            },
+        }),
+    });
+
+    kmdconv_exe.root_module.addOptions("build_options", version_options);
+
+    const kmdconv_install = b.addInstallArtifact(kmdconv_exe, .{});
+    const kmdconv_step = b.step("kmdconv", "Build the kmdconv developer tool (JSON <-> .kmd)");
+    kmdconv_step.dependOn(&kmdconv_install.step);
+
     const run_step = b.step("run", "Run the app");
 
     const run_cmd = b.addRunArtifact(exe);
@@ -84,8 +104,15 @@ pub fn build(b: *std.Build) void {
 
     const run_vlmzs_tests = b.addRunArtifact(vlmzs_tests);
 
+    const kmdconv_tests = b.addTest(.{
+        .root_module = kmdconv_exe.root_module,
+    });
+
+    const run_kmdconv_tests = b.addRunArtifact(kmdconv_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_vlmzs_tests.step);
+    test_step.dependOn(&run_kmdconv_tests.step);
 }
