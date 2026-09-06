@@ -1015,7 +1015,7 @@ test "generateRandomPid format" {
     // platform(5)-group(5)-keyHi(3)-keyLo(6)-03-lang-build.0000-yday(3)year(4)
     try std.testing.expectEqualStrings("03612", pid[0..5]); // platform id for 17763
     try std.testing.expectEqual('-', pid[5]);
-    try std.testing.expectEqualStrings("00206", pid[6..11]); // Windows group id
+    try std.testing.expectEqualStrings("04919", pid[6..11]); // Windows group id
     try std.testing.expectEqual('-', pid[11]);
     try std.testing.expectEqual('-', pid[15]);
     try std.testing.expectEqual('-', pid[22]);
