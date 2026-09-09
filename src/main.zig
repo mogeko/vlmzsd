@@ -287,6 +287,25 @@ const ClientContext = struct {
     log: *cli_helper.Logger,
 };
 
+/// Translate a `network.Event` into a log line. This is the logger boundary:
+/// `network.serveRpc` reports what happened, and this function decides the
+/// level, wording, and destination.
+fn logProtocolEvent(context: ?*anyopaque, event: network.Event) void {
+    const log: *cli_helper.Logger = @ptrCast(@alignCast(context orelse return));
+    switch (event) {
+        .bind_negotiated => |ndr64| log.debug("BIND: negotiated {s}", .{if (ndr64) "NDR64" else "NDR32"}),
+        .fault => |nca| log.warn("RPC fault (NCA 0x{X:0>8})", .{nca}),
+        .request_rejected => |r| {
+            if (r.major != 0) {
+                log.warn("KMS v{d} request rejected (HRESULT 0x{X:0>8})", .{ r.major, r.hr });
+            } else {
+                log.warn("invalid KMS request rejected (HRESULT 0x{X:0>8})", .{r.hr});
+            }
+        },
+        .response => |r| log.debug("KMS v{d} request → {d}-byte response", .{ r.major, r.size }),
+    }
+}
+
 /// Serve one connection as a pooled task (dispatched via `Group.concurrent`).
 /// Releases the semaphore and frees the context on exit.
 fn serveClientThread(ctx: *ClientContext) void {
@@ -309,7 +328,8 @@ fn serveClientThread(ctx: *ClientContext) void {
 
     network.serveRpc(ctx.gpa, &reader.interface, &writer.interface, ctx.prng.random(), now_unix, .{
         .cfg = ctx.cfg,
-        .log = ctx.log,
+        .on_event = logProtocolEvent,
+        .event_context = ctx.log,
         .secondary_address = ctx.port_str,
         .use_ndr64 = ctx.use_ndr64,
         .use_btfn = ctx.use_btfn,
