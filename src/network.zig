@@ -9,7 +9,6 @@
 //! loops.
 
 const std = @import("std");
-const cli_helper = @import("cli_helper.zig");
 const rpc = @import("rpc.zig");
 const kms = @import("kms.zig");
 
@@ -37,9 +36,24 @@ pub fn writeAll(writer: *Io.Writer, buf: []const u8) !void {
 // Server
 // ---------------------------------------------------------------------------
 
+/// Protocol-level event reported to the caller via `ServeOptions.on_event`.
+/// This module reports what happened; the caller decides how to surface it
+/// (e.g. logging), keeping this module free of any logger dependency.
+pub const Event = union(enum) {
+    /// BIND/ALTER-CONTEXT negotiation; payload is true when NDR64 was selected.
+    bind_negotiated: bool,
+    /// A FAULT was sent; payload is the NCA status code.
+    fault: u32,
+    /// A KMS request was rejected; `major` is the request's major version
+    /// (0 = unparseable) and `hr` the HRESULT.
+    request_rejected: struct { major: u32, hr: u32 },
+    /// A KMS request was served; `major` is the version and `size` the
+    /// response byte length.
+    response: struct { major: u32, size: usize },
+};
+
 pub const ServeOptions = struct {
     cfg: *const kms.ServerConfig,
-    log: ?*cli_helper.Logger = null,
     rpc_assoc_group: u32 = 0,
     /// Port-number string to embed in BIND responses ("" → none).
     secondary_address: []const u8 = "",
@@ -53,6 +67,10 @@ pub const ServeOptions = struct {
     timeout_seconds: u32 = 0,
     /// Connected socket fd, polled for readability when `timeout_seconds > 0`.
     socket_fd: std.posix.socket_t = 0,
+    /// Optional sink for protocol-level events (see `Event`). When null, the
+    /// events are simply not reported.
+    on_event: ?*const fn (context: ?*anyopaque, event: Event) void = null,
+    event_context: ?*anyopaque = null,
 };
 
 /// Write one RPC packet (header + body).
@@ -128,10 +146,8 @@ pub fn serveRpc(
             defer allocator.free(resp_body);
 
             if (action == 0) {
-                if (options.log) |l| {
-                    l.debug("BIND: negotiated {s}", .{
-                        if (negotiation.ndr64_ctx != rpc.invalid_ctx) "NDR64" else "NDR32",
-                    });
+                if (options.on_event) |cb| {
+                    cb(options.event_context, .{ .bind_negotiated = negotiation.ndr64_ctx != rpc.invalid_ctx });
                 }
             }
 
@@ -144,7 +160,7 @@ pub fn serveRpc(
             const dispatch = try rpc.dispatchKmsRequest(allocator, request_body, &negotiation, options.cfg, rng, now_unix);
             switch (dispatch.kind) {
                 .fault => |nca| {
-                    if (options.log) |l| l.warn("RPC fault (NCA 0x{X:0>8})", .{nca});
+                    if (options.on_event) |cb| cb(options.event_context, .{ .fault = nca });
                     const fault_body = rpc.buildFault(nca);
                     // The C reference writes the server's global CallId (2)
                     // into FAULT headers, not the request's CallId.
@@ -159,16 +175,17 @@ pub fn serveRpc(
                 },
                 .response => |resp_body| {
                     defer allocator.free(resp_body);
-                    if (options.log) |l| {
+                    if (options.on_event) |cb| {
                         if (dispatch.response_size < 0) {
-                            const hr: u32 = @bitCast(dispatch.response_size);
-                            if (dispatch.major_version != 0) {
-                                l.warn("KMS v{d} request rejected (HRESULT 0x{X:0>8})", .{ dispatch.major_version, hr });
-                            } else {
-                                l.warn("invalid KMS request rejected (HRESULT 0x{X:0>8})", .{hr});
-                            }
+                            cb(options.event_context, .{ .request_rejected = .{
+                                .major = dispatch.major_version,
+                                .hr = @bitCast(dispatch.response_size),
+                            } });
                         } else {
-                            l.debug("KMS v{d} request → {d}-byte response", .{ dispatch.major_version, dispatch.response_size });
+                            cb(options.event_context, .{ .response = .{
+                                .major = dispatch.major_version,
+                                .size = @intCast(dispatch.response_size),
+                            } });
                         }
                     }
                     // RESPONSE echoes the request's packet flags (incl. MULTIPLEX).
