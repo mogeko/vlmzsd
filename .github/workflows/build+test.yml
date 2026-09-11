@@ -12,8 +12,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+      - name: Set up Homebrew
+        uses: homebrew/actions/setup-homebrew@master
+      - name: Fetch minimum Zig version
+        id: zig-version
+        run: |
+          ZIG_VER="$(sed -n 's/.*minimum_zig_version = "\([0-9]*\.[0-9]*\)\.[0-9]*".*/\1/p' build.zig.zon)"
+          echo "Minimum Zig version: $ZIG_VER"
+          echo "version=$ZIG_VER" >> "$GITHUB_OUTPUT"
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
+        run: brew install zig@${{ steps.zig-version.outputs.version }}
       - run: zig build vlmzsd vlmzs --summary all
       - run: zig build kmdconv --summary all
       - run: zig build test --summary all
