@@ -345,7 +345,7 @@ fn writeTimestamp(w: *std.Io.Writer, io: Io) void {
     var buf: [20]u8 = undefined;
     const ts = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         @as(u32, yad.year),
-        @as(u32, @intFromEnum(mad.month)) + 1,
+        @as(u32, @intFromEnum(mad.month)),
         @as(u32, mad.day_index) + 1,
         @as(u32, @intCast(day_secs / 3600)),
         @as(u32, @intCast((day_secs % 3600) / 60)),
