@@ -13,17 +13,25 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Set up Homebrew
-        uses: homebrew/actions/setup-homebrew@master
+        uses: homebrew/actions/setup-homebrew@main
       - name: Fetch minimum Zig version
         id: zig-version
         run: |
           ZIG_VER="$(sed -n 's/.*minimum_zig_version = "\([0-9]*\.[0-9]*\)\.[0-9]*".*/\1/p' build.zig.zon)"
           echo "Minimum Zig version: $ZIG_VER"
           echo "version=$ZIG_VER" >> "$GITHUB_OUTPUT"
+      - name: Cache Homebrew (Linuxbrew)
+        id: homebrew-cache
+        uses: actions/cache@v6
+        with:
+          path: /home/linuxbrew/.linuxbrew
+          key: ${{ runner.os }}-${{ runner.arch }}-homebrew-zig-${{ steps.zig-version.outputs.version }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-homebrew-zig-
       - name: Set up Zig
-        run: brew install zig@${{ steps.zig-version.outputs.version }}
-      - run: zig build vlmzsd vlmzs --summary all
-      - run: zig build kmdconv --summary all
+        if: steps.homebrew-cache.outputs.cache-hit != 'true'
+        run: brew install --yes zig@${{ steps.zig-version.outputs.version }}
+      - run: zig build vlmzsd vlmzs kmdconv --summary all
       - run: zig build test --summary all
       - run: ./zig-out/bin/vlmzsd --version
       - run: ./zig-out/bin/vlmzs --version
