@@ -14,5 +14,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
-      - run: zig build --summary all
+      - run: zig build vlmzsd vlmzs --summary all
+      - run: zig build kmdconv --summary all
       - run: zig build test --summary all
+      - run: ./zig-out/bin/vlmzsd --version
+      - run: ./zig-out/bin/vlmzs --version
