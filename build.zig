@@ -160,7 +160,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/cli_helper.zig"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true, // std.c.getenv
         }),
     });
 

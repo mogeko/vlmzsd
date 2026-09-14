@@ -602,7 +602,7 @@ pub fn main(init: std.process.Init) !void {
         kmd_owned = true;
         loaded_from = path;
     } else {
-        fhs_loaded = cli_helper.loadFhsKmd(init.io, init.gpa) catch |e| {
+        fhs_loaded = cli_helper.loadFhsKmd(init.io, init.gpa, init.minimal.environ) catch |e| {
             log.err("failed to read FHS data file: {s}", .{@errorName(e)});
             std.process.exit(1);
         };
