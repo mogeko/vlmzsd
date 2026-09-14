@@ -89,6 +89,7 @@ fn subWord(w: u32) u32 {
 }
 
 fn expandKey(comptime nk: usize, key: []const u8, is_v6: bool) [16 * (nk + 7)]u8 {
+    std.debug.assert(key.len == nk * 4); // 128-bit (nk=4) or 160-bit (nk=5) key
     const nr = nk + 6;
     const words = 4 * (nr + 1);
 

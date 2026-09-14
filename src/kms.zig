@@ -443,6 +443,7 @@ fn itoc(buf: []u8, value: u32, digits: u8) []u8 {
 /// Pick a random host build whose NDR64 capability matches `use_ndr64`
 /// (mirrors the C `getRandomServerType`).
 fn getRandomServerType(data: *const kmsdata.KmsData, rng: std.Random, use_ndr64: bool) u32 {
+    std.debug.assert(data.host_builds.len > 0); // otherwise the loop never terminates
     while (true) {
         const idx = rng.uintLessThan(usize, data.host_builds.len);
         const is_ndr64 = (data.host_builds[idx].flags & use_ndr64_flag) != 0;
@@ -468,13 +469,19 @@ pub fn generateRandomPid(
     use_ndr64: bool,
     now_unix: i64,
 ) []u8 {
+    std.debug.assert(index < data.csvlk.len);
+    std.debug.assert(out.len >= pid_buffer_size);
+
     const resolved_build: i32 = if (host_build == 0)
         data.host_builds[getRandomServerType(data, rng, use_ndr64)].build_number
     else
         host_build;
 
     const csvlk = data.csvlk[index];
+    std.debug.assert(csvlk.max_key_id > csvlk.min_key_id); // avoid uintLessThan by zero
     const key_id = csvlk.min_key_id + rng.uintLessThan(u32, csvlk.max_key_id - csvlk.min_key_id);
+    std.debug.assert(key_id >= csvlk.min_key_id);
+    std.debug.assert(key_id < csvlk.max_key_id);
 
     const resolved_lang: u16 = if (lang < 1)
         lcid_list[rng.uintLessThan(usize, lcid_list.len)]
@@ -560,7 +567,10 @@ pub fn createResponseBase(
     rng: std.Random,
     now_unix: i64,
 ) i32 {
+    std.debug.assert(cfg.data.csvlk.len > 0);
+
     const required_clients: u32 = if (request.n_policy < 1) 1 else request.n_policy << 1;
+    std.debug.assert(required_clients >= 1);
 
     const kms_items = cfg.data.kms();
     const index_opt = getProductIndex(&request.kms_id, kms_items);

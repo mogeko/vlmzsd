@@ -380,6 +380,8 @@ pub fn dispatchKmsRequest(
     len += pad;
 
     const total = len + 8;
+    std.debug.assert(total % 4 == 0); // NDR body is 4-byte aligned
+    std.debug.assert(return_code_off + 4 <= total);
     const body = try allocator.alloc(u8, total);
     @memset(body, 0);
 
@@ -390,6 +392,7 @@ pub fn dispatchKmsRequest(
         writeLe(u64, body, 8, data_len); // DataLength
         writeLe(u64, body, 16, if (response_size < 0) 0 else 0x00020000); // DataSizeMax
         if (response_size >= 0) {
+            std.debug.assert(response64_data_offset + @as(usize, @intCast(response_size)) <= total);
             writeLe(u64, body, 24, data_len); // DataSizeIs
             @memcpy(body[response64_data_offset..][0..@intCast(response_size)], kms_response_buf[0..@intCast(response_size)]);
         }
@@ -398,6 +401,7 @@ pub fn dispatchKmsRequest(
         writeLe(u32, body, 8, data_len); // DataLength
         writeLe(u32, body, 12, if (response_size < 0) 0 else 0x00020000); // DataSizeMax
         if (response_size >= 0) {
+            std.debug.assert(response32_data_offset + @as(usize, @intCast(response_size)) <= total);
             writeLe(u32, body, 16, data_len); // DataSizeIs
             @memcpy(body[response32_data_offset..][0..@intCast(response_size)], kms_response_buf[0..@intCast(response_size)]);
         }
