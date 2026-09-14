@@ -1007,7 +1007,7 @@ test "generateRandomPid format" {
     var td = try loadTestData(alloc);
     defer td.deinit(alloc);
 
-    var prng = std.Random.DefaultPrng.init(0xDEAD_BEEF);
+    var prng: std.Random.DefaultPrng = .init(0xDEAD_BEEF);
     var buf: [pid_buffer_size]u8 = undefined;
     // CSVLC 0 (Windows), fixed LCID 1033 and build 17763.
     const pid = generateRandomPid(&td.data, 0, &buf, 1033, 17763, prng.random(), true, 1_700_000_000);
@@ -1040,7 +1040,7 @@ test "generateRandomPid random lang/build" {
     var td = try loadTestData(alloc);
     defer td.deinit(alloc);
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     var buf: [pid_buffer_size]u8 = undefined;
     // lang < 1 → random LCID; host_build 0 → random build.
     const pid = generateRandomPid(&td.data, 0, &buf, 0, 0, prng.random(), true, 1_700_000_000);
@@ -1087,7 +1087,7 @@ test "client list insert and lookup" {
     const storage = try alloc.alloc(ClientList, td.data.apps().len);
     defer alloc.free(storage);
     var lists: ClientLists = .{ .lists = storage };
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     initClientLists(&lists, &td.data, true, prng.random()); // start empty
 
     var cfg = ServerConfig{ .data = &td.data, .maintain_clients = true, .client_lists = &lists };
@@ -1127,7 +1127,7 @@ test "client list ring eviction" {
     const storage = try alloc.alloc(ClientList, td.data.apps().len);
     defer alloc.free(storage);
     var lists: ClientLists = .{ .lists = storage };
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     initClientLists(&lists, &td.data, true, prng.random());
 
     var cfg = ServerConfig{ .data = &td.data, .maintain_clients = true, .client_lists = &lists };
@@ -1197,7 +1197,7 @@ test "required_clients over 2000 rejected" {
     var base = makeBase(&td.data, 6 << 16);
     base.n_policy = 1001; // required_clients = 2002 > 2000 — docs/migration.md §5
 
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     var resp: Response = undefined;
     try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
 }
@@ -1211,7 +1211,7 @@ test "client time off by more than 4 hours rejected" {
     var base = makeBase(&td.data, 6 << 16);
     base.client_time = u64ToFileTime(unixTimeToFileTime(1_700_000_000 + 5 * 3600)); // +5 h — docs/migration.md §5
 
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     var resp: Response = undefined;
     try std.testing.expectEqual(hresult.client_time_mismatch, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
 }
@@ -1225,7 +1225,7 @@ test "whitelist rejects unknown product" {
     var base = makeBase(&td.data, 6 << 16);
     base.kms_id = [_]u8{0xFF} ** 16; // not in the .kmd — docs/migration.md §5
 
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     var resp: Response = undefined;
     try std.testing.expectEqual(hresult.product_rejected, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
 }
@@ -1238,7 +1238,7 @@ test "client list full rejected" {
     const storage = try alloc.alloc(ClientList, td.data.apps().len);
     defer alloc.free(storage);
     var lists: ClientLists = .{ .lists = storage };
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     initClientLists(&lists, &td.data, true, prng.random()); // start empty
 
     // Simulate a full list: count at the cap, empty slots still present.
@@ -1264,7 +1264,7 @@ test "overlong ePID rejected" {
     var cfg = ServerConfig{ .data = &td.data, .epid_overrides = &overrides };
     var base = makeBase(&td.data, 6 << 16);
 
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     var resp: Response = undefined;
     try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
 }
@@ -1275,7 +1275,7 @@ test "ePID date span zero or negative" {
     var data = try makeVariantData(alloc, now + 100); // release_date in the future — docs/migration.md §5
     defer data.deinit(alloc);
 
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     var out: [pid_buffer_size]u8 = undefined;
     // span <= 0 → take min_time directly, never `%0` (the C UB fix).
     const pid = generateRandomPid(&data, 0, &out, 0, 0, prng.random(), true, now);
@@ -1293,7 +1293,7 @@ test "v4 request/response round-trip" {
     var request: RequestV4 = undefined;
     createRequestV4(&request, &base);
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     var out: [max_response_size]u8 align(4) = undefined;
     const resp_len: usize = @intCast(createResponseV4(&request, &out, &cfg, prng.random(), 1_700_000_000));
     try std.testing.expect(resp_len > 0);
@@ -1313,7 +1313,7 @@ test "v5 request/response round-trip" {
     var cfg = ServerConfig{ .data = &td.data };
     const base = makeBase(&td.data, 5 << 16);
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     const rng = prng.random();
 
     var request_sent: RequestV6 = undefined;
@@ -1339,7 +1339,7 @@ test "v6 request/response round-trip" {
     var cfg = ServerConfig{ .data = &td.data };
     const base = makeBase(&td.data, 6 << 16);
 
-    var prng = std.Random.DefaultPrng.init(0x9e37_79b9);
+    var prng: std.Random.DefaultPrng = .init(0x9e37_79b9);
     const rng = prng.random();
 
     var request_sent: RequestV6 = undefined;

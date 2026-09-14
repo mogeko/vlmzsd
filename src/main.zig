@@ -392,7 +392,7 @@ pub fn main(init: std.process.Init) !void {
     // Collect the raw arguments (skip argv[0]).
     var args_list: std.ArrayList([]const u8) = .empty;
     defer args_list.deinit(init.gpa);
-    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+    var args_iter: std.process.Args.Iterator = .init(init.minimal.args);
     _ = args_iter.skip();
     while (args_iter.next()) |arg| {
         try args_list.append(init.gpa, arg);
@@ -425,7 +425,7 @@ pub fn main(init: std.process.Init) !void {
 
     var out_buf: [4096]u8 = undefined;
     var err_buf: [4096]u8 = undefined;
-    var log = cli_helper.Logger.init(init.io, &out_buf, &err_buf);
+    var log: cli_helper.Logger = .init(init.io, &out_buf, &err_buf);
 
     var opts = resolveOptions(init.gpa, init.environ_map, &res) catch |e| {
         log.err("invalid configuration: {s}", .{@errorName(e)});
@@ -480,7 +480,7 @@ pub fn main(init: std.process.Init) !void {
         log.debug("using embedded KMS data", .{});
     }
 
-    var prng = std.Random.DefaultPrng.init(cli_helper.makeSeed(init.io));
+    var prng: std.Random.DefaultPrng = .init(cli_helper.makeSeed(init.io));
     const rng = prng.random();
 
     const epid_overrides = try buildEpidOverrides(init.gpa, &data, &opts, rng, cli_helper.nowUnix(init.io), &log);
@@ -522,7 +522,7 @@ pub fn main(init: std.process.Init) !void {
     // Create the listening sockets. ip-protection level 1 listens only on the
     // host's private addresses; otherwise `--listen` (default ::, a dual-stack
     // socket covering both IPv4 and IPv6).
-    var servers = std.ArrayList(Io.net.Server).empty;
+    var servers: std.ArrayList(Io.net.Server) = .empty;
     defer {
         for (servers.items) |*s| s.deinit(init.io);
         servers.deinit(init.gpa);

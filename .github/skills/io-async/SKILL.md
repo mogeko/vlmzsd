@@ -66,7 +66,7 @@ const result = future.await(io);
 
 // Bounded batch: submit N tasks, wait for all. This is the target shape for the
 // server accept loop replacing `serveClientThread`.
-var group = Io.Group.init;
+var group: Io.Group = .init;
 for (clients) |c| Io.Group.concurrent(&group, io, handleClient, .{c});
 try group.await(io);
 ```

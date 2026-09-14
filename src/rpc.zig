@@ -728,7 +728,7 @@ test "dispatch v6 request end-to-end" {
     var cfg = kms.ServerConfig{ .data = &td.data };
     const base = makeBase(&td.data);
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     const rng = prng.random();
 
     // Client builds the (encrypted) KMS request.
@@ -769,7 +769,7 @@ test "dispatch unsupported KMS version returns HRESULT" {
     var base = makeBase(&td.data);
     base.version = 7 << 16; // unsupported major version
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     const rng = prng.random();
 
     var request_v6: kms.RequestV6 = undefined;
@@ -818,7 +818,7 @@ test "rejected response wire bytes (NDR64)" {
     var base = makeBase(&td.data);
     base.version = 7 << 16; // unsupported major version
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     const rng = prng.random();
     var request_v6: kms.RequestV6 = undefined;
     kms.createRequestV6(&request_v6, &base, rng);
@@ -852,7 +852,7 @@ test "dispatch non-zero minor version returns HRESULT" {
     var base = makeBase(&td.data);
     base.version = (6 << 16) | 1; // non-zero minor — docs/migration.md §5
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     const rng = prng.random();
 
     var request_v6: kms.RequestV6 = undefined;
@@ -882,7 +882,7 @@ test "too-short request disconnects" {
 
     var cfg = kms.ServerConfig{ .data = &td.data };
     var negotiation = BindNegotiation{ .ndr_ctx = 0, .ndr64_ctx = 1 };
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
 
     // Body shorter than request32_fixed_size (16) → disconnect — docs/migration.md §5.
     try std.testing.expectError(error.InvalidRequest, dispatchKmsRequest(
@@ -902,7 +902,7 @@ test "unknown context returns FAULT" {
 
     var cfg = kms.ServerConfig{ .data = &td.data };
     var negotiation = BindNegotiation{ .ndr_ctx = 0, .ndr64_ctx = 1 };
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
 
     // context_id matches neither negotiated id — docs/migration.md §5.
     var body: [16]u8 = [_]u8{0} ** 16;

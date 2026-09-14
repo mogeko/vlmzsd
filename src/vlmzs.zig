@@ -505,7 +505,7 @@ fn sendRequestTask(
     out: *Output,
     data: *const kmsdata.KmsData,
 ) void {
-    var prng = std.Random.DefaultPrng.init(seed);
+    var prng: std.Random.DefaultPrng = .init(seed);
     sendRequest(gpa, io, opts, base, prng.random(), out, data) catch |e| {
         out.eprint("request failed: {s}\n", .{@errorName(e)});
     };
@@ -557,7 +557,7 @@ pub fn main(init: std.process.Init) !void {
     // Collect the raw arguments (skip argv[0]).
     var args_list: std.ArrayList([]const u8) = .empty;
     defer args_list.deinit(init.gpa);
-    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+    var args_iter: std.process.Args.Iterator = .init(init.minimal.args);
     _ = args_iter.skip();
     while (args_iter.next()) |arg| {
         try args_list.append(init.gpa, arg);
@@ -590,7 +590,7 @@ pub fn main(init: std.process.Init) !void {
 
     var out_buf: [4096]u8 = undefined;
     var err_buf: [4096]u8 = undefined;
-    var out = Output.init(init.io, &out_buf, &err_buf);
+    var out: Output = .init(init.io, &out_buf, &err_buf);
 
     var opts = resolveOptions(&res) catch |e| {
         out.eprint("error: {s}\n", .{@errorName(e)});
@@ -650,17 +650,17 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    var prng = std.Random.DefaultPrng.init(cli_helper.makeSeed(init.io));
+    var prng: std.Random.DefaultPrng = .init(cli_helper.makeSeed(init.io));
 
     if (opts.reconnect_per_request) {
         // Each request gets its own connection; dispatch them in parallel onto
         // the Io.Threaded pool. Each request builds its base and derives its own
         // PRNG before submission, so concurrent tasks never share PRNG state.
-        var group = Io.Group.init;
+        var group: Io.Group = .init;
         var i: usize = 0;
         while (i < opts.count) : (i += 1) {
             const seed = prng.random().int(u64);
-            var req_prng = std.Random.DefaultPrng.init(seed);
+            var req_prng: std.Random.DefaultPrng = .init(seed);
             const base = buildRequestBase(&opts, &data, sku_index, req_prng.random(), init.io);
             group.concurrent(init.io, sendRequestTask, .{
                 init.gpa, init.io, &opts, base, seed, &out, &data,
@@ -687,10 +687,10 @@ test "buildRequestBase binding expiration" {
     var data = try kmsdata.parse(alloc, @embedFile("vlmcsd.kmd"));
     defer data.deinit(alloc);
 
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     const rng = prng.random();
 
-    var threaded = std.Io.Threaded.init(alloc, .{});
+    var threaded: std.Io.Threaded = .init(alloc, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
