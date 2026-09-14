@@ -58,6 +58,7 @@ pub fn main() !void {
 }
 ```
 
+
 ## Getting started
 
 Each module below gets one sentence of purpose plus its entry points. Full
@@ -73,6 +74,55 @@ editor's autocomplete rather than expecting this page to enumerate the API.
 - `rpc` — hand-written DCE/RPC framing. Start from `dispatchKmsRequest`
   (server side) or `wrapKmsRequest` (client side).
 
+## How the modules fit together
+
+```mermaid
+flowchart LR
+    A[".kmd file"] -->|"kmsdata.parse"| B["KmsData"]
+    B -->|"ServerConfig.data"| C["kms.ServerConfig"]
+    D["RPC request bytes"] -->|"rpc.dispatchKmsRequest"| E["kms.createResponseV4 / V6"]
+    C --> E
+    E -->|"crypto AES / CMAC"| F["response bytes"]
+```
+
+`kmsdata` supplies the data, `rpc` handles DCE/RPC framing, `kms` implements
+the protocol, and `crypto` is the primitive layer underneath. The dependency
+chain is one-way: `rpc` → `kms` → `kmsdata` / `crypto`.
+
+## A minimal server
+
+The core server-side sequence, from network bytes to a KMS response.
+`bind_request` and `kms_request` are raw bytes received from a socket;
+`rng` and `now_unix` are supplied by the caller.
+
+```zig
+// 1. Load data and build the config — only `data` is required.
+var data = try vlmzsd.kmsdata.parse(allocator, raw);
+defer data.deinit(allocator);
+const cfg = kms.ServerConfig{ .data = &data };
+
+// 2. BIND negotiation records the NDR32/NDR64 context ids.
+var negotiation = rpc.BindNegotiation{};
+const bind_body = try rpc.buildBindResponse(allocator, bind_request, assoc_group, .{}, &negotiation);
+defer allocator.free(bind_body);
+
+// 3. Dispatch the KMS request. `response_size < 0` is an HRESULT rejection.
+const result = try rpc.dispatchKmsRequest(allocator, kms_request, &negotiation, &cfg, rng, now_unix);
+switch (result.kind) {
+    .fault => |nca| std.debug.print("NCA fault: 0x{X:0>8}\n", .{nca}),
+    .response => |body| {
+        defer allocator.free(body);
+        if (result.response_size < 0) {
+            std.debug.print("rejected: HRESULT 0x{X:0>8}\n", .{@as(u32, @bitCast(result.response_size))});
+        }
+        // else: body[0..result.response_size] is the KMS response payload
+    },
+}
+```
+
+The client side is symmetric: `rpc.buildBindRequest` → `rpc.wrapKmsRequest`,
+send, then `rpc.parseKmsResponse` → `kms.decryptResponseV6`.
+
 ## Contract and pitfalls
 
 Rules you must know before calling into the library — they are not visible
@@ -87,6 +137,11 @@ from type signatures alone:
   machines.
 - **No global state.** Anything needing memory or randomness takes an
   allocator / RNG parameter explicitly.
+- **HRESULT, not errors.** `kms.createResponseV4` / `createResponseV6` return
+  an `i32` HRESULT — `kms.hresult.ok == 0` on success, a negative code (e.g.
+  `0xC004F042`) on rejection. `rpc.dispatchKmsRequest` reports the same through
+  `DispatchResult.response_size`. A rejected activation is a normal protocol
+  answer, not a Zig error — always check the return value.
 - **Freestanding-friendly.** The four public modules use neither `std.Io` nor
   libc, so they link into freestanding targets too.
 
