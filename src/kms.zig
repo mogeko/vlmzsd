@@ -111,6 +111,11 @@ pub const workstation_name_buffer = 64;
 pub const max_response_size = 384;
 pub const max_request_size = @sizeOf(RequestV6);
 pub const max_clients = 671;
+/// `required_clients` above this value are rejected (`n_policy > 1000`) —
+/// docs/migration.md §5.
+pub const max_required_clients = 2000;
+/// Reject requests whose client time is off by more than 4 hours — §5.
+pub const client_time_tolerance_seconds = 4 * 60 * 60;
 
 /// Fixed (max-ePID) sizes of the response structs.
 pub const request_size: usize = @sizeOf(Request);
@@ -162,6 +167,10 @@ pub const hresult = struct {
     pub const product_rejected: i32 = @bitCast(@as(u32, 0xC004F042));
     pub const too_many_clients: i32 = @bitCast(@as(u32, 0xC004D104));
 };
+
+/// `ServerConfig.whitelisting_level` bit masks.
+pub const whitelist_app_guid: u32 = 1; // reject when the app GUID does not match
+pub const whitelist_retail: u32 = 2; // reject retail/preview products
 
 // ---------------------------------------------------------------------------
 // Layout verification (byte-for-byte parity with the C packed structs)
@@ -551,29 +560,28 @@ pub fn createResponseBase(
     rng: std.Random,
     now_unix: i64,
 ) i32 {
-    const min_clients = request.n_policy;
-    const required_clients: u32 = if (min_clients < 1) 1 else min_clients << 1;
+    const required_clients: u32 = if (request.n_policy < 1) 1 else request.n_policy << 1;
 
     const kms_items = cfg.data.kms();
     const index_opt = getProductIndex(&request.kms_id, kms_items);
 
     // Strict-mode checks (before touching the response).
-    if (required_clients > 2000) return hresult.invalid_arg;
+    if (required_clients > max_required_clients) return hresult.invalid_arg;
 
     if (cfg.check_client_time) {
         const request_time = fileTimeToUnixTime(fileTimeToU64(request.client_time));
         const diff = request_time - now_unix;
-        if (diff > 4 * 60 * 60 or diff < -4 * 60 * 60) return hresult.client_time_mismatch;
+        if (diff > client_time_tolerance_seconds or diff < -client_time_tolerance_seconds) return hresult.client_time_mismatch;
     }
 
-    if (cfg.whitelisting_level & 2 != 0) {
+    if (cfg.whitelisting_level & whitelist_retail != 0) {
         if (index_opt) |i| {
             const item = kms_items[i];
             if (item.is_retail != 0 or item.is_preview != 0) return hresult.product_rejected;
         }
     }
 
-    if (cfg.whitelisting_level & 1 != 0) {
+    if (cfg.whitelisting_level & whitelist_app_guid != 0) {
         if (index_opt) |i| {
             const app_guid = cfg.data.apps()[kms_items[i].app_index].guid;
             if (!guidEqual(&app_guid, &request.app_id)) return hresult.product_rejected;
@@ -588,10 +596,10 @@ pub fn createResponseBase(
     // minimum active clients (mirrors `CreateResponseBaseCallback`).
     if (cfg.maintain_clients) {
         const app_index: usize = if (index_opt) |i| kms_items[i].app_index else 0;
-        if (cfg.client_lists) |cl| {
-            while (!cl.mutex.tryLock()) std.atomic.spinLoopHint();
-            defer cl.mutex.unlock();
-            const list = &cl.lists[app_index];
+        if (cfg.client_lists) |client_lists| {
+            while (!client_lists.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer client_lists.mutex.unlock();
+            const list = &client_lists.lists[app_index];
             const required: usize = required_clients;
             // Cap the logical list size at MAX_CLIENTS so the fixed-size GUID
             // ring buffer is never indexed out of bounds (the C reference can
