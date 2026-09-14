@@ -69,7 +69,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/vlmzs.zig"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true,
             .imports = &.{
                 .{ .name = "vlmzsd", .module = mod },
             },
@@ -91,7 +90,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/kmdconv.zig"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true,
             .imports = &.{
                 .{ .name = "vlmzsd", .module = mod },
             },
