@@ -461,7 +461,7 @@ pub fn getPrivateIPAddresses(allocator: Allocator) ![]Io.net.IpAddress {
     if (getifaddrs(&ifap) != 0) return error.GetIfAddrsFailed;
     defer if (ifap) |ifa| freeifaddrs(ifa);
 
-    var list = std.ArrayList(Io.net.IpAddress).empty;
+    var list: std.ArrayList(Io.net.IpAddress) = .empty;
     errdefer list.deinit(allocator);
 
     var cur = ifap;
@@ -614,7 +614,7 @@ test "serveRpc end-to-end (bind + v6 request)" {
     var cfg = kms.ServerConfig{ .data = &td.data };
     const base = makeBase(&td.data);
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     const rng = prng.random();
 
     // Client-side packets: BIND request followed by a KMS request.

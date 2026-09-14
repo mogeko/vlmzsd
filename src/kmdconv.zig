@@ -11,6 +11,8 @@ const kmsdata = vlmzsd.kmsdata;
 
 const build_options = @import("build_options");
 const version = build_options.version;
+const git_hash = build_options.git_hash;
+const build_date = build_options.build_date;
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -67,7 +69,7 @@ fn readStdin(io: Io, gpa: Allocator) ![]u8 {
 pub fn main(init: std.process.Init) !void {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(init.gpa);
-    var it = std.process.Args.Iterator.init(init.minimal.args);
+    var it: std.process.Args.Iterator = .init(init.minimal.args);
     _ = it.skip();
     while (it.next()) |a| try args.append(init.gpa, a);
 
@@ -87,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "-V") or std.mem.eql(u8, a, "--version")) {
             var vbuf: [64]u8 = undefined;
             var vw = std.Io.File.writer(std.Io.File.stdout(), init.io, &vbuf);
-            try vw.interface.print("kmdconv {s}\n", .{version});
+            try vw.interface.print("kmdconv {s} ({s} {s})\n", .{ version, git_hash, build_date });
             try vw.interface.flush();
             return;
         } else if (std.mem.eql(u8, a, "-r") or std.mem.eql(u8, a, "--reverse")) {
@@ -135,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
     var output_owned = false;
     defer if (output_owned) init.gpa.free(@constCast(output_data));
     if (reverse) {
-        var arena = std.heap.ArenaAllocator.init(init.gpa);
+        var arena: std.heap.ArenaAllocator = .init(init.gpa);
         defer arena.deinit();
         const data = kmsdata.parse(arena.allocator(), input_data) catch |e| {
             errOut(init.io, "kmdconv: error: invalid .kmd data: {s} (is this a JSON file? remove -r to convert it to .kmd)\n", .{@errorName(e)});
@@ -147,7 +149,7 @@ pub fn main(init: std.process.Init) !void {
         };
         output_owned = true;
     } else {
-        var arena = std.heap.ArenaAllocator.init(init.gpa);
+        var arena: std.heap.ArenaAllocator = .init(init.gpa);
         defer arena.deinit();
         const data = jsonToKmsData(arena.allocator(), input_data) catch |e| {
             errOut(init.io, "kmdconv: error: invalid JSON input: {s} (is this a .kmd file? use -r to convert it to JSON)\n", .{@errorName(e)});

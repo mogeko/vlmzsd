@@ -111,6 +111,11 @@ pub const workstation_name_buffer = 64;
 pub const max_response_size = 384;
 pub const max_request_size = @sizeOf(RequestV6);
 pub const max_clients = 671;
+/// `required_clients` above this value are rejected (`n_policy > 1000`) —
+/// docs/migration.md §5.
+pub const max_required_clients = 2000;
+/// Reject requests whose client time is off by more than 4 hours — §5.
+pub const client_time_tolerance_seconds = 4 * 60 * 60;
 
 /// Fixed (max-ePID) sizes of the response structs.
 pub const request_size: usize = @sizeOf(Request);
@@ -162,6 +167,10 @@ pub const hresult = struct {
     pub const product_rejected: i32 = @bitCast(@as(u32, 0xC004F042));
     pub const too_many_clients: i32 = @bitCast(@as(u32, 0xC004D104));
 };
+
+/// `ServerConfig.whitelisting_level` bit masks.
+pub const whitelist_app_guid: u32 = 1; // reject when the app GUID does not match
+pub const whitelist_retail: u32 = 2; // reject retail/preview products
 
 // ---------------------------------------------------------------------------
 // Layout verification (byte-for-byte parity with the C packed structs)
@@ -434,6 +443,7 @@ fn itoc(buf: []u8, value: u32, digits: u8) []u8 {
 /// Pick a random host build whose NDR64 capability matches `use_ndr64`
 /// (mirrors the C `getRandomServerType`).
 fn getRandomServerType(data: *const kmsdata.KmsData, rng: std.Random, use_ndr64: bool) u32 {
+    std.debug.assert(data.host_builds.len > 0); // otherwise the loop never terminates
     while (true) {
         const idx = rng.uintLessThan(usize, data.host_builds.len);
         const is_ndr64 = (data.host_builds[idx].flags & use_ndr64_flag) != 0;
@@ -459,13 +469,19 @@ pub fn generateRandomPid(
     use_ndr64: bool,
     now_unix: i64,
 ) []u8 {
+    std.debug.assert(index < data.csvlk.len);
+    std.debug.assert(out.len >= pid_buffer_size);
+
     const resolved_build: i32 = if (host_build == 0)
         data.host_builds[getRandomServerType(data, rng, use_ndr64)].build_number
     else
         host_build;
 
     const csvlk = data.csvlk[index];
+    std.debug.assert(csvlk.max_key_id > csvlk.min_key_id); // avoid uintLessThan by zero
     const key_id = csvlk.min_key_id + rng.uintLessThan(u32, csvlk.max_key_id - csvlk.min_key_id);
+    std.debug.assert(key_id >= csvlk.min_key_id);
+    std.debug.assert(key_id < csvlk.max_key_id);
 
     const resolved_lang: u16 = if (lang < 1)
         lcid_list[rng.uintLessThan(usize, lcid_list.len)]
@@ -551,29 +567,31 @@ pub fn createResponseBase(
     rng: std.Random,
     now_unix: i64,
 ) i32 {
-    const min_clients = request.n_policy;
-    const required_clients: u32 = if (min_clients < 1) 1 else min_clients << 1;
+    std.debug.assert(cfg.data.csvlk.len > 0);
+
+    const required_clients: u32 = if (request.n_policy < 1) 1 else request.n_policy << 1;
+    std.debug.assert(required_clients >= 1);
 
     const kms_items = cfg.data.kms();
     const index_opt = getProductIndex(&request.kms_id, kms_items);
 
     // Strict-mode checks (before touching the response).
-    if (required_clients > 2000) return hresult.invalid_arg;
+    if (required_clients > max_required_clients) return hresult.invalid_arg;
 
     if (cfg.check_client_time) {
         const request_time = fileTimeToUnixTime(fileTimeToU64(request.client_time));
         const diff = request_time - now_unix;
-        if (diff > 4 * 60 * 60 or diff < -4 * 60 * 60) return hresult.client_time_mismatch;
+        if (diff > client_time_tolerance_seconds or diff < -client_time_tolerance_seconds) return hresult.client_time_mismatch;
     }
 
-    if (cfg.whitelisting_level & 2 != 0) {
+    if (cfg.whitelisting_level & whitelist_retail != 0) {
         if (index_opt) |i| {
             const item = kms_items[i];
             if (item.is_retail != 0 or item.is_preview != 0) return hresult.product_rejected;
         }
     }
 
-    if (cfg.whitelisting_level & 1 != 0) {
+    if (cfg.whitelisting_level & whitelist_app_guid != 0) {
         if (index_opt) |i| {
             const app_guid = cfg.data.apps()[kms_items[i].app_index].guid;
             if (!guidEqual(&app_guid, &request.app_id)) return hresult.product_rejected;
@@ -588,10 +606,10 @@ pub fn createResponseBase(
     // minimum active clients (mirrors `CreateResponseBaseCallback`).
     if (cfg.maintain_clients) {
         const app_index: usize = if (index_opt) |i| kms_items[i].app_index else 0;
-        if (cfg.client_lists) |cl| {
-            while (!cl.mutex.tryLock()) std.atomic.spinLoopHint();
-            defer cl.mutex.unlock();
-            const list = &cl.lists[app_index];
+        if (cfg.client_lists) |client_lists| {
+            while (!client_lists.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer client_lists.mutex.unlock();
+            const list = &client_lists.lists[app_index];
             const required: usize = required_clients;
             // Cap the logical list size at MAX_CLIENTS so the fixed-size GUID
             // ring buffer is never indexed out of bounds (the C reference can
@@ -1007,7 +1025,7 @@ test "generateRandomPid format" {
     var td = try loadTestData(alloc);
     defer td.deinit(alloc);
 
-    var prng = std.Random.DefaultPrng.init(0xDEAD_BEEF);
+    var prng: std.Random.DefaultPrng = .init(0xDEAD_BEEF);
     var buf: [pid_buffer_size]u8 = undefined;
     // CSVLC 0 (Windows), fixed LCID 1033 and build 17763.
     const pid = generateRandomPid(&td.data, 0, &buf, 1033, 17763, prng.random(), true, 1_700_000_000);
@@ -1040,7 +1058,7 @@ test "generateRandomPid random lang/build" {
     var td = try loadTestData(alloc);
     defer td.deinit(alloc);
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     var buf: [pid_buffer_size]u8 = undefined;
     // lang < 1 → random LCID; host_build 0 → random build.
     const pid = generateRandomPid(&td.data, 0, &buf, 0, 0, prng.random(), true, 1_700_000_000);
@@ -1087,7 +1105,7 @@ test "client list insert and lookup" {
     const storage = try alloc.alloc(ClientList, td.data.apps().len);
     defer alloc.free(storage);
     var lists: ClientLists = .{ .lists = storage };
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     initClientLists(&lists, &td.data, true, prng.random()); // start empty
 
     var cfg = ServerConfig{ .data = &td.data, .maintain_clients = true, .client_lists = &lists };
@@ -1127,7 +1145,7 @@ test "client list ring eviction" {
     const storage = try alloc.alloc(ClientList, td.data.apps().len);
     defer alloc.free(storage);
     var lists: ClientLists = .{ .lists = storage };
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     initClientLists(&lists, &td.data, true, prng.random());
 
     var cfg = ServerConfig{ .data = &td.data, .maintain_clients = true, .client_lists = &lists };
@@ -1197,7 +1215,7 @@ test "required_clients over 2000 rejected" {
     var base = makeBase(&td.data, 6 << 16);
     base.n_policy = 1001; // required_clients = 2002 > 2000 — docs/migration.md §5
 
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     var resp: Response = undefined;
     try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
 }
@@ -1211,7 +1229,7 @@ test "client time off by more than 4 hours rejected" {
     var base = makeBase(&td.data, 6 << 16);
     base.client_time = u64ToFileTime(unixTimeToFileTime(1_700_000_000 + 5 * 3600)); // +5 h — docs/migration.md §5
 
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     var resp: Response = undefined;
     try std.testing.expectEqual(hresult.client_time_mismatch, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
 }
@@ -1225,7 +1243,7 @@ test "whitelist rejects unknown product" {
     var base = makeBase(&td.data, 6 << 16);
     base.kms_id = [_]u8{0xFF} ** 16; // not in the .kmd — docs/migration.md §5
 
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     var resp: Response = undefined;
     try std.testing.expectEqual(hresult.product_rejected, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
 }
@@ -1238,7 +1256,7 @@ test "client list full rejected" {
     const storage = try alloc.alloc(ClientList, td.data.apps().len);
     defer alloc.free(storage);
     var lists: ClientLists = .{ .lists = storage };
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     initClientLists(&lists, &td.data, true, prng.random()); // start empty
 
     // Simulate a full list: count at the cap, empty slots still present.
@@ -1264,7 +1282,7 @@ test "overlong ePID rejected" {
     var cfg = ServerConfig{ .data = &td.data, .epid_overrides = &overrides };
     var base = makeBase(&td.data, 6 << 16);
 
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     var resp: Response = undefined;
     try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
 }
@@ -1275,7 +1293,7 @@ test "ePID date span zero or negative" {
     var data = try makeVariantData(alloc, now + 100); // release_date in the future — docs/migration.md §5
     defer data.deinit(alloc);
 
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
     var out: [pid_buffer_size]u8 = undefined;
     // span <= 0 → take min_time directly, never `%0` (the C UB fix).
     const pid = generateRandomPid(&data, 0, &out, 0, 0, prng.random(), true, now);
@@ -1293,7 +1311,7 @@ test "v4 request/response round-trip" {
     var request: RequestV4 = undefined;
     createRequestV4(&request, &base);
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     var out: [max_response_size]u8 align(4) = undefined;
     const resp_len: usize = @intCast(createResponseV4(&request, &out, &cfg, prng.random(), 1_700_000_000));
     try std.testing.expect(resp_len > 0);
@@ -1313,7 +1331,7 @@ test "v5 request/response round-trip" {
     var cfg = ServerConfig{ .data = &td.data };
     const base = makeBase(&td.data, 5 << 16);
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     const rng = prng.random();
 
     var request_sent: RequestV6 = undefined;
@@ -1339,7 +1357,7 @@ test "v6 request/response round-trip" {
     var cfg = ServerConfig{ .data = &td.data };
     const base = makeBase(&td.data, 6 << 16);
 
-    var prng = std.Random.DefaultPrng.init(0x9e37_79b9);
+    var prng: std.Random.DefaultPrng = .init(0x9e37_79b9);
     const rng = prng.random();
 
     var request_sent: RequestV6 = undefined;

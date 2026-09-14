@@ -180,6 +180,12 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
         };
     }
 
+    // Postconditions: every array length matches the header counts.
+    std.debug.assert(csvlk.len == csvlk_count);
+    std.debug.assert(items.len == total_items);
+    std.debug.assert(host_builds.len == hostbuild_count);
+    std.debug.assert(app_count + kms_count + sku_count == total_items);
+
     return .{
         .minor_ver = minor_ver,
         .major_ver = major_ver,

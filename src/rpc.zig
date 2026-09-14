@@ -380,6 +380,8 @@ pub fn dispatchKmsRequest(
     len += pad;
 
     const total = len + 8;
+    std.debug.assert(total % 4 == 0); // NDR body is 4-byte aligned
+    std.debug.assert(return_code_off + 4 <= total);
     const body = try allocator.alloc(u8, total);
     @memset(body, 0);
 
@@ -390,6 +392,7 @@ pub fn dispatchKmsRequest(
         writeLe(u64, body, 8, data_len); // DataLength
         writeLe(u64, body, 16, if (response_size < 0) 0 else 0x00020000); // DataSizeMax
         if (response_size >= 0) {
+            std.debug.assert(response64_data_offset + @as(usize, @intCast(response_size)) <= total);
             writeLe(u64, body, 24, data_len); // DataSizeIs
             @memcpy(body[response64_data_offset..][0..@intCast(response_size)], kms_response_buf[0..@intCast(response_size)]);
         }
@@ -398,6 +401,7 @@ pub fn dispatchKmsRequest(
         writeLe(u32, body, 8, data_len); // DataLength
         writeLe(u32, body, 12, if (response_size < 0) 0 else 0x00020000); // DataSizeMax
         if (response_size >= 0) {
+            std.debug.assert(response32_data_offset + @as(usize, @intCast(response_size)) <= total);
             writeLe(u32, body, 16, data_len); // DataSizeIs
             @memcpy(body[response32_data_offset..][0..@intCast(response_size)], kms_response_buf[0..@intCast(response_size)]);
         }
@@ -728,7 +732,7 @@ test "dispatch v6 request end-to-end" {
     var cfg = kms.ServerConfig{ .data = &td.data };
     const base = makeBase(&td.data);
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     const rng = prng.random();
 
     // Client builds the (encrypted) KMS request.
@@ -769,7 +773,7 @@ test "dispatch unsupported KMS version returns HRESULT" {
     var base = makeBase(&td.data);
     base.version = 7 << 16; // unsupported major version
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     const rng = prng.random();
 
     var request_v6: kms.RequestV6 = undefined;
@@ -818,7 +822,7 @@ test "rejected response wire bytes (NDR64)" {
     var base = makeBase(&td.data);
     base.version = 7 << 16; // unsupported major version
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     const rng = prng.random();
     var request_v6: kms.RequestV6 = undefined;
     kms.createRequestV6(&request_v6, &base, rng);
@@ -852,7 +856,7 @@ test "dispatch non-zero minor version returns HRESULT" {
     var base = makeBase(&td.data);
     base.version = (6 << 16) | 1; // non-zero minor — docs/migration.md §5
 
-    var prng = std.Random.DefaultPrng.init(0x1234_5678);
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     const rng = prng.random();
 
     var request_v6: kms.RequestV6 = undefined;
@@ -882,7 +886,7 @@ test "too-short request disconnects" {
 
     var cfg = kms.ServerConfig{ .data = &td.data };
     var negotiation = BindNegotiation{ .ndr_ctx = 0, .ndr64_ctx = 1 };
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
 
     // Body shorter than request32_fixed_size (16) → disconnect — docs/migration.md §5.
     try std.testing.expectError(error.InvalidRequest, dispatchKmsRequest(
@@ -902,7 +906,7 @@ test "unknown context returns FAULT" {
 
     var cfg = kms.ServerConfig{ .data = &td.data };
     var negotiation = BindNegotiation{ .ndr_ctx = 0, .ndr64_ctx = 1 };
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng: std.Random.DefaultPrng = .init(0);
 
     // context_id matches neither negotiated id — docs/migration.md §5.
     var body: [16]u8 = [_]u8{0} ** 16;

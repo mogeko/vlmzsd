@@ -12,7 +12,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
-      - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-      - run: zig build --summary all
+      - uses: mogeko/setup-zig@v1
+      - run: zig build vlmzsd vlmzs kmdconv --summary all
       - run: zig build test --summary all
+      - run: ./zig-out/bin/vlmzsd --version
+      - run: ./zig-out/bin/vlmzs --version

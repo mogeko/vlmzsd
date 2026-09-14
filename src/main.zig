@@ -18,7 +18,18 @@ const EnvironMap = std.process.Environ.Map;
 
 const build_options = @import("build_options");
 const version = build_options.version;
+const git_hash = build_options.git_hash;
+const build_date = build_options.build_date;
 const default_port: u16 = 1688;
+
+/// `--ip-protection` bit masks (docs/cli.md §5).
+const ip_protect_private_listen: u8 = 1; // listen only on private addresses
+const ip_protect_reject_public: u8 = 2; // reject clients with public IPs
+
+/// Maximum listen sockets (plus one shutdown-pipe slot in the poll set).
+const max_listen_sockets = 64;
+/// Longest decimal PID string (generous upper bound).
+const pid_str_buffer_size = 16;
 
 /// Embedded default `.kmd` data, unless built with `-Dno-embedded-data`
 /// (then `--data <file>` is required at runtime).
@@ -386,11 +397,153 @@ fn installSignalHandlers(log: *cli_helper.Logger) void {
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
 
+/// Create the listening sockets. ip-protection level 1 listens only on the
+/// host's private addresses; otherwise `--listen` (default ::, a dual-stack
+/// socket covering both IPv4 and IPv6).
+fn createListenSockets(
+    gpa: Allocator,
+    io: Io,
+    opts: *const ServerOptions,
+    log: *cli_helper.Logger,
+    servers: *std.ArrayList(Io.net.Server),
+) !void {
+    if (opts.ip_protection & ip_protect_private_listen != 0) {
+        const privates = try network.getPrivateIPAddresses(gpa);
+        defer gpa.free(privates);
+        if (privates.len == 0) log.warn("ip-protection level 1: no private IP addresses found", .{});
+        for (privates) |ip0| {
+            var ip = ip0;
+            ip.setPort(opts.port);
+            const s = Io.net.IpAddress.listen(&ip, io, .{ .reuse_address = true }) catch |e| {
+                log.warn("failed to listen on a private address: {s}", .{@errorName(e)});
+                continue;
+            };
+            try servers.append(gpa, s);
+        }
+    } else {
+        for (opts.listen) |addr| {
+            const s = network.listen(io, addr, opts.port) catch |e| {
+                // Fallback: a default dual-stack "::" listen fails when the
+                // host has no IPv6 stack; retry on IPv4 only.
+                if (std.mem.eql(u8, addr, "::") and e == error.AddressFamilyUnsupported) {
+                    const s4 = network.listen(io, "0.0.0.0", opts.port) catch |e4| {
+                        log.err("failed to listen on 0.0.0.0:{d}: {s}", .{ opts.port, @errorName(e4) });
+                        std.process.exit(1);
+                    };
+                    try servers.append(gpa, s4);
+                    continue;
+                }
+                log.err("failed to listen on {s}:{d}: {s}", .{ addr, opts.port, @errorName(e) });
+                std.process.exit(1);
+            };
+            try servers.append(gpa, s);
+        }
+    }
+
+    if (servers.items.len == 0) {
+        log.err("could not listen on any socket", .{});
+        std.process.exit(1);
+    }
+}
+
+/// State shared by the accept loop: everything it needs to poll the listen
+/// sockets and dispatch accepted connections onto the worker pool.
+const ServerContext = struct {
+    gpa: Allocator,
+    io: Io,
+    opts: *const ServerOptions,
+    log: *cli_helper.Logger,
+    cfg: *const kms.ServerConfig,
+    servers: []Io.net.Server,
+    sem: *Io.Semaphore,
+    group: *Io.Group,
+    port_str: []const u8,
+    prng: std.Random,
+
+    /// Poll the listen sockets and the shutdown pipe, accepting and
+    /// dispatching clients until SIGINT/SIGTERM arrives.
+    fn run(self: *ServerContext) !void {
+        const sem_active = self.opts.max_clients != 0;
+        var poll_fds: [max_listen_sockets + 1]std.posix.pollfd = undefined;
+        const pipe_index = self.servers.len; // the shutdown pipe's slot in `fds`
+
+        while (true) {
+            const fds = poll_fds[0 .. pipe_index + 1];
+            for (self.servers, 0..) |*s, i| {
+                fds[i] = .{ .fd = s.socket.handle, .events = std.posix.POLL.IN, .revents = 0 };
+            }
+            fds[pipe_index] = .{ .fd = shutdown_pipe[0], .events = std.posix.POLL.IN, .revents = 0 };
+
+            const nready = std.posix.poll(fds, -1) catch |e| {
+                self.log.err("poll failed: {s}", .{@errorName(e)});
+                return e;
+            };
+            if (nready == 0) continue;
+
+            // A byte on the shutdown pipe means SIGINT/SIGTERM arrived: return
+            // so the defers run their cleanup.
+            if (fds[pipe_index].revents & std.posix.POLL.IN != 0) {
+                self.log.info("shutdown signal received, exiting", .{});
+                return;
+            }
+
+            for (self.servers, 0..) |*s, i| {
+                if (fds[i].revents & std.posix.POLL.IN == 0) continue;
+                const stream = s.accept(self.io) catch |e| {
+                    self.log.warn("accept failed: {s}", .{@errorName(e)});
+                    continue;
+                };
+
+                // ip-protection level 2: reject clients with a public IP.
+                if (self.opts.ip_protection & ip_protect_reject_public != 0) {
+                    if (!network.isClientPrivate(stream.socket.handle)) {
+                        stream.close(self.io);
+                        self.log.debug("client with public IP address rejected", .{});
+                        continue;
+                    }
+                }
+
+                // Block until a worker slot is available (if the cap is enabled).
+                if (sem_active) self.sem.waitUncancelable(self.io);
+
+                const ctx = self.gpa.create(ClientContext) catch |e| {
+                    stream.close(self.io);
+                    if (sem_active) self.sem.post(self.io);
+                    self.log.warn("out of memory accepting client: {s}", .{@errorName(e)});
+                    continue;
+                };
+                ctx.* = .{
+                    .stream = stream,
+                    .io = self.io,
+                    .gpa = self.gpa,
+                    .cfg = self.cfg,
+                    .prng = std.Random.DefaultPrng.init(self.prng.int(u64)),
+                    .port_str = self.port_str,
+                    .use_ndr64 = self.opts.ndr64,
+                    .use_btfn = self.opts.btfn,
+                    .disconnect_per_request = self.opts.disconnect_per_request,
+                    .timeout_seconds = @intCast(self.opts.timeout_seconds),
+                    .sem = if (sem_active) self.sem else null,
+                    .log = self.log,
+                };
+
+                self.group.concurrent(self.io, serveClientThread, .{ctx}) catch |e| {
+                    ctx.stream.close(self.io);
+                    if (sem_active) self.sem.post(self.io);
+                    self.gpa.destroy(ctx);
+                    self.log.warn("failed to dispatch client task: {s}", .{@errorName(e)});
+                    continue;
+                };
+            }
+        }
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     // Collect the raw arguments (skip argv[0]).
     var args_list: std.ArrayList([]const u8) = .empty;
     defer args_list.deinit(init.gpa);
-    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+    var args_iter: std.process.Args.Iterator = .init(init.minimal.args);
     _ = args_iter.skip();
     while (args_iter.next()) |arg| {
         try args_list.append(init.gpa, arg);
@@ -416,14 +569,14 @@ pub fn main(init: std.process.Init) !void {
     if (res.hasFlag("version")) {
         var buf: [64]u8 = undefined;
         var fw = std.Io.File.writer(std.Io.File.stdout(), init.io, &buf);
-        try fw.interface.print("vlmzsd {s}\n", .{version});
+        try fw.interface.print("vlmzsd {s} ({s} {s})\n", .{ version, git_hash, build_date });
         try fw.interface.flush();
         return;
     }
 
     var out_buf: [4096]u8 = undefined;
     var err_buf: [4096]u8 = undefined;
-    var log = cli_helper.Logger.init(init.io, &out_buf, &err_buf);
+    var log: cli_helper.Logger = .init(init.io, &out_buf, &err_buf);
 
     var opts = resolveOptions(init.gpa, init.environ_map, &res) catch |e| {
         log.err("invalid configuration: {s}", .{@errorName(e)});
@@ -478,7 +631,7 @@ pub fn main(init: std.process.Init) !void {
         log.debug("using embedded KMS data", .{});
     }
 
-    var prng = std.Random.DefaultPrng.init(cli_helper.makeSeed(init.io));
+    var prng: std.Random.DefaultPrng = .init(cli_helper.makeSeed(init.io));
     const rng = prng.random();
 
     const epid_overrides = try buildEpidOverrides(init.gpa, &data, &opts, rng, cli_helper.nowUnix(init.io), &log);
@@ -520,56 +673,19 @@ pub fn main(init: std.process.Init) !void {
     // Create the listening sockets. ip-protection level 1 listens only on the
     // host's private addresses; otherwise `--listen` (default ::, a dual-stack
     // socket covering both IPv4 and IPv6).
-    var servers = std.ArrayList(Io.net.Server).empty;
+    var servers: std.ArrayList(Io.net.Server) = .empty;
     defer {
         for (servers.items) |*s| s.deinit(init.io);
         servers.deinit(init.gpa);
     }
-
-    if (opts.ip_protection & 1 != 0) {
-        const privates = try network.getPrivateIPAddresses(init.gpa);
-        defer init.gpa.free(privates);
-        if (privates.len == 0) log.warn("ip-protection level 1: no private IP addresses found", .{});
-        for (privates) |ip0| {
-            var ip = ip0;
-            ip.setPort(opts.port);
-            const s = Io.net.IpAddress.listen(&ip, init.io, .{ .reuse_address = true }) catch |e| {
-                log.warn("failed to listen on a private address: {s}", .{@errorName(e)});
-                continue;
-            };
-            try servers.append(init.gpa, s);
-        }
-    } else {
-        for (opts.listen) |addr| {
-            const s = network.listen(init.io, addr, opts.port) catch |e| {
-                // Fallback: a default dual-stack "::" listen fails when the
-                // host has no IPv6 stack; retry on IPv4 only.
-                if (std.mem.eql(u8, addr, "::") and e == error.AddressFamilyUnsupported) {
-                    const s4 = network.listen(init.io, "0.0.0.0", opts.port) catch |e4| {
-                        log.err("failed to listen on 0.0.0.0:{d}: {s}", .{ opts.port, @errorName(e4) });
-                        std.process.exit(1);
-                    };
-                    try servers.append(init.gpa, s4);
-                    continue;
-                }
-                log.err("failed to listen on {s}:{d}: {s}", .{ addr, opts.port, @errorName(e) });
-                std.process.exit(1);
-            };
-            try servers.append(init.gpa, s);
-        }
-    }
-
-    if (servers.items.len == 0) {
-        log.err("could not listen on any socket", .{});
-        std.process.exit(1);
-    }
+    try createListenSockets(init.gpa, init.io, &opts, &log, &servers);
 
     log.info("vlmzsd {s} listening on port {d}", .{ version, opts.port });
 
     // Write the PID file (best effort; mirrors the C `writePidFile`, which
     // only logs on failure).
     if (opts.pid_file) |path| {
-        var pid_buf: [16]u8 = undefined;
+        var pid_buf: [pid_str_buffer_size]u8 = undefined;
         const pid_str = try std.fmt.bufPrint(&pid_buf, "{d}", .{std.c.getpid()});
         std.Io.Dir.writeFile(std.Io.Dir.cwd(), init.io, .{
             .sub_path = path,
@@ -584,13 +700,14 @@ pub fn main(init: std.process.Init) !void {
 
     // Long-lived task group: accepted connections are dispatched onto the
     // `Io.Threaded` pool via `Group.concurrent`. Each task's resources are
-    // released when it returns, so the group never needs to be awaited.
-    var group = Io.Group.init;
+    // released when it returns; the group itself holds a token that is
+    // released by canceling on shutdown, which asks in-flight tasks to stop
+    // and waits for their cleanup to finish.
+    var group: Io.Group = .init;
+    defer group.cancel(init.io);
 
-    // 64 listen sockets + 1 shutdown-pipe read end.
-    var poll_fds: [65]std.posix.pollfd = undefined;
-    if (servers.items.len > 64) {
-        log.err("too many listen sockets (max 64)", .{});
+    if (servers.items.len > max_listen_sockets) {
+        log.err("too many listen sockets (max {d})", .{max_listen_sockets});
         std.process.exit(1);
     }
 
@@ -599,75 +716,18 @@ pub fn main(init: std.process.Init) !void {
         _ = std.c.close(shutdown_pipe[0]);
         _ = std.c.close(shutdown_pipe[1]);
     }
-    const pipe_index = servers.items.len; // the shutdown pipe's slot in `fds`
 
-    while (true) {
-        const fds = poll_fds[0 .. pipe_index + 1];
-        for (servers.items, 0..) |*s, i| {
-            fds[i] = .{ .fd = s.socket.handle, .events = std.posix.POLL.IN, .revents = 0 };
-        }
-        fds[pipe_index] = .{ .fd = shutdown_pipe[0], .events = std.posix.POLL.IN, .revents = 0 };
-
-        const nready = std.posix.poll(fds, -1) catch |e| {
-            log.err("poll failed: {s}", .{@errorName(e)});
-            return e;
-        };
-        if (nready == 0) continue;
-
-        // A byte on the shutdown pipe means SIGINT/SIGTERM arrived: return so
-        // the defers run their cleanup.
-        if (fds[pipe_index].revents & std.posix.POLL.IN != 0) {
-            log.info("shutdown signal received, exiting", .{});
-            return;
-        }
-
-        for (servers.items, 0..) |*s, i| {
-            if (fds[i].revents & std.posix.POLL.IN == 0) continue;
-            const stream = s.accept(init.io) catch |e| {
-                log.warn("accept failed: {s}", .{@errorName(e)});
-                continue;
-            };
-
-            // ip-protection level 2: reject clients with a public IP address.
-            if (opts.ip_protection & 2 != 0) {
-                if (!network.isClientPrivate(stream.socket.handle)) {
-                    stream.close(init.io);
-                    log.debug("client with public IP address rejected", .{});
-                    continue;
-                }
-            }
-
-            // Block until a worker slot is available (if the cap is enabled).
-            if (sem_active) sem.waitUncancelable(init.io);
-
-            const ctx = init.gpa.create(ClientContext) catch |e| {
-                stream.close(init.io);
-                if (sem_active) sem.post(init.io);
-                log.warn("out of memory accepting client: {s}", .{@errorName(e)});
-                continue;
-            };
-            ctx.* = .{
-                .stream = stream,
-                .io = init.io,
-                .gpa = init.gpa,
-                .cfg = &cfg,
-                .prng = std.Random.DefaultPrng.init(prng.random().int(u64)),
-                .port_str = port_str,
-                .use_ndr64 = opts.ndr64,
-                .use_btfn = opts.btfn,
-                .disconnect_per_request = opts.disconnect_per_request,
-                .timeout_seconds = @intCast(opts.timeout_seconds),
-                .sem = if (sem_active) &sem else null,
-                .log = &log,
-            };
-
-            group.concurrent(init.io, serveClientThread, .{ctx}) catch |e| {
-                ctx.stream.close(init.io);
-                if (sem_active) sem.post(init.io);
-                init.gpa.destroy(ctx);
-                log.warn("failed to dispatch client task: {s}", .{@errorName(e)});
-                continue;
-            };
-        }
-    }
+    var server: ServerContext = .{
+        .gpa = init.gpa,
+        .io = init.io,
+        .opts = &opts,
+        .log = &log,
+        .cfg = &cfg,
+        .servers = servers.items,
+        .sem = &sem,
+        .group = &group,
+        .port_str = port_str,
+        .prng = rng,
+    };
+    try server.run();
 }

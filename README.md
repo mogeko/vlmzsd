@@ -47,6 +47,8 @@ zig-out/bin/vlmzs localhost:1688
 ## Documentation
 
 - [docs/cli.md](./docs/cli.md) — CLI reference (options, env vars, logging)
+- [docs/kmd-format.md](./docs/kmd-format.md) — `.kmd` binary data format specification
+- [docs/kmdconv.md](./docs/kmdconv.md) — `kmdconv` developer tool (JSON ⇄ `.kmd`)
 - [docs/migration.md](./docs/migration.md) — byte layouts and known deviations from the C reference
 
 ## License
