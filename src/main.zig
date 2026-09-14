@@ -6,11 +6,10 @@
 
 const std = @import("std");
 const vlmzsd = @import("vlmzsd");
-
-const cli_helper = vlmzsd.cli_helper;
+const cli_helper = @import("cli_helper.zig");
+const network = @import("network.zig");
 const kms = vlmzsd.kms;
 const kmsdata = vlmzsd.kmsdata;
-const network = vlmzsd.network;
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
