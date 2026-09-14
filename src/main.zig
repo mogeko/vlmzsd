@@ -586,8 +586,11 @@ pub fn main(init: std.process.Init) !void {
 
     // Long-lived task group: accepted connections are dispatched onto the
     // `Io.Threaded` pool via `Group.concurrent`. Each task's resources are
-    // released when it returns, so the group never needs to be awaited.
-    var group = Io.Group.init;
+    // released when it returns; the group itself holds a token that is
+    // released by canceling on shutdown, which asks in-flight tasks to stop
+    // and waits for their cleanup to finish.
+    var group: Io.Group = .init;
+    defer group.cancel(init.io);
 
     // 64 listen sockets + 1 shutdown-pipe read end.
     var poll_fds: [65]std.posix.pollfd = undefined;
