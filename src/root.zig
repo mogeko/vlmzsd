@@ -1,11 +1,18 @@
 //! vlmzsd — an idiomatic Zig implementation of the KMS (Key Management Service) emulator.
+//!
+//! **Public API** (stable across patch releases; may change in 0.x):
+//! `crypto` (AES/CMAC/HMAC), `kmsdata` (`.kmd` parsing), `kms` (KMS v4/v5/v6
+//! protocol), and `rpc` (DCE/RPC framing). These four modules are pure logic
+//! with no `std.Io` or libc dependency — downstream projects should
+//! `@import("vlmzsd")` and use these.
+//!
+//! `network` and `cli_helper` are internal to the `vlmzsd`/`vlmzs` binaries and
+//! are not part of the public API.
 
 pub const crypto = @import("crypto.zig");
 pub const kmsdata = @import("kmsdata.zig");
 pub const kms = @import("kms.zig");
 pub const rpc = @import("rpc.zig");
-pub const network = @import("network.zig");
-pub const cli_helper = @import("cli_helper.zig");
 
 const std = @import("std");
 const testutil = @import("testutil.zig");
@@ -26,6 +33,4 @@ test {
     _ = kmsdata;
     _ = kms;
     _ = rpc;
-    _ = network;
-    _ = cli_helper;
 }

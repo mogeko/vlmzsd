@@ -3,7 +3,7 @@
 This document is the authoritative specification of the `.kmd` (KMS data) binary
 format consumed by `vlmzsd` / `vlmzs`. The parser is `src/kmsdata.zig`; the
 byte-level layout is pinned by the tests in that file and summarized in
-`docs/migration.md` §3.4. This file describes the format in full.
+[`docs/migration.md`](./migration.md) §3.4. This file describes the format in full.
 
 ## 1. Overview
 

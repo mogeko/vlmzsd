@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("vlmzsd", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .link_libc = true,
+        .link_libc = false,
     });
 
     // Expose build-time facts (version, git hash, build date, embedded-data
@@ -49,6 +49,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{
                 .{ .name = "vlmzsd", .module = mod },
             },
@@ -136,9 +137,37 @@ pub fn build(b: *std.Build) void {
 
     const run_kmdconv_tests = b.addRunArtifact(kmdconv_tests);
 
+    // `network.zig` and `cli_helper.zig` are internal to the binaries and no
+    // longer imported by `root.zig`, so test them directly. `network.zig`
+    // imports the `vlmzsd` module for the protocol layer.
+    const network_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/network.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vlmzsd", .module = mod },
+            },
+        }),
+    });
+
+    const run_network_tests = b.addRunArtifact(network_tests);
+
+    const cli_helper_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli_helper.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_cli_helper_tests = b.addRunArtifact(cli_helper_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_vlmzs_tests.step);
     test_step.dependOn(&run_kmdconv_tests.step);
+    test_step.dependOn(&run_network_tests.step);
+    test_step.dependOn(&run_cli_helper_tests.step);
 }

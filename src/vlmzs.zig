@@ -5,11 +5,10 @@
 
 const std = @import("std");
 const vlmzsd = @import("vlmzsd");
-
-const cli_helper = vlmzsd.cli_helper;
+const cli_helper = @import("cli_helper.zig");
+const network = @import("network.zig");
 const kms = vlmzsd.kms;
 const kmsdata = vlmzsd.kmsdata;
-const network = vlmzsd.network;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -613,7 +612,7 @@ pub fn main(init: std.process.Init) !void {
         };
         kmd_owned = true;
     } else {
-        fhs_loaded = cli_helper.loadFhsKmd(init.io, init.gpa) catch |e| {
+        fhs_loaded = cli_helper.loadFhsKmd(init.io, init.gpa, init.minimal.environ) catch |e| {
             out.eprint("error: failed to read FHS data file: {s}\n", .{@errorName(e)});
             std.process.exit(1);
         };

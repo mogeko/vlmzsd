@@ -44,9 +44,20 @@ zig-out/bin/vlmzs localhost:1688
 # Sending activation request (KMS V6) -> <ePID> (<hwid>)
 ```
 
+## Using as a library
+
+The core protocol layer (`crypto`, `kmsdata`, `kms`, `rpc`) is a pure-logic
+library module — no `std.Io`, no libc. Full details in
+[docs/library.md](./docs/library.md).
+
+```sh
+zig fetch --save git+https://github.com/mogeko/vlmzsd.git#v0.3.0
+```
+
 ## Documentation
 
 - [docs/cli.md](./docs/cli.md) — CLI reference (options, env vars, logging)
+- [docs/library.md](./docs/library.md) — using vlmzsd as a library
 - [docs/kmd-format.md](./docs/kmd-format.md) — `.kmd` binary data format specification
 - [docs/kmdconv.md](./docs/kmdconv.md) — `kmdconv` developer tool (JSON ⇄ `.kmd`)
 - [docs/migration.md](./docs/migration.md) — byte layouts and known deviations from the C reference

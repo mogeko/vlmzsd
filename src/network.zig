@@ -9,8 +9,9 @@
 //! loops.
 
 const std = @import("std");
-const rpc = @import("rpc.zig");
-const kms = @import("kms.zig");
+const vlmzsd = @import("vlmzsd");
+const rpc = vlmzsd.rpc;
+const kms = vlmzsd.kms;
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -484,7 +485,7 @@ pub fn getPrivateIPAddresses(allocator: Allocator) ![]Io.net.IpAddress {
 // Tests
 // ---------------------------------------------------------------------------
 
-const kmsdata = @import("kmsdata.zig");
+const kmsdata = @import("vlmzsd").kmsdata;
 
 const TestData = struct {
     data: kmsdata.KmsData,
