@@ -17,9 +17,11 @@ RUN ARCH=$(uname -m) && \
 
 RUN  minisign -Vm zig.tar.xz -P "${MINISIGN_PUBKEY}" -x zig.tar.xz.minisig
 
-RUN mkdir -p /opt/builder/ && \
-    tar -xf zig.tar.xz -C /opt/builder/ --strip-components=1 && \
+RUN mkdir -p /opt/toolchain/ && \
+    tar -xf zig.tar.xz -C /opt/toolchain/ --strip-components=1 && \
     rm /tmp/zig.tar.xz /tmp/zig.tar.xz.minisig
+
+ENV PATH="/opt/toolchain:${PATH}"
 
 WORKDIR /opt/app/
 
@@ -29,8 +31,7 @@ COPY ./build.zig.zon /opt/app/build.zig.zon
 COPY ./LICENSE /opt/app/LICENSE
 COPY ./README.md /opt/app/README.md
 
-RUN /opt/builder/zig build vlmzsd vlmzs \
-        --release=safe -Dcpu=baseline -Dno-embedded-data
+RUN zig build vlmzsd vlmzs --release=safe -Dcpu=baseline -Dno-embedded-data
 
 FROM gcr.io/distroless/base-nossl-debian13:latest
 
