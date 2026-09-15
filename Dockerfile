@@ -32,7 +32,7 @@ COPY ./README.md /opt/app/README.md
 RUN /opt/builder/zig build vlmzsd vlmzs \
         --release=safe -Dcpu=baseline -Dno-embedded-data
 
-FROM gcr.io/distroless/cc-debian13:latest
+FROM gcr.io/distroless/base-nossl-debian13:latest
 
 COPY --from=builder /opt/app/zig-out/bin/vlmzsd /usr/bin/vlmzsd
 COPY --from=builder /opt/app/zig-out/bin/vlmzs /usr/bin/vlmzs
