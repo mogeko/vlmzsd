@@ -51,7 +51,7 @@ library module — no `std.Io`, no libc. Full details in
 [docs/library.md](./docs/library.md).
 
 ```sh
-zig fetch --save git+https://github.com/mogeko/vlmzsd.git#v0.3.0
+zig fetch --save git+https://github.com/mogeko/vlmzsd.git#v0.3.1
 ```
 
 ## Documentation
