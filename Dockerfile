@@ -4,18 +4,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl minisign tar xz-utils ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
+ARG TARGETARCH
 ARG MINISIGN_PUBKEY="RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
 ARG ZIG_VERSION="0.16.0"
-ARG ZIG_DL_BASE="https://ziglang.org/download"
 
 WORKDIR /tmp/
 
-RUN ARCH=$(uname -m) && \
-    ZIG_DL_URL="${ZIG_DL_BASE}/${ZIG_VERSION}/zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz" && \
-    curl -fSL "$ZIG_DL_URL" -o zig.tar.xz && \
-    curl -fSL "$ZIG_DL_URL.minisig" -o zig.tar.xz.minisig
+RUN <<EOF
+    case "${TARGETARCH}" in
+        amd64)    ZIG_PKG="zig-x86_64-linux-${ZIG_VERSION}"      ;;
+        arm64)    ZIG_PKG="zig-aarch64-linux-${ZIG_VERSION}"     ;;
+        arm)      ZIG_PKG="zig-arm-linux-${ZIG_VERSION}"         ;;
+        riscv64)  ZIG_PKG="zig-riscv64-linux-${ZIG_VERSION}"     ;;
+        ppc64le)  ZIG_PKG="zig-powerpc64le-linux-${ZIG_VERSION}" ;;
+        386)      ZIG_PKG="zig-x86-linux-${ZIG_VERSION}"         ;;
+        loong64)  ZIG_PKG="zig-loongarch64-linux-${ZIG_VERSION}" ;;
+        s390x)    ZIG_PKG="zig-s390x-linux-${ZIG_VERSION}"       ;;
+        *) echo   "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;;
+    esac
+    ZIG_DL_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_PKG}.tar.xz"
+    curl -fSL "${ZIG_DL_URL}" -o zig.tar.xz
+    curl -fSL "${ZIG_DL_URL}.minisig" -o zig.tar.xz.minisig
+EOF
 
-RUN  minisign -Vm zig.tar.xz -P "${MINISIGN_PUBKEY}" -x zig.tar.xz.minisig
+RUN minisign -Vm zig.tar.xz -P "${MINISIGN_PUBKEY}" -x zig.tar.xz.minisig
 
 RUN mkdir -p /opt/toolchain/ && \
     tar -xf zig.tar.xz -C /opt/toolchain/ --strip-components=1 && \
