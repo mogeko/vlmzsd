@@ -221,8 +221,8 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, res: *const cli_helper
     opts.disconnect_per_request = try resolveFlag(res.hasFlag("disconnect-per-request"), env, "VLMZSD_DISCONNECT_PER_REQUEST", false);
 
     opts.pid_file = resolveStr(res.get("pid-file"), env, "VLMZSD_PID_FILE", null);
-    opts.verbose = res.hasFlag("verbose");
-    opts.quiet = res.hasFlag("quiet");
+    opts.verbose = try resolveFlag(res.hasFlag("verbose"), env, "VLMZSD_VERBOSE", false);
+    opts.quiet = try resolveFlag(res.hasFlag("quiet"), env, "VLMZSD_QUIET", false);
     opts.quiet_loopback = try resolveFlag(res.hasFlag("quiet-loopback"), env, "VLMZSD_QUIET_LOOPBACK", false);
 
     return opts;
