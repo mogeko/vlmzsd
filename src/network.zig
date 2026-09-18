@@ -401,6 +401,38 @@ pub fn isPrivateIPAddress(addr: *const std.posix.sockaddr) bool {
     };
 }
 
+/// True when `addr` is a loopback address: 127.0.0.0/8 (including the
+/// IPv4-mapped form a dual-stack socket reports) or ::1.
+fn isLoopbackAddress(addr: *const std.posix.sockaddr) bool {
+    return switch (addr.family) {
+        std.posix.AF.INET => blk: {
+            const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(addr));
+            break :blk (@byteSwap(in.addr) & 0xff000000) == 0x7f000000;
+        },
+        std.posix.AF.INET6 => blk: {
+            const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
+            if (isIpv4Mapped(in6.addr)) {
+                const ip4 = std.mem.readInt(u32, in6.addr[12..16], .big);
+                break :blk (ip4 & 0xff000000) == 0x7f000000;
+            }
+            const qword0 = std.mem.readInt(u64, in6.addr[0..8], .big);
+            const qword1 = std.mem.readInt(u64, in6.addr[8..16], .big);
+            break :blk qword0 == 0 and qword1 == 1; // ::1
+        },
+        else => false,
+    };
+}
+
+/// True when the connected socket's peer is a loopback address (the container
+/// HEALTHCHECK probes from here). Returns false when the peer address cannot
+/// be determined.
+pub fn isLoopbackPeer(fd: std.posix.socket_t) bool {
+    var addr: std.posix.sockaddr.storage align(8) = undefined;
+    var addrlen: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    std.posix.getpeername(fd, @ptrCast(&addr), &addrlen) catch return false;
+    return isLoopbackAddress(@ptrCast(&addr));
+}
+
 /// True when the connected socket's peer address is private. Returns false
 /// when the peer address cannot be determined (the C `serveClient` closes such
 /// connections), so callers treat false as "reject".
@@ -604,6 +636,54 @@ test "isPrivateIPAddress ipv6" {
     {
         var sa = ipv6.addr([_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 8, 8, 8, 8 });
         try std.testing.expect(!isPrivateIPAddress(@ptrCast(&sa)));
+    }
+}
+
+test "isLoopbackAddress" {
+    const ipv4 = struct {
+        fn addr(a: u8, b: u8, c: u8, d: u8) std.posix.sockaddr.in {
+            var sa: std.posix.sockaddr.in = .{ .port = 0, .addr = 0 };
+            const value = (@as(u32, a) << 24) | (@as(u32, b) << 16) | (@as(u32, c) << 8) | d;
+            std.mem.writeInt(u32, std.mem.asBytes(&sa.addr)[0..4], value, .big);
+            return sa;
+        }
+    };
+    const ipv6 = struct {
+        fn addr(bytes: [16]u8) std.posix.sockaddr.in6 {
+            return .{ .port = 0, .flowinfo = 0, .addr = bytes, .scope_id = 0 };
+        }
+    };
+
+    // IPv4: loopback, private-but-not-loopback, public.
+    {
+        var sa = ipv4.addr(127, 0, 0, 1);
+        try std.testing.expect(isLoopbackAddress(@ptrCast(&sa)));
+    }
+    {
+        var sa = ipv4.addr(10, 0, 0, 1); // private, not loopback
+        try std.testing.expect(!isLoopbackAddress(@ptrCast(&sa)));
+    }
+    {
+        var sa = ipv4.addr(8, 8, 8, 8); // public
+        try std.testing.expect(!isLoopbackAddress(@ptrCast(&sa)));
+    }
+    // IPv6: ::1 loopback vs global.
+    {
+        var sa = ipv6.addr([_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
+        try std.testing.expect(isLoopbackAddress(@ptrCast(&sa)));
+    }
+    {
+        var sa = ipv6.addr([_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
+        try std.testing.expect(!isLoopbackAddress(@ptrCast(&sa)));
+    }
+    // IPv4-mapped: ::ffff:127.0.0.1 loopback vs ::ffff:8.8.8.8 public.
+    {
+        var sa = ipv6.addr([_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 });
+        try std.testing.expect(isLoopbackAddress(@ptrCast(&sa)));
+    }
+    {
+        var sa = ipv6.addr([_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 8, 8, 8, 8 });
+        try std.testing.expect(!isLoopbackAddress(@ptrCast(&sa)));
     }
 }
 

@@ -62,6 +62,7 @@ const vlmzsd_opts = [_]cli_helper.Opt{
     .{ .name = "pid-file", .kind = .str, .hint = "file", .group = "Process", .desc = "Write PID to file" },
     .{ .name = "verbose", .short = 'v', .group = "Process", .desc = "Verbose logging" },
     .{ .name = "quiet", .short = 'q', .group = "Process", .desc = "Quiet logging (warnings/errors only)" },
+    .{ .name = "quiet-loopback", .group = "Process", .desc = "Suppress debug logs for loopback (localhost) clients" },
 };
 
 /// Resolved server configuration (post three-tier precedence merge).
@@ -88,6 +89,7 @@ const ServerOptions = struct {
     pid_file: ?[]const u8 = null,
     verbose: bool = false,
     quiet: bool = false,
+    quiet_loopback: bool = false,
 
     /// gpa-allocated backing for `listen`/`epids` (only when split from env).
     listen_backing: ?[]const []const u8 = null,
@@ -221,6 +223,7 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, res: *const cli_helper
     opts.pid_file = resolveStr(res.get("pid-file"), env, "VLMZSD_PID_FILE", null);
     opts.verbose = res.hasFlag("verbose");
     opts.quiet = res.hasFlag("quiet");
+    opts.quiet_loopback = try resolveFlag(res.hasFlag("quiet-loopback"), env, "VLMZSD_QUIET_LOOPBACK", false);
 
     return opts;
 }
@@ -295,24 +298,32 @@ const ClientContext = struct {
     timeout_seconds: u32,
     sem: ?*Io.Semaphore,
     log: *cli_helper.Logger,
+    /// Mirror of `ServerOptions.quiet_loopback` (the opt-in).
+    quiet_loopback: bool = false,
+    /// Computed per connection: `quiet_loopback` AND the peer is loopback.
+    quiet: bool = false,
 };
 
 /// Translate a `network.Event` into a log line. This is the logger boundary:
 /// `network.serveRpc` reports what happened, and this function decides the
 /// level, wording, and destination.
 fn logProtocolEvent(context: ?*anyopaque, event: network.Event) void {
-    const log: *cli_helper.Logger = @ptrCast(@alignCast(context orelse return));
+    const ctx: *ClientContext = @ptrCast(@alignCast(context orelse return));
     switch (event) {
-        .bind_negotiated => |ndr64| log.debug("BIND: negotiated {s}", .{if (ndr64) "NDR64" else "NDR32"}),
-        .fault => |nca| log.warn("RPC fault (NCA 0x{X:0>8})", .{nca}),
+        .bind_negotiated => |ndr64| {
+            if (!ctx.quiet) ctx.log.debug("BIND: negotiated {s}", .{if (ndr64) "NDR64" else "NDR32"});
+        },
+        .fault => |nca| ctx.log.warn("RPC fault (NCA 0x{X:0>8})", .{nca}),
         .request_rejected => |r| {
             if (r.major != 0) {
-                log.warn("KMS v{d} request rejected (HRESULT 0x{X:0>8})", .{ r.major, r.hr });
+                ctx.log.warn("KMS v{d} request rejected (HRESULT 0x{X:0>8})", .{ r.major, r.hr });
             } else {
-                log.warn("invalid KMS request rejected (HRESULT 0x{X:0>8})", .{r.hr});
+                ctx.log.warn("invalid KMS request rejected (HRESULT 0x{X:0>8})", .{r.hr});
             }
         },
-        .response => |r| log.debug("KMS v{d} request → {d}-byte response", .{ r.major, r.size }),
+        .response => |r| {
+            if (!ctx.quiet) ctx.log.debug("KMS v{d} request → {d}-byte response", .{ r.major, r.size });
+        },
     }
 }
 
@@ -325,9 +336,13 @@ fn serveClientThread(ctx: *ClientContext) void {
         ctx.gpa.destroy(ctx);
     }
 
+    // Only when --quiet-loopback is on, and only for loopback peers (the
+    // container HEALTHCHECK): suppress debug chatter; warn/err still logs.
+    ctx.quiet = ctx.quiet_loopback and network.isLoopbackPeer(ctx.stream.socket.handle);
+
     var peer_buf: [64]u8 = undefined;
     const peer = network.formatPeer(ctx.stream.socket.handle, &peer_buf);
-    ctx.log.debug("connection from {s} accepted", .{peer});
+    if (!ctx.quiet) ctx.log.debug("connection from {s} accepted", .{peer});
 
     const now_unix = cli_helper.nowUnix(ctx.io);
 
@@ -339,7 +354,7 @@ fn serveClientThread(ctx: *ClientContext) void {
     network.serveRpc(ctx.gpa, &reader.interface, &writer.interface, ctx.prng.random(), now_unix, .{
         .cfg = ctx.cfg,
         .on_event = logProtocolEvent,
-        .event_context = ctx.log,
+        .event_context = ctx,
         .secondary_address = ctx.port_str,
         .use_ndr64 = ctx.use_ndr64,
         .use_btfn = ctx.use_btfn,
@@ -347,8 +362,12 @@ fn serveClientThread(ctx: *ClientContext) void {
         .timeout_seconds = ctx.timeout_seconds,
         .socket_fd = ctx.stream.socket.handle,
     }) catch |e| switch (e) {
-        error.EndOfStream => ctx.log.debug("connection from {s} closed", .{peer}),
-        error.Timeout => ctx.log.debug("connection from {s} timed out", .{peer}),
+        error.EndOfStream => {
+            if (!ctx.quiet) ctx.log.debug("connection from {s} closed", .{peer});
+        },
+        error.Timeout => {
+            if (!ctx.quiet) ctx.log.debug("connection from {s} timed out", .{peer});
+        },
         else => ctx.log.warn("connection from {s} error: {s}", .{ peer, @errorName(e) }),
     };
 }
@@ -524,6 +543,7 @@ const ServerContext = struct {
                     .timeout_seconds = @intCast(self.opts.timeout_seconds),
                     .sem = if (sem_active) self.sem else null,
                     .log = self.log,
+                    .quiet_loopback = self.opts.quiet_loopback,
                 };
 
                 self.group.concurrent(self.io, serveClientThread, .{ctx}) catch |e| {
