@@ -137,7 +137,9 @@ with `-Dno-embedded-data`, startup fails with an error.
 | Option | Short | Default | Env var | Notes |
 |---|---|---|---|---|
 | `--pid-file <file>` | | — | `VLMZSD_PID_FILE` | write PID to file |
-| `--verbose` / `--quiet` | `-v` / `-q` | off | — | enable `debug` / drop `info` |
+| `--verbose` | `-v` | off | `VLMZSD_VERBOSE` | enable `debug` logging |
+| `--quiet` | `-q` | off | `VLMZSD_QUIET` | drop `info` logging |
+| `--quiet-loopback` | | off | `VLMZSD_QUIET_LOOPBACK` | suppress debug logs from loopback (localhost) clients |
 
 ### Logging
 
