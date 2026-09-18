@@ -53,7 +53,12 @@ COPY --from=builder /opt/app/src/vlmcsd.kmd /usr/share/vlmzsd/data.kmd
 COPY --from=builder /opt/app/LICENSE /usr/share/doc/vlmzsd/copyright
 COPY --from=builder /opt/app/README.md /usr/share/doc/vlmzsd/README.md
 
+# Set the port for vlmzsd to listen on
 ENV VLMZSD_PORT="1688"
+# Suppress debug logs from loopback (localhost) clients
+ENV VLMZSD_QUIET_LOOPBACK="true"
+# Set the default log level to verbose
+ENV VLMZSD_VERBOSE="true"
 
 EXPOSE 1688/tcp
 
