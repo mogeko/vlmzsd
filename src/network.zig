@@ -20,9 +20,30 @@ const Io = std.Io;
 // `sendrecv` equivalents
 // ---------------------------------------------------------------------------
 
-/// Read exactly `buf.len` bytes (equivalent to `_recv` in network.c).
-pub fn readAll(reader: *Io.Reader, buf: []u8) !void {
-    try reader.readSliceAll(buf);
+/// Read exactly `buf.len` bytes, waiting for the peer before each refill so that
+/// no single `read(2)` can block past the idle timeout (the reference used
+/// `SO_RCVTIMEO` for the same purpose).
+///
+/// `Io.Reader.readSliceAll` alone does not bound the wait: it loops until `buf`
+/// is full, so a peer that delivers half a packet and then stalls parks the
+/// caller in the kernel. Split packets are the normal case here — `writePacket`
+/// sends the header and the body as two separate writes, and TCP may segment
+/// them further — which is why the poll happens per refill, not per packet.
+pub fn readAll(idle: IdleTimeout, reader: *Io.Reader, buf: []u8) !void {
+    var off: usize = 0;
+    while (off < buf.len) {
+        // Bytes already buffered cost neither a syscall nor a poll.
+        if (reader.bufferedLen() == 0) try waitReadable(idle);
+        var vec: [1][]u8 = .{buf[off..]};
+        const n = reader.readVec(&vec) catch |err| switch (err) {
+            error.EndOfStream => return error.EndOfStream,
+            else => |e| return e,
+        };
+        // `readVec` returns 0 only when it drained the buffer and the socket
+        // had nothing more.
+        if (n == 0) return error.EndOfStream;
+        off += n;
+    }
 }
 
 /// Write all of `buf` (equivalent to `_send` in network.c). Flushes the
@@ -63,11 +84,8 @@ pub const ServeOptions = struct {
     use_btfn: bool = false,
     /// Close the connection after each RESPONSE/FAULT (C `DisconnectImmediately`).
     disconnect_per_request: bool = false,
-    /// Idle timeout in seconds (0 = disabled). Polls the connected socket for
-    /// readability before each packet read (C `ServerTimeout`).
-    timeout_seconds: u32 = 0,
-    /// Connected socket fd, polled for readability when `timeout_seconds > 0`.
-    socket_fd: std.posix.socket_t = 0,
+    /// Idle timeout for packet reads (C `ServerTimeout`).
+    idle: IdleTimeout = .{},
     /// Optional sink for protocol-level events (see `Event`). When null, the
     /// events are simply not reported.
     on_event: ?*const fn (context: ?*anyopaque, event: Event) void = null,
@@ -88,15 +106,27 @@ fn writePacket(
     try writeAll(writer, body);
 }
 
-/// Wait until the connected socket is readable, or return `error.Timeout`
-/// once the idle timeout elapses. A no-op when the timeout is disabled or the
-/// reader already has buffered bytes (the buffered `Io.Reader` may have read
-/// ahead past the packet being consumed).
-fn waitReadable(options: ServeOptions, reader: *Io.Reader) !void {
-    if (options.timeout_seconds == 0 or options.socket_fd == 0) return;
-    if (reader.bufferedLen() > 0) return;
-    var fds = [1]std.posix.pollfd{.{ .fd = options.socket_fd, .events = std.posix.POLL.IN, .revents = 0 }};
-    const timeout_ms: i32 = @intCast(@as(i64, options.timeout_seconds) * 1000);
+/// Idle timeout for reads on a connected socket: how long to wait for the peer
+/// to answer (`seconds = 0` waits forever) and which socket to poll. Both the
+/// server loop and the client use it, so `--timeout` means the same on either
+/// side of the connection.
+pub const IdleTimeout = struct {
+    seconds: u32 = 0,
+    /// Connected socket, polled for readability before each packet read. `0`
+    /// disables the timeout (the fd is unknown).
+    socket_fd: std.posix.socket_t = 0,
+};
+
+/// Wait until the connected socket has something to read, or return
+/// `error.Timeout` once the idle timeout elapses. A no-op when the timeout is
+/// disabled or the fd is unknown; callers that already hold buffered bytes
+/// skip it entirely.
+fn waitReadable(idle: IdleTimeout) !void {
+    if (idle.seconds == 0 or idle.socket_fd == 0) return;
+    var fds = [1]std.posix.pollfd{.{ .fd = idle.socket_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    // `poll` takes an i32 millisecond count; clamp so a legal but huge
+    // `--timeout` (e.g. `30d`) cannot overflow it in a safety-checked build.
+    const timeout_ms: i32 = @intCast(@min(@as(u64, idle.seconds) * 1000, std.math.maxInt(i32)));
     const n = try std.posix.poll(&fds, timeout_ms);
     if (n == 0) return error.Timeout;
 }
@@ -114,9 +144,8 @@ pub fn serveRpc(
     var negotiation = rpc.BindNegotiation{};
 
     while (true) {
-        try waitReadable(options, reader);
         var header: rpc.RpcHeader = undefined;
-        readAll(reader, std.mem.asBytes(&header)) catch |err| switch (err) {
+        readAll(options.idle, reader, std.mem.asBytes(&header)) catch |err| switch (err) {
             error.EndOfStream => return,
             else => return err,
         };
@@ -132,8 +161,7 @@ pub fn serveRpc(
         if (frag_len < rpc.header_size) return error.InvalidPacket;
         const request_body = try allocator.alloc(u8, frag_len - rpc.header_size);
         defer allocator.free(request_body);
-        try waitReadable(options, reader);
-        readAll(reader, request_body) catch |err| switch (err) {
+        readAll(options.idle, reader, request_body) catch |err| switch (err) {
             error.EndOfStream => return,
             else => return err,
         };
@@ -206,6 +234,11 @@ pub const ClientOptions = struct {
     use_ndr64: bool = true,
     use_btfn: bool = false,
     multiplexed: bool = false,
+    /// Idle timeout for the BIND reply and for every RESPONSE read. The client
+    /// has no *connect* deadline: `std.Io.Threaded` (0.16) still panics on
+    /// `ConnectOptions.timeout` ("TODO implement"), so a blackholed host is
+    /// bounded only by the kernel's own SYN timeout.
+    idle: IdleTimeout = .{},
 };
 
 /// Perform the BIND handshake and return the negotiated transfer syntaxes.
@@ -226,7 +259,7 @@ pub fn clientBind(
 
     try writeAll(writer, req);
 
-    const resp_body = try readPacket(allocator, reader);
+    const resp_body = try readPacket(allocator, options.idle, reader);
     defer allocator.free(resp_body);
 
     return rpc.parseBindResponse(resp_body);
@@ -247,6 +280,7 @@ pub fn clientSendRequest(
     call_id: *u32,
     kms_request: []const u8,
     use_ndr64: bool,
+    idle: IdleTimeout,
 ) !SendResult {
     const req = try rpc.wrapKmsRequest(allocator, kms_request, use_ndr64, call_id.*);
     defer allocator.free(req);
@@ -254,7 +288,7 @@ pub fn clientSendRequest(
 
     try writeAll(writer, req);
 
-    const resp_body = try readPacket(allocator, reader);
+    const resp_body = try readPacket(allocator, idle, reader);
     defer allocator.free(resp_body);
 
     const parsed = rpc.parseKmsResponse(resp_body, use_ndr64);
@@ -265,15 +299,15 @@ pub fn clientSendRequest(
 }
 
 /// Read one RPC packet (header + body) and return its body bytes.
-fn readPacket(allocator: Allocator, reader: *Io.Reader) ![]u8 {
+fn readPacket(allocator: Allocator, idle: IdleTimeout, reader: *Io.Reader) ![]u8 {
     var header: rpc.RpcHeader = undefined;
-    try readAll(reader, std.mem.asBytes(&header));
+    try readAll(idle, reader, std.mem.asBytes(&header));
 
     const frag_len: usize = header.frag_length;
     if (frag_len < rpc.header_size) return error.InvalidPacket;
     const body = try allocator.alloc(u8, frag_len - rpc.header_size);
     errdefer allocator.free(body);
-    try readAll(reader, body);
+    try readAll(idle, reader, body);
     return body;
 }
 

@@ -359,8 +359,7 @@ fn serveClientThread(ctx: *ClientContext) void {
         .use_ndr64 = ctx.use_ndr64,
         .use_btfn = ctx.use_btfn,
         .disconnect_per_request = ctx.disconnect_per_request,
-        .timeout_seconds = ctx.timeout_seconds,
-        .socket_fd = ctx.stream.socket.handle,
+        .idle = .{ .seconds = ctx.timeout_seconds, .socket_fd = ctx.stream.socket.handle },
     }) catch |e| switch (e) {
         error.EndOfStream => {
             if (!ctx.quiet) ctx.log.debug("connection from {s} closed", .{peer});

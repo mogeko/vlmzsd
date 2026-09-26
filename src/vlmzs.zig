@@ -19,9 +19,17 @@ const git_hash = build_options.git_hash;
 const build_date = build_options.build_date;
 const default_port: u16 = 1688;
 const default_grace_minutes: u32 = 43200;
+/// Idle timeout for the BIND reply and every RESPONSE read, mirroring the
+/// server's `--timeout` default.
+const default_timeout_seconds: u32 = 30;
 /// Embedded default `.kmd` data, unless built with `-Dno-embedded-data`
 /// (then `--data <file>` is required at runtime).
 const embedded_kmd: []const u8 = if (build_options.embedded_data) @embedFile("vlmcsd.kmd") else &.{};
+
+/// Bytes staged per request and per stream. The largest report is a `--verbose`
+/// request+response dump (~1.5 KiB), so this leaves more than 2x headroom;
+/// `Report` also has a spill path so that text is never dropped.
+const report_buffer_size = 4096;
 
 /// Bare stdout/stderr writers for the client. The client is a CLI debugging
 /// tool, not a service: its answer (ePID) and `--verbose` protocol dumps go to
@@ -32,9 +40,15 @@ const Output = struct {
     io: Io,
     out: std.Io.File.Writer,
     err: std.Io.File.Writer,
-    /// Guards concurrent `print`/`eprint` calls (the client dispatches
-    /// `--reconnect-per-request` tasks in parallel onto the thread pool).
+    /// Guards every write: each `print`/`eprint`, and each whole `writeBlock`
+    /// (one request's staged report), is written under this lock.
     mutex: Io.Mutex = .init,
+    /// Test seam: when set, output goes here instead of the process
+    /// descriptors. `zig build test` runs this binary with `--listen=-`, where
+    /// stdout carries the runner's protocol, so a test must never write to the
+    /// real stdout (see AGENTS.md → Pitfalls).
+    test_out: ?*std.Io.Writer = null,
+    test_err: ?*std.Io.Writer = null,
 
     fn init(io: Io, out_buf: []u8, err_buf: []u8) Output {
         return .{
@@ -44,20 +58,115 @@ const Output = struct {
         };
     }
 
+    fn outWriter(self: *Output) *std.Io.Writer {
+        return self.test_out orelse &self.out.interface;
+    }
+
+    fn errWriter(self: *Output) *std.Io.Writer {
+        return self.test_err orelse &self.err.interface;
+    }
+
     /// Write to stdout and flush (the answer/progress stream).
     fn print(self: *Output, comptime fmt: []const u8, args: anytype) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.out.interface.print(fmt, args) catch {};
-        self.out.interface.flush() catch {};
+        const writer = self.outWriter();
+        writer.print(fmt, args) catch {};
+        writer.flush() catch {};
     }
 
     /// Write to stderr and flush (the error stream).
     fn eprint(self: *Output, comptime fmt: []const u8, args: anytype) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.err.interface.print(fmt, args) catch {};
-        self.err.interface.flush() catch {};
+        const writer = self.errWriter();
+        writer.print(fmt, args) catch {};
+        writer.flush() catch {};
+    }
+
+    /// Write one request's staged report under a single lock acquisition, so
+    /// parallel `--reconnect-per-request` tasks cannot interleave inside a
+    /// report. Empty streams are skipped.
+    fn writeBlock(self: *Output, out_bytes: []const u8, err_bytes: []const u8) void {
+        if (out_bytes.len == 0 and err_bytes.len == 0) return;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (out_bytes.len > 0) {
+            const writer = self.outWriter();
+            writer.writeAll(out_bytes) catch {};
+            writer.flush() catch {};
+        }
+        if (err_bytes.len > 0) {
+            const writer = self.errWriter();
+            writer.writeAll(err_bytes) catch {};
+            writer.flush() catch {};
+        }
+    }
+};
+
+/// One request's staged output. A request emits many fragments — a `--verbose`
+/// request+response dump is ~25 lines — and they are *mid-line* fragments: the
+/// `Sending activation request` prefix has no newline of its own. Writing them
+/// straight to `Output` makes every fragment a separate lock acquisition, so
+/// parallel tasks splice each other's lines. Staging the whole report and
+/// writing it once keeps one request atomic.
+///
+/// The report-printing helpers below take this as `out` (same `print`/`eprint`
+/// methods as `Output`, but staged); everything outside a request keeps writing
+/// straight to `Output`.
+const Report = struct {
+    output: *Output,
+    out: std.Io.Writer,
+    err: std.Io.Writer,
+    /// Kept so the spill path can re-arm the writers. The buffers live in the
+    /// caller's frame: `init` returns by value, so embedding them here would
+    /// leave the writers pointing into the struct that was just moved.
+    out_buffer: []u8,
+    err_buffer: []u8,
+
+    fn init(output: *Output, out_buffer: []u8, err_buffer: []u8) Report {
+        return .{
+            .output = output,
+            .out = .fixed(out_buffer),
+            .err = .fixed(err_buffer),
+            .out_buffer = out_buffer,
+            .err_buffer = err_buffer,
+        };
+    }
+
+    fn print(self: *Report, comptime fmt: []const u8, args: anytype) void {
+        self.out.print(fmt, args) catch self.spillOut(fmt, args);
+    }
+
+    fn eprint(self: *Report, comptime fmt: []const u8, args: anytype) void {
+        self.err.print(fmt, args) catch self.spillErr(fmt, args);
+    }
+
+    /// Terminate a half-written report. A request that fails on the wire (peer
+    /// vanished mid-exchange) returns after the `Sending activation request`
+    /// prefix was staged but before the result completed that line; the caller
+    /// then reports the failure on stderr, which would visually continue the
+    /// unterminated stdout line. Called from the `errdefer` in `sendRequestOn`
+    /// *before* the block is flushed, so even the failure path emits a
+    /// complete line.
+    fn endLine(self: *Report) void {
+        if (self.out.buffered().len == 0) return;
+        self.print("\n", .{});
+    }
+
+    /// Safety valve for a report larger than `report_buffer_size` (unreachable
+    /// in practice): flush what is staged and continue in a fresh buffer. The
+    /// chunk boundary may interleave with another task, but no text is dropped.
+    fn spillOut(self: *Report, comptime fmt: []const u8, args: anytype) void {
+        self.output.writeBlock(self.out.buffered(), &.{});
+        self.out = .fixed(self.out_buffer);
+        self.out.print(fmt, args) catch {};
+    }
+
+    fn spillErr(self: *Report, comptime fmt: []const u8, args: anytype) void {
+        self.output.writeBlock(&.{}, self.err.buffered());
+        self.err = .fixed(self.err_buffer);
+        self.err.print(fmt, args) catch {};
     }
 };
 
@@ -144,6 +253,7 @@ const vlmzs_opts = [_]cli_helper.Opt{
     .{ .name = "address-family", .kind = .int, .hint = "u8", .group = "Request", .desc = "IPv4/IPv6 selection (4/6)" },
     .{ .name = "license-status", .short = 't', .kind = .int, .hint = "u32", .group = "Request", .desc = "LicenseStatus field (0-6, default 1)" },
     .{ .name = "reconnect-per-request", .short = 'T', .group = "Connection", .desc = "Reconnect for each request" },
+    .{ .name = "timeout", .kind = .str, .hint = "dur", .group = "Connection", .desc = "Idle timeout (default 30s, 0 disables)" },
     .{ .name = "no-multiplexed", .group = "Connection", .desc = "Disable multiplexed RPC" },
     .{ .name = "no-ndr64", .group = "Connection", .desc = "Disable NDR64 transfer syntax" },
     .{ .name = "no-btfn", .group = "Connection", .desc = "Disable bind-time feature negotiation" },
@@ -170,6 +280,7 @@ const ClientOptions = struct {
     list_products: bool = false,
     license_status: u32 = 1,
     reconnect_per_request: bool = false,
+    timeout_seconds: u32 = default_timeout_seconds,
     multiplexed: bool = true,
     ndr64: bool = true,
     btfn: bool = true,
@@ -230,6 +341,10 @@ fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
     opts.list_products = res.hasFlag("list-products");
     opts.license_status = if (res.get("license-status")) |s| try std.fmt.parseInt(u32, s, 10) else 1;
     opts.reconnect_per_request = res.hasFlag("reconnect-per-request");
+    opts.timeout_seconds = if (res.get("timeout")) |s|
+        std.math.cast(u32, try cli_helper.parseDurationSeconds(s)) orelse return error.InvalidTimeout
+    else
+        default_timeout_seconds;
     opts.multiplexed = !res.hasFlag("no-multiplexed");
     opts.ndr64 = !res.hasFlag("no-ndr64");
     opts.btfn = !res.hasFlag("no-btfn");
@@ -315,7 +430,7 @@ fn ucs2ToAscii(pid: *const [64]u16, out: []u8) []const u8 {
 }
 
 /// Report each failed response-verification check to stderr (C `displayResponse`).
-fn reportVerificationErrors(result: kms.ResponseResult, out: *Output) void {
+fn reportVerificationErrors(result: kms.ResponseResult, out: *Report) void {
     out.print("\n", .{}); // end the in-progress "Sending ..." line on stdout
     if (!result.rpc_ok) out.eprint("ERROR: non-zero RPC result code\n", .{});
     if (!result.decrypt_success) out.eprint("ERROR: decryption of the V5/V6 response failed\n", .{});
@@ -337,7 +452,7 @@ fn reportVerificationErrors(result: kms.ResponseResult, out: *Output) void {
 
 /// Report a server rejection to stderr with a human-readable reason when known
 /// (C `displayRequestError`).
-fn printRejection(status: i32, out: *Output) void {
+fn printRejection(status: i32, out: *Report) void {
     out.print("\n", .{}); // end the in-progress "Sending ..." line on stdout
     const hr: u32 = @bitCast(status);
     if (rejectionReason(hr)) |reason| {
@@ -349,7 +464,7 @@ fn printRejection(status: i32, out: *Output) void {
 
 /// Print the activation answer to stdout (C `displayResponse`, non-verbose).
 /// `hwid` is only present for v5+ responses.
-fn printResultSummary(base: *const kms.Response, hwid: ?*const [8]u8, out: *Output) void {
+fn printResultSummary(base: *const kms.Response, hwid: ?*const [8]u8, out: *Report) void {
     var epid_buf: [64]u8 = undefined;
     const epid = ucs2ToAscii(&base.kms_pid, &epid_buf);
     out.print(" -> {s}", .{epid});
@@ -358,7 +473,7 @@ fn printResultSummary(base: *const kms.Response, hwid: ?*const [8]u8, out: *Outp
 }
 
 /// One aligned GUID line with the product name when the GUID is in `list`.
-fn printGuidLine(out: *Output, label: []const u8, guid: *const kms.Guid, list: []const kmsdata.VlmcsdData, buf: []u8) void {
+fn printGuidLine(out: *Report, label: []const u8, guid: *const kms.Guid, list: []const kmsdata.VlmcsdData, buf: []u8) void {
     if (kms.getProductIndex(guid, list)) |idx| {
         out.print("{s:<32}: {s} ({s})\n", .{ label, formatGuid(guid, buf), list[idx].name });
     } else {
@@ -367,7 +482,7 @@ fn printGuidLine(out: *Output, label: []const u8, guid: *const kms.Guid, list: [
 }
 
 /// Verbose per-field request dump (C `logRequestVerbose`).
-fn printRequestVerbose(req: *const kms.Request, data: *const kmsdata.KmsData, out: *Output) void {
+fn printRequestVerbose(req: *const kms.Request, data: *const kmsdata.KmsData, out: *Report) void {
     const major: u16 = @truncate(req.version >> 16);
     const minor: u16 = @truncate(req.version);
     var guid_buf: [64]u8 = undefined;
@@ -391,7 +506,7 @@ fn printRequestVerbose(req: *const kms.Request, data: *const kmsdata.KmsData, ou
 }
 
 /// Verbose per-field response dump (C `logResponseVerbose`).
-fn printResponseVerbose(base: *const kms.Response, hwid: ?*const [8]u8, result: kms.ResponseResult, out: *Output) void {
+fn printResponseVerbose(base: *const kms.Response, hwid: ?*const [8]u8, result: kms.ResponseResult, out: *Report) void {
     const major: u16 = @truncate(base.version >> 16);
     const minor: u16 = @truncate(base.version);
     var epid_buf: [64]u8 = undefined;
@@ -411,6 +526,22 @@ fn printResponseVerbose(base: *const kms.Response, hwid: ?*const [8]u8, result: 
     out.print("\n", .{});
 }
 
+/// A BIND-completed connection a request is sent over: the buffered streams
+/// (borrowed — they stay in the caller's frame), the transfer syntax the BIND
+/// reply negotiated, the CallId sequence, and the read timeout. The timeout
+/// travels with the connection because it has to poll the very socket the
+/// streams were opened on.
+const Conn = struct {
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    /// Negotiated syntax, which can be narrower than the requested one.
+    use_ndr64: bool,
+    /// Next DCE/RPC CallId; BIND consumed 2.
+    call_id: u32 = 2,
+    /// Applied to the BIND reply and to every RESPONSE read.
+    idle: network.IdleTimeout,
+};
+
 fn sendRequest(
     gpa: Allocator,
     io: Io,
@@ -428,67 +559,86 @@ fn sendRequest(
     var reader = stream.reader(io, &rbuf);
     var writer = stream.writer(io, &wbuf);
 
+    const idle: network.IdleTimeout = .{
+        .seconds = opts.timeout_seconds,
+        .socket_fd = stream.socket.handle,
+    };
     var call_id: u32 = 2;
     const bind = try network.clientBind(gpa, &reader.interface, &writer.interface, &call_id, .{
         .use_ndr64 = opts.ndr64,
         .use_btfn = opts.btfn,
         .multiplexed = opts.multiplexed,
+        .idle = idle,
     });
 
-    const use_ndr64 = if (opts.ndr64 and bind.has_ndr64) true else bind.has_ndr32;
+    var conn = Conn{
+        .reader = &reader.interface,
+        .writer = &writer.interface,
+        .use_ndr64 = if (opts.ndr64 and bind.has_ndr64) true else bind.has_ndr32,
+        .call_id = call_id,
+        .idle = idle,
+    };
 
-    try sendRequestOn(gpa, &reader.interface, &writer.interface, &call_id, use_ndr64, base, rng, out, data, opts.verbose);
+    try sendRequestOn(gpa, &conn, base, rng, out, data, opts.verbose);
 }
 
 /// Send one KMS request over an already-established connection (BIND done).
 fn sendRequestOn(
     gpa: Allocator,
-    reader: *std.Io.Reader,
-    writer: *std.Io.Writer,
-    call_id: *u32,
-    use_ndr64: bool,
+    conn: *Conn,
     base: kms.Request,
     rng: std.Random,
     out: *Output,
     data: *const kmsdata.KmsData,
     verbose: bool,
 ) !void {
+    // One request = one lock acquisition: stage the report here and flush it on
+    // every exit path, including the early rejection/verification returns.
+    var report_out_buffer: [report_buffer_size]u8 = undefined;
+    var report_err_buffer: [report_buffer_size]u8 = undefined;
+    var report = Report.init(out, &report_out_buffer, &report_err_buffer);
+    defer out.writeBlock(report.out.buffered(), report.err.buffered());
+    // A network failure below returns with the request prefix still unline-
+    // terminated; close the line before the flush above, so the caller's
+    // stderr diagnostic does not continue it.
+    errdefer report.endLine();
+
     const proto: u16 = @intCast(base.version >> 16);
-    if (verbose) printRequestVerbose(&base, data, out);
-    out.print("Sending activation request (KMS V{d}) ", .{proto});
+    if (verbose) printRequestVerbose(&base, data, &report);
+    report.print("Sending activation request (KMS V{d}) ", .{proto});
 
     if (proto == 4) {
         var req: kms.RequestV4 = undefined;
         kms.createRequestV4(&req, &base);
-        const sent = try network.clientSendRequest(gpa, reader, writer, call_id, std.mem.asBytes(&req), use_ndr64);
+        const sent = try network.clientSendRequest(gpa, conn.reader, conn.writer, &conn.call_id, std.mem.asBytes(&req), conn.use_ndr64, conn.idle);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
-            printRejection(sent.status, out);
+            printRejection(sent.status, &report);
             return;
         }
         var resp: kms.ResponseV4 = undefined;
         const result = kms.decryptResponseV4(&resp, sent.data.len, sent.data, &req);
         if (!result.ok()) {
-            reportVerificationErrors(result, out);
+            reportVerificationErrors(result, &report);
             return;
         }
-        if (verbose) printResponseVerbose(&resp.base, null, result, out) else printResultSummary(&resp.base, null, out);
+        if (verbose) printResponseVerbose(&resp.base, null, result, &report) else printResultSummary(&resp.base, null, &report);
     } else {
         var req: kms.RequestV6 = undefined;
         kms.createRequestV6(&req, &base, rng);
-        const sent = try network.clientSendRequest(gpa, reader, writer, call_id, std.mem.asBytes(&req), use_ndr64);
+        const sent = try network.clientSendRequest(gpa, conn.reader, conn.writer, &conn.call_id, std.mem.asBytes(&req), conn.use_ndr64, conn.idle);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
-            printRejection(sent.status, out);
+            printRejection(sent.status, &report);
             return;
         }
         var resp: kms.ResponseV6 = undefined;
         const result = kms.decryptResponseV6(&resp, sent.data.len, sent.data, &req, null);
         if (!result.ok()) {
-            reportVerificationErrors(result, out);
+            reportVerificationErrors(result, &report);
             return;
         }
-        if (verbose) printResponseVerbose(&resp.base, &resp.hwid, result, out) else printResultSummary(&resp.base, &resp.hwid, out);
+        if (verbose) printResponseVerbose(&resp.base, &resp.hwid, result, &report) else printResultSummary(&resp.base, &resp.hwid, &report);
     }
 }
 
@@ -529,19 +679,30 @@ fn sendRequestsReused(
     var reader = stream.reader(io, &rbuf);
     var writer = stream.writer(io, &wbuf);
 
+    const idle: network.IdleTimeout = .{
+        .seconds = opts.timeout_seconds,
+        .socket_fd = stream.socket.handle,
+    };
     var call_id: u32 = 2;
     const bind = try network.clientBind(gpa, &reader.interface, &writer.interface, &call_id, .{
         .use_ndr64 = opts.ndr64,
         .use_btfn = opts.btfn,
         .multiplexed = opts.multiplexed,
+        .idle = idle,
     });
 
-    const use_ndr64 = if (opts.ndr64 and bind.has_ndr64) true else bind.has_ndr32;
+    var conn = Conn{
+        .reader = &reader.interface,
+        .writer = &writer.interface,
+        .use_ndr64 = if (opts.ndr64 and bind.has_ndr64) true else bind.has_ndr32,
+        .call_id = call_id,
+        .idle = idle,
+    };
 
     var i: usize = 0;
     while (i < opts.count) : (i += 1) {
         const base = buildRequestBase(opts, data, sku_index, rng, io);
-        try sendRequestOn(gpa, &reader.interface, &writer.interface, &call_id, use_ndr64, base, rng, out, data, opts.verbose);
+        try sendRequestOn(gpa, &conn, base, rng, out, data, opts.verbose);
     }
 }
 
@@ -703,4 +864,176 @@ test "buildRequestBase binding expiration" {
     opts_custom.grace = 60;
     const base_custom = buildRequestBase(&opts_custom, &data, 0, rng, io);
     try std.testing.expectEqual(@as(u32, 60), base_custom.binding_expiration);
+}
+
+// The client's output staging is pinned here: one request must reach the sink as
+// one contiguous block, because its fragments are mid-line (the "Sending
+// activation request" prefix has no newline) and `--reconnect-per-request` runs
+// requests in parallel. The sink is injectable for the same reason the server's
+// logger is: `zig build test` runs this binary with `--listen=-`, so a test must
+// never write to the real stdout (see AGENTS.md → Pitfalls).
+test "a staged report reaches the sink as one block" {
+    const io = std.testing.io;
+    var unused_out: [64]u8 = undefined;
+    var unused_err: [64]u8 = undefined;
+    var output = Output.init(io, &unused_out, &unused_err);
+    var sink_buffer: [256]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buffer);
+    output.test_out = &sink;
+    var err_sink_buffer: [256]u8 = undefined;
+    var err_sink: std.Io.Writer = .fixed(&err_sink_buffer);
+    output.test_err = &err_sink;
+
+    var report_out_buffer: [report_buffer_size]u8 = undefined;
+    var report_err_buffer: [report_buffer_size]u8 = undefined;
+    var report = Report.init(&output, &report_out_buffer, &report_err_buffer);
+    report.print("BEGIN ", .{});
+    report.print("middle ", .{});
+    report.eprint("to-stderr\n", .{});
+    report.print("END\n", .{});
+    output.writeBlock(report.out.buffered(), report.err.buffered());
+
+    try std.testing.expectEqualStrings("BEGIN middle END\n", sink.buffered());
+    try std.testing.expectEqualStrings("to-stderr\n", err_sink.buffered());
+}
+
+test "concurrent requests do not interleave inside a report" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var unused_out: [64]u8 = undefined;
+    var unused_err: [64]u8 = undefined;
+    var output = Output.init(io, &unused_out, &unused_err);
+    var sink_buffer: [64 * 1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buffer);
+    output.test_out = &sink;
+
+    const requests = 8;
+    const Task = struct {
+        output: *Output,
+        id: usize,
+
+        fn run(self: *@This()) void {
+            var report_out_buffer: [report_buffer_size]u8 = undefined;
+            var report_err_buffer: [report_buffer_size]u8 = undefined;
+            var report = Report.init(self.output, &report_out_buffer, &report_err_buffer);
+            report.print("<{d}", .{self.id});
+            var i: usize = 0;
+            while (i < 8) : (i += 1) report.print("-{d}", .{i});
+            report.print(">\n", .{});
+            self.output.writeBlock(report.out.buffered(), report.err.buffered());
+        }
+    };
+
+    var group: Io.Group = .init;
+    var tasks: [requests]Task = undefined;
+    for (&tasks, 0..) |*task, id| {
+        task.* = .{ .output = &output, .id = id };
+        try group.concurrent(io, Task.run, .{task});
+    }
+    try group.await(io);
+
+    // Each report must appear as one uninterrupted block: before staging, the
+    // fragments of these parallel requests were spliced together.
+    const text = sink.buffered();
+    var found: usize = 0;
+    var id: usize = 0;
+    while (id < requests) : (id += 1) {
+        var expected_buffer: [64]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_buffer, "<{d}-0-1-2-3-4-5-6-7>\n", .{id});
+        if (std.mem.indexOf(u8, text, expected) != null) found += 1;
+    }
+    try std.testing.expectEqual(requests, found);
+}
+
+// Pins the failure path: a request that dies on the wire returns after the
+// prefix was staged, and the staged line must still be terminated — otherwise
+// the caller's stderr diagnostic is written straight into the middle of that
+// stdout line. Exercises the real `sendRequestOn` with an at-EOF reader, which
+// is what a peer that vanished mid-exchange looks like (see `expectError`).
+test "a request that fails on the wire still emits a complete line" {
+    const alloc = std.testing.allocator;
+    var data = try kmsdata.parse(alloc, @embedFile("vlmcsd.kmd"));
+    defer data.deinit(alloc);
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var unused_out: [64]u8 = undefined;
+    var unused_err: [64]u8 = undefined;
+    var output = Output.init(io, &unused_out, &unused_err);
+    var sink_buffer: [1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buffer);
+    output.test_out = &sink;
+
+    const opts = ClientOptions{};
+    var prng: std.Random.DefaultPrng = .init(0);
+    const base = buildRequestBase(&opts, &data, 0, prng.random(), io);
+
+    // The peer is already gone: the fixed reader is at EOF, and the request
+    // goes out into a buffer that goes nowhere.
+    var no_bytes: [0]u8 = .{};
+    var reader: std.Io.Reader = .fixed(&no_bytes);
+    var sent: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&sent);
+    var conn = Conn{
+        .reader = &reader,
+        .writer = &writer,
+        .use_ndr64 = true,
+        // No socket behind these buffers, so the timeout stays off.
+        .idle = .{},
+    };
+
+    try std.testing.expectError(error.EndOfStream, sendRequestOn(
+        alloc,
+        &conn,
+        base,
+        prng.random(),
+        &output,
+        &data,
+        false,
+    ));
+
+    try std.testing.expectEqualStrings("Sending activation request (KMS V6) \n", sink.buffered());
+}
+
+// A peer that completes the TCP handshake and then says nothing is the failure
+// mode `--timeout` exists for: without the poll, the client blocks in `read(2)`
+// forever. Uses the real `clientBind` against a listening socket nobody
+// accepts from, so the timeout is exercised on the actual packet read.
+test "--timeout bounds a peer that never answers" {
+    const alloc = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Port 0 → the kernel picks a free port, reported back in `socket.address`.
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try Io.net.IpAddress.listen(&addr, io, .{ .mode = .stream });
+    defer server.deinit(io);
+
+    const stream = try Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = stream.reader(io, &rbuf);
+    var writer = stream.writer(io, &wbuf);
+    var call_id: u32 = 2;
+
+    // One second is the smallest `--timeout` (seconds are the unit), so this
+    // test is as fast as the option itself allows.
+    try std.testing.expectError(error.Timeout, network.clientBind(
+        alloc,
+        &reader.interface,
+        &writer.interface,
+        &call_id,
+        .{ .use_ndr64 = false, .idle = .{ .seconds = 1, .socket_fd = stream.socket.handle } },
+    ));
 }

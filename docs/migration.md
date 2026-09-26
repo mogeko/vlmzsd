@@ -231,8 +231,14 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
   (the pool spawns a thread only when every thread is busy, and reuses it afterwards); `--max-clients`
   is a counting `Io.Semaphore` gate in front of the dispatch. There is no `detach()` — the group owns
   the tasks, and shutdown joins them with `Io.Group.cancel`.
-- **Timeout**: `std.posix.poll` (replacing C's `SO_RCVTIMEO`; checks `reader.bufferedLen()` before polling to
-  avoid the buffered-reader read-ahead pitfall).
+- **Timeout**: `std.posix.poll` (replacing C's `SO_RCVTIMEO`). The poll runs before every *refill* of
+  the buffered reader (`network.readAll`), not once per packet: `readSliceAll` loops until the buffer is
+  full, so a peer that sends half a packet and then stalls would block past the deadline — and split
+  packets are the norm, since `writePacket` writes the header and the body separately. Bytes already
+  buffered are consumed without polling (the read-ahead pitfall). The server loop and the client
+  (`vlmzs --timeout`) share the same `IdleTimeout`. The client has **no connect deadline**:
+  `std.Io.Threaded` in 0.16 still panics on `ConnectOptions.timeout` ("TODO implement"), so an
+  unreachable host is bounded only by the kernel's SYN timeout.
 - Client: DNS via `Io.net.HostName.lookup` (with address-family filtering); default host `::1` (IPv6) or `127.0.0.1`;
   `--grace` default `43200` minutes written to `BindingExpiration`.
 
