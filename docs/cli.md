@@ -183,4 +183,13 @@ is absent when both counters are zero. The queue size is not configurable.
 | `--no-multiplexed` | | on | disable multiplexed RPC |
 | `--no-ndr64` | | on | disable NDR64 transfer syntax |
 | `--no-btfn` | | on | disable bind-time feature negotiation |
+| `--timeout <dur>` | | `30s` | idle timeout; `0` disables |
 | `--verbose` | `-v` | off | verbosity |
+
+`--timeout` applies to the BIND reply and to every RESPONSE read: the client
+polls the socket for readability before each packet read and fails with
+`error.Timeout` rather than blocking forever on a peer that accepted the
+connection and then went silent. It does **not** bound `connect` — Zig 0.16's
+`std.Io.Threaded` backend still panics on `ConnectOptions.timeout` ("TODO
+implement"), so an unreachable host is bounded only by the kernel's own SYN
+timeout.

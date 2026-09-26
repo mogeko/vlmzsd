@@ -19,6 +19,9 @@ const git_hash = build_options.git_hash;
 const build_date = build_options.build_date;
 const default_port: u16 = 1688;
 const default_grace_minutes: u32 = 43200;
+/// Idle timeout for the BIND reply and every RESPONSE read, mirroring the
+/// server's `--timeout` default.
+const default_timeout_seconds: u32 = 30;
 /// Embedded default `.kmd` data, unless built with `-Dno-embedded-data`
 /// (then `--data <file>` is required at runtime).
 const embedded_kmd: []const u8 = if (build_options.embedded_data) @embedFile("vlmcsd.kmd") else &.{};
@@ -250,6 +253,7 @@ const vlmzs_opts = [_]cli_helper.Opt{
     .{ .name = "address-family", .kind = .int, .hint = "u8", .group = "Request", .desc = "IPv4/IPv6 selection (4/6)" },
     .{ .name = "license-status", .short = 't', .kind = .int, .hint = "u32", .group = "Request", .desc = "LicenseStatus field (0-6, default 1)" },
     .{ .name = "reconnect-per-request", .short = 'T', .group = "Connection", .desc = "Reconnect for each request" },
+    .{ .name = "timeout", .kind = .str, .hint = "dur", .group = "Connection", .desc = "Idle timeout (default 30s, 0 disables)" },
     .{ .name = "no-multiplexed", .group = "Connection", .desc = "Disable multiplexed RPC" },
     .{ .name = "no-ndr64", .group = "Connection", .desc = "Disable NDR64 transfer syntax" },
     .{ .name = "no-btfn", .group = "Connection", .desc = "Disable bind-time feature negotiation" },
@@ -276,6 +280,7 @@ const ClientOptions = struct {
     list_products: bool = false,
     license_status: u32 = 1,
     reconnect_per_request: bool = false,
+    timeout_seconds: u32 = default_timeout_seconds,
     multiplexed: bool = true,
     ndr64: bool = true,
     btfn: bool = true,
@@ -336,6 +341,10 @@ fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
     opts.list_products = res.hasFlag("list-products");
     opts.license_status = if (res.get("license-status")) |s| try std.fmt.parseInt(u32, s, 10) else 1;
     opts.reconnect_per_request = res.hasFlag("reconnect-per-request");
+    opts.timeout_seconds = if (res.get("timeout")) |s|
+        std.math.cast(u32, try cli_helper.parseDurationSeconds(s)) orelse return error.InvalidTimeout
+    else
+        default_timeout_seconds;
     opts.multiplexed = !res.hasFlag("no-multiplexed");
     opts.ndr64 = !res.hasFlag("no-ndr64");
     opts.btfn = !res.hasFlag("no-btfn");
@@ -517,6 +526,22 @@ fn printResponseVerbose(base: *const kms.Response, hwid: ?*const [8]u8, result: 
     out.print("\n", .{});
 }
 
+/// A BIND-completed connection a request is sent over: the buffered streams
+/// (borrowed — they stay in the caller's frame), the transfer syntax the BIND
+/// reply negotiated, the CallId sequence, and the read timeout. The timeout
+/// travels with the connection because it has to poll the very socket the
+/// streams were opened on.
+const Conn = struct {
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    /// Negotiated syntax, which can be narrower than the requested one.
+    use_ndr64: bool,
+    /// Next DCE/RPC CallId; BIND consumed 2.
+    call_id: u32 = 2,
+    /// Applied to the BIND reply and to every RESPONSE read.
+    idle: network.IdleTimeout,
+};
+
 fn sendRequest(
     gpa: Allocator,
     io: Io,
@@ -534,25 +559,33 @@ fn sendRequest(
     var reader = stream.reader(io, &rbuf);
     var writer = stream.writer(io, &wbuf);
 
+    const idle: network.IdleTimeout = .{
+        .seconds = opts.timeout_seconds,
+        .socket_fd = stream.socket.handle,
+    };
     var call_id: u32 = 2;
     const bind = try network.clientBind(gpa, &reader.interface, &writer.interface, &call_id, .{
         .use_ndr64 = opts.ndr64,
         .use_btfn = opts.btfn,
         .multiplexed = opts.multiplexed,
+        .idle = idle,
     });
 
-    const use_ndr64 = if (opts.ndr64 and bind.has_ndr64) true else bind.has_ndr32;
+    var conn = Conn{
+        .reader = &reader.interface,
+        .writer = &writer.interface,
+        .use_ndr64 = if (opts.ndr64 and bind.has_ndr64) true else bind.has_ndr32,
+        .call_id = call_id,
+        .idle = idle,
+    };
 
-    try sendRequestOn(gpa, &reader.interface, &writer.interface, &call_id, use_ndr64, base, rng, out, data, opts.verbose);
+    try sendRequestOn(gpa, &conn, base, rng, out, data, opts.verbose);
 }
 
 /// Send one KMS request over an already-established connection (BIND done).
 fn sendRequestOn(
     gpa: Allocator,
-    reader: *std.Io.Reader,
-    writer: *std.Io.Writer,
-    call_id: *u32,
-    use_ndr64: bool,
+    conn: *Conn,
     base: kms.Request,
     rng: std.Random,
     out: *Output,
@@ -577,7 +610,7 @@ fn sendRequestOn(
     if (proto == 4) {
         var req: kms.RequestV4 = undefined;
         kms.createRequestV4(&req, &base);
-        const sent = try network.clientSendRequest(gpa, reader, writer, call_id, std.mem.asBytes(&req), use_ndr64);
+        const sent = try network.clientSendRequest(gpa, conn.reader, conn.writer, &conn.call_id, std.mem.asBytes(&req), conn.use_ndr64, conn.idle);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
             printRejection(sent.status, &report);
@@ -593,7 +626,7 @@ fn sendRequestOn(
     } else {
         var req: kms.RequestV6 = undefined;
         kms.createRequestV6(&req, &base, rng);
-        const sent = try network.clientSendRequest(gpa, reader, writer, call_id, std.mem.asBytes(&req), use_ndr64);
+        const sent = try network.clientSendRequest(gpa, conn.reader, conn.writer, &conn.call_id, std.mem.asBytes(&req), conn.use_ndr64, conn.idle);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
             printRejection(sent.status, &report);
@@ -646,19 +679,30 @@ fn sendRequestsReused(
     var reader = stream.reader(io, &rbuf);
     var writer = stream.writer(io, &wbuf);
 
+    const idle: network.IdleTimeout = .{
+        .seconds = opts.timeout_seconds,
+        .socket_fd = stream.socket.handle,
+    };
     var call_id: u32 = 2;
     const bind = try network.clientBind(gpa, &reader.interface, &writer.interface, &call_id, .{
         .use_ndr64 = opts.ndr64,
         .use_btfn = opts.btfn,
         .multiplexed = opts.multiplexed,
+        .idle = idle,
     });
 
-    const use_ndr64 = if (opts.ndr64 and bind.has_ndr64) true else bind.has_ndr32;
+    var conn = Conn{
+        .reader = &reader.interface,
+        .writer = &writer.interface,
+        .use_ndr64 = if (opts.ndr64 and bind.has_ndr64) true else bind.has_ndr32,
+        .call_id = call_id,
+        .idle = idle,
+    };
 
     var i: usize = 0;
     while (i < opts.count) : (i += 1) {
         const base = buildRequestBase(opts, data, sku_index, rng, io);
-        try sendRequestOn(gpa, &reader.interface, &writer.interface, &call_id, use_ndr64, base, rng, out, data, opts.verbose);
+        try sendRequestOn(gpa, &conn, base, rng, out, data, opts.verbose);
     }
 }
 
@@ -937,14 +981,17 @@ test "a request that fails on the wire still emits a complete line" {
     var reader: std.Io.Reader = .fixed(&no_bytes);
     var sent: [4096]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&sent);
-    var call_id: u32 = 2;
+    var conn = Conn{
+        .reader = &reader,
+        .writer = &writer,
+        .use_ndr64 = true,
+        // No socket behind these buffers, so the timeout stays off.
+        .idle = .{},
+    };
 
     try std.testing.expectError(error.EndOfStream, sendRequestOn(
         alloc,
-        &reader,
-        &writer,
-        &call_id,
-        true,
+        &conn,
         base,
         prng.random(),
         &output,
@@ -953,4 +1000,40 @@ test "a request that fails on the wire still emits a complete line" {
     ));
 
     try std.testing.expectEqualStrings("Sending activation request (KMS V6) \n", sink.buffered());
+}
+
+// A peer that completes the TCP handshake and then says nothing is the failure
+// mode `--timeout` exists for: without the poll, the client blocks in `read(2)`
+// forever. Uses the real `clientBind` against a listening socket nobody
+// accepts from, so the timeout is exercised on the actual packet read.
+test "--timeout bounds a peer that never answers" {
+    const alloc = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Port 0 → the kernel picks a free port, reported back in `socket.address`.
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try Io.net.IpAddress.listen(&addr, io, .{ .mode = .stream });
+    defer server.deinit(io);
+
+    const stream = try Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var reader = stream.reader(io, &rbuf);
+    var writer = stream.writer(io, &wbuf);
+    var call_id: u32 = 2;
+
+    // One second is the smallest `--timeout` (seconds are the unit), so this
+    // test is as fast as the option itself allows.
+    try std.testing.expectError(error.Timeout, network.clientBind(
+        alloc,
+        &reader.interface,
+        &writer.interface,
+        &call_id,
+        .{ .use_ndr64 = false, .idle = .{ .seconds = 1, .socket_fd = stream.socket.handle } },
+    ));
 }
