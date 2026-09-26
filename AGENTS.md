@@ -22,7 +22,8 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
 
 - `zig build` — build both binaries into `zig-out/`
 - `zig build run -- <args>` — build and run `vlmzsd`
-- `zig build test` — run unit tests (module + both executables)
+- `zig build test` — run unit tests (the module, both executables, `kmdconv`, and the internal
+  `network` / `cli_helper` / `line_queue` roots)
 - `build.zig` is the only build entrypoint — never add `make`/`gmake` targets.
 
 ## Architecture
@@ -37,6 +38,7 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
 | Server | `src/main.zig` | `vlmzsd` CLI + accept loop + `Io.Group` task dispatch onto the `std.Io.Threaded` pool |
 | Client | `src/vlmzs.zig` | `vlmzs` activation client |
 | Shared | `src/cli_helper.zig` | data-driven CLI parser (Opt table → parse/help/validate), value parsers (duration/bool/GUID), timestamped logger |
+| Log queue | `src/line_queue.zig` | bounded, lossy MPSC FIFO for log lines (preallocated, internal) |
 | Tests | `src/testutil.zig` | byte-compare / hex-diff helpers |
 
 ## Wire compatibility (core invariant)
@@ -62,7 +64,12 @@ source linked above).
 - CLI: two binaries, no config file — `docs/cli.md` is the authoritative spec. Three-tier
   precedence `default < VLMZSD_*/env < CLI`.
 - Logging: fixed format with a UTC timestamp; `debug`/`info` → stdout, `warn`/`err` → stderr.
-  `--verbose` enables `debug`, `--quiet` drops `info` (see `docs/cli.md`).
+  `--verbose` enables `debug`, `--quiet` drops `info` (see `docs/cli.md`). Lines are handed to a
+  bounded, **lossy** queue (`src/line_queue.zig`) and written by a dedicated writer task; a full
+  queue drops the line (counted, reported at shutdown) instead of blocking a worker. Shutdown order
+  is `conn_group.cancel` → `log.shutdown` → `log_group.cancel` → `log.deinit`, so lines logged while
+  connections stop are still flushed. On a fatal startup path use `fatal(...)` — `std.process.exit`
+  skips the `defer`s that would drain the queue.
 - Tests: byte-level round-trips and golden hex vectors (hard-coded in `src/crypto.zig`).
 - Concurrency: one `std.Io.Group` for the process lifetime; each accepted connection is one
   `Group.concurrent` task on the `std.Io.Threaded` pool (threads are spawned on demand and reused,
@@ -96,3 +103,7 @@ source linked above).
   without SVE (e.g. Apple Silicon). The `Dockerfile` pins `-Dcpu=baseline` for portability.
 - The `zig-fmt` (PostToolUse) and `zig-build-test` (Stop) hooks auto-format and run tests; keep
   `.zig` files formatted and tests green.
+- **Never write to the real stdout/stderr from a test.** `zig build test` runs each test binary with
+  `--listen=-`, where stdout carries the runner's protocol: a stray write to fd 1 corrupts it and
+  deadlocks the build. A standalone `zig test <file>` stays green (human mode), so it looks like a
+  deadlock in the code under test. Inject a sink instead — see `Logger.direct_out`/`direct_err`.

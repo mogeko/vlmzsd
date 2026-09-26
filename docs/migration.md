@@ -218,7 +218,14 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 
 - **CLI redesign** (`docs/cli.md`): no config file; three-tier precedence `default < VLMZSD_*/env < CLI`;
   data-driven `Opt`-table parsing (`src/cli_helper.zig`, std-only); fixed-format stdout logging
-  (`Logger` guarded by `Io.Mutex`; the KMS client lists use `std.atomic.Mutex`).
+  (the KMS client lists use `std.atomic.Mutex`).
+- **Logging**: the format, levels and switches are unchanged, but delivery is asynchronous.
+  `Logger.emit` formats on the calling thread and pushes into a bounded, preallocated, **lossy** FIFO
+  (`src/line_queue.zig`, 1024 × 256 B); a dedicated writer task (`log_group`) owns the blocking
+  `write`/`flush`, so a slow consumer can no longer stall a worker — the queue drops the line instead
+  and reports the `dropped`/`truncated` counts at shutdown. The queue is closed and drained after the
+  connection tasks are joined and before the writer group is canceled; a fatal startup path drains it
+  explicitly (`fatal`), because `std.process.exit` skips the `defer`s.
 - **Concurrency**: the `std.Io.Threaded` thread pool (provided by `std.process.Init`), not hand-rolled
   `std.Thread.spawn`. Each accepted connection is dispatched as one task with `Io.Group.concurrent`
   (the pool spawns a thread only when every thread is busy, and reuses it afterwards); `--max-clients`
