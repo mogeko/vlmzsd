@@ -23,6 +23,11 @@ const default_grace_minutes: u32 = 43200;
 /// (then `--data <file>` is required at runtime).
 const embedded_kmd: []const u8 = if (build_options.embedded_data) @embedFile("vlmcsd.kmd") else &.{};
 
+/// Bytes staged per request and per stream. The largest report is a `--verbose`
+/// request+response dump (~1.5 KiB), so this leaves more than 2x headroom;
+/// `Report` also has a spill path so that text is never dropped.
+const report_buffer_size = 4096;
+
 /// Bare stdout/stderr writers for the client. The client is a CLI debugging
 /// tool, not a service: its answer (ePID) and `--verbose` protocol dumps go to
 /// stdout, errors go to stderr — no timestamp, no level, matching the C
@@ -32,9 +37,15 @@ const Output = struct {
     io: Io,
     out: std.Io.File.Writer,
     err: std.Io.File.Writer,
-    /// Guards concurrent `print`/`eprint` calls (the client dispatches
-    /// `--reconnect-per-request` tasks in parallel onto the thread pool).
+    /// Guards every write: each `print`/`eprint`, and each whole `writeBlock`
+    /// (one request's staged report), is written under this lock.
     mutex: Io.Mutex = .init,
+    /// Test seam: when set, output goes here instead of the process
+    /// descriptors. `zig build test` runs this binary with `--listen=-`, where
+    /// stdout carries the runner's protocol, so a test must never write to the
+    /// real stdout (see AGENTS.md → Pitfalls).
+    test_out: ?*std.Io.Writer = null,
+    test_err: ?*std.Io.Writer = null,
 
     fn init(io: Io, out_buf: []u8, err_buf: []u8) Output {
         return .{
@@ -44,20 +55,115 @@ const Output = struct {
         };
     }
 
+    fn outWriter(self: *Output) *std.Io.Writer {
+        return self.test_out orelse &self.out.interface;
+    }
+
+    fn errWriter(self: *Output) *std.Io.Writer {
+        return self.test_err orelse &self.err.interface;
+    }
+
     /// Write to stdout and flush (the answer/progress stream).
     fn print(self: *Output, comptime fmt: []const u8, args: anytype) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.out.interface.print(fmt, args) catch {};
-        self.out.interface.flush() catch {};
+        const writer = self.outWriter();
+        writer.print(fmt, args) catch {};
+        writer.flush() catch {};
     }
 
     /// Write to stderr and flush (the error stream).
     fn eprint(self: *Output, comptime fmt: []const u8, args: anytype) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.err.interface.print(fmt, args) catch {};
-        self.err.interface.flush() catch {};
+        const writer = self.errWriter();
+        writer.print(fmt, args) catch {};
+        writer.flush() catch {};
+    }
+
+    /// Write one request's staged report under a single lock acquisition, so
+    /// parallel `--reconnect-per-request` tasks cannot interleave inside a
+    /// report. Empty streams are skipped.
+    fn writeBlock(self: *Output, out_bytes: []const u8, err_bytes: []const u8) void {
+        if (out_bytes.len == 0 and err_bytes.len == 0) return;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (out_bytes.len > 0) {
+            const writer = self.outWriter();
+            writer.writeAll(out_bytes) catch {};
+            writer.flush() catch {};
+        }
+        if (err_bytes.len > 0) {
+            const writer = self.errWriter();
+            writer.writeAll(err_bytes) catch {};
+            writer.flush() catch {};
+        }
+    }
+};
+
+/// One request's staged output. A request emits many fragments — a `--verbose`
+/// request+response dump is ~25 lines — and they are *mid-line* fragments: the
+/// `Sending activation request` prefix has no newline of its own. Writing them
+/// straight to `Output` makes every fragment a separate lock acquisition, so
+/// parallel tasks splice each other's lines. Staging the whole report and
+/// writing it once keeps one request atomic.
+///
+/// The report-printing helpers below take this as `out` (same `print`/`eprint`
+/// methods as `Output`, but staged); everything outside a request keeps writing
+/// straight to `Output`.
+const Report = struct {
+    output: *Output,
+    out: std.Io.Writer,
+    err: std.Io.Writer,
+    /// Kept so the spill path can re-arm the writers. The buffers live in the
+    /// caller's frame: `init` returns by value, so embedding them here would
+    /// leave the writers pointing into the struct that was just moved.
+    out_buffer: []u8,
+    err_buffer: []u8,
+
+    fn init(output: *Output, out_buffer: []u8, err_buffer: []u8) Report {
+        return .{
+            .output = output,
+            .out = .fixed(out_buffer),
+            .err = .fixed(err_buffer),
+            .out_buffer = out_buffer,
+            .err_buffer = err_buffer,
+        };
+    }
+
+    fn print(self: *Report, comptime fmt: []const u8, args: anytype) void {
+        self.out.print(fmt, args) catch self.spillOut(fmt, args);
+    }
+
+    fn eprint(self: *Report, comptime fmt: []const u8, args: anytype) void {
+        self.err.print(fmt, args) catch self.spillErr(fmt, args);
+    }
+
+    /// Terminate a half-written report. A request that fails on the wire (peer
+    /// vanished mid-exchange) returns after the `Sending activation request`
+    /// prefix was staged but before the result completed that line; the caller
+    /// then reports the failure on stderr, which would visually continue the
+    /// unterminated stdout line. Called from the `errdefer` in `sendRequestOn`
+    /// *before* the block is flushed, so even the failure path emits a
+    /// complete line.
+    fn endLine(self: *Report) void {
+        if (self.out.buffered().len == 0) return;
+        self.print("\n", .{});
+    }
+
+    /// Safety valve for a report larger than `report_buffer_size` (unreachable
+    /// in practice): flush what is staged and continue in a fresh buffer. The
+    /// chunk boundary may interleave with another task, but no text is dropped.
+    fn spillOut(self: *Report, comptime fmt: []const u8, args: anytype) void {
+        self.output.writeBlock(self.out.buffered(), &.{});
+        self.out = .fixed(self.out_buffer);
+        self.out.print(fmt, args) catch {};
+    }
+
+    fn spillErr(self: *Report, comptime fmt: []const u8, args: anytype) void {
+        self.output.writeBlock(&.{}, self.err.buffered());
+        self.err = .fixed(self.err_buffer);
+        self.err.print(fmt, args) catch {};
     }
 };
 
@@ -315,7 +421,7 @@ fn ucs2ToAscii(pid: *const [64]u16, out: []u8) []const u8 {
 }
 
 /// Report each failed response-verification check to stderr (C `displayResponse`).
-fn reportVerificationErrors(result: kms.ResponseResult, out: *Output) void {
+fn reportVerificationErrors(result: kms.ResponseResult, out: *Report) void {
     out.print("\n", .{}); // end the in-progress "Sending ..." line on stdout
     if (!result.rpc_ok) out.eprint("ERROR: non-zero RPC result code\n", .{});
     if (!result.decrypt_success) out.eprint("ERROR: decryption of the V5/V6 response failed\n", .{});
@@ -337,7 +443,7 @@ fn reportVerificationErrors(result: kms.ResponseResult, out: *Output) void {
 
 /// Report a server rejection to stderr with a human-readable reason when known
 /// (C `displayRequestError`).
-fn printRejection(status: i32, out: *Output) void {
+fn printRejection(status: i32, out: *Report) void {
     out.print("\n", .{}); // end the in-progress "Sending ..." line on stdout
     const hr: u32 = @bitCast(status);
     if (rejectionReason(hr)) |reason| {
@@ -349,7 +455,7 @@ fn printRejection(status: i32, out: *Output) void {
 
 /// Print the activation answer to stdout (C `displayResponse`, non-verbose).
 /// `hwid` is only present for v5+ responses.
-fn printResultSummary(base: *const kms.Response, hwid: ?*const [8]u8, out: *Output) void {
+fn printResultSummary(base: *const kms.Response, hwid: ?*const [8]u8, out: *Report) void {
     var epid_buf: [64]u8 = undefined;
     const epid = ucs2ToAscii(&base.kms_pid, &epid_buf);
     out.print(" -> {s}", .{epid});
@@ -358,7 +464,7 @@ fn printResultSummary(base: *const kms.Response, hwid: ?*const [8]u8, out: *Outp
 }
 
 /// One aligned GUID line with the product name when the GUID is in `list`.
-fn printGuidLine(out: *Output, label: []const u8, guid: *const kms.Guid, list: []const kmsdata.VlmcsdData, buf: []u8) void {
+fn printGuidLine(out: *Report, label: []const u8, guid: *const kms.Guid, list: []const kmsdata.VlmcsdData, buf: []u8) void {
     if (kms.getProductIndex(guid, list)) |idx| {
         out.print("{s:<32}: {s} ({s})\n", .{ label, formatGuid(guid, buf), list[idx].name });
     } else {
@@ -367,7 +473,7 @@ fn printGuidLine(out: *Output, label: []const u8, guid: *const kms.Guid, list: [
 }
 
 /// Verbose per-field request dump (C `logRequestVerbose`).
-fn printRequestVerbose(req: *const kms.Request, data: *const kmsdata.KmsData, out: *Output) void {
+fn printRequestVerbose(req: *const kms.Request, data: *const kmsdata.KmsData, out: *Report) void {
     const major: u16 = @truncate(req.version >> 16);
     const minor: u16 = @truncate(req.version);
     var guid_buf: [64]u8 = undefined;
@@ -391,7 +497,7 @@ fn printRequestVerbose(req: *const kms.Request, data: *const kmsdata.KmsData, ou
 }
 
 /// Verbose per-field response dump (C `logResponseVerbose`).
-fn printResponseVerbose(base: *const kms.Response, hwid: ?*const [8]u8, result: kms.ResponseResult, out: *Output) void {
+fn printResponseVerbose(base: *const kms.Response, hwid: ?*const [8]u8, result: kms.ResponseResult, out: *Report) void {
     const major: u16 = @truncate(base.version >> 16);
     const minor: u16 = @truncate(base.version);
     var epid_buf: [64]u8 = undefined;
@@ -453,9 +559,20 @@ fn sendRequestOn(
     data: *const kmsdata.KmsData,
     verbose: bool,
 ) !void {
+    // One request = one lock acquisition: stage the report here and flush it on
+    // every exit path, including the early rejection/verification returns.
+    var report_out_buffer: [report_buffer_size]u8 = undefined;
+    var report_err_buffer: [report_buffer_size]u8 = undefined;
+    var report = Report.init(out, &report_out_buffer, &report_err_buffer);
+    defer out.writeBlock(report.out.buffered(), report.err.buffered());
+    // A network failure below returns with the request prefix still unline-
+    // terminated; close the line before the flush above, so the caller's
+    // stderr diagnostic does not continue it.
+    errdefer report.endLine();
+
     const proto: u16 = @intCast(base.version >> 16);
-    if (verbose) printRequestVerbose(&base, data, out);
-    out.print("Sending activation request (KMS V{d}) ", .{proto});
+    if (verbose) printRequestVerbose(&base, data, &report);
+    report.print("Sending activation request (KMS V{d}) ", .{proto});
 
     if (proto == 4) {
         var req: kms.RequestV4 = undefined;
@@ -463,32 +580,32 @@ fn sendRequestOn(
         const sent = try network.clientSendRequest(gpa, reader, writer, call_id, std.mem.asBytes(&req), use_ndr64);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
-            printRejection(sent.status, out);
+            printRejection(sent.status, &report);
             return;
         }
         var resp: kms.ResponseV4 = undefined;
         const result = kms.decryptResponseV4(&resp, sent.data.len, sent.data, &req);
         if (!result.ok()) {
-            reportVerificationErrors(result, out);
+            reportVerificationErrors(result, &report);
             return;
         }
-        if (verbose) printResponseVerbose(&resp.base, null, result, out) else printResultSummary(&resp.base, null, out);
+        if (verbose) printResponseVerbose(&resp.base, null, result, &report) else printResultSummary(&resp.base, null, &report);
     } else {
         var req: kms.RequestV6 = undefined;
         kms.createRequestV6(&req, &base, rng);
         const sent = try network.clientSendRequest(gpa, reader, writer, call_id, std.mem.asBytes(&req), use_ndr64);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
-            printRejection(sent.status, out);
+            printRejection(sent.status, &report);
             return;
         }
         var resp: kms.ResponseV6 = undefined;
         const result = kms.decryptResponseV6(&resp, sent.data.len, sent.data, &req, null);
         if (!result.ok()) {
-            reportVerificationErrors(result, out);
+            reportVerificationErrors(result, &report);
             return;
         }
-        if (verbose) printResponseVerbose(&resp.base, &resp.hwid, result, out) else printResultSummary(&resp.base, &resp.hwid, out);
+        if (verbose) printResponseVerbose(&resp.base, &resp.hwid, result, &report) else printResultSummary(&resp.base, &resp.hwid, &report);
     }
 }
 
@@ -703,4 +820,137 @@ test "buildRequestBase binding expiration" {
     opts_custom.grace = 60;
     const base_custom = buildRequestBase(&opts_custom, &data, 0, rng, io);
     try std.testing.expectEqual(@as(u32, 60), base_custom.binding_expiration);
+}
+
+// The client's output staging is pinned here: one request must reach the sink as
+// one contiguous block, because its fragments are mid-line (the "Sending
+// activation request" prefix has no newline) and `--reconnect-per-request` runs
+// requests in parallel. The sink is injectable for the same reason the server's
+// logger is: `zig build test` runs this binary with `--listen=-`, so a test must
+// never write to the real stdout (see AGENTS.md → Pitfalls).
+test "a staged report reaches the sink as one block" {
+    const io = std.testing.io;
+    var unused_out: [64]u8 = undefined;
+    var unused_err: [64]u8 = undefined;
+    var output = Output.init(io, &unused_out, &unused_err);
+    var sink_buffer: [256]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buffer);
+    output.test_out = &sink;
+    var err_sink_buffer: [256]u8 = undefined;
+    var err_sink: std.Io.Writer = .fixed(&err_sink_buffer);
+    output.test_err = &err_sink;
+
+    var report_out_buffer: [report_buffer_size]u8 = undefined;
+    var report_err_buffer: [report_buffer_size]u8 = undefined;
+    var report = Report.init(&output, &report_out_buffer, &report_err_buffer);
+    report.print("BEGIN ", .{});
+    report.print("middle ", .{});
+    report.eprint("to-stderr\n", .{});
+    report.print("END\n", .{});
+    output.writeBlock(report.out.buffered(), report.err.buffered());
+
+    try std.testing.expectEqualStrings("BEGIN middle END\n", sink.buffered());
+    try std.testing.expectEqualStrings("to-stderr\n", err_sink.buffered());
+}
+
+test "concurrent requests do not interleave inside a report" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var unused_out: [64]u8 = undefined;
+    var unused_err: [64]u8 = undefined;
+    var output = Output.init(io, &unused_out, &unused_err);
+    var sink_buffer: [64 * 1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buffer);
+    output.test_out = &sink;
+
+    const requests = 8;
+    const Task = struct {
+        output: *Output,
+        id: usize,
+
+        fn run(self: *@This()) void {
+            var report_out_buffer: [report_buffer_size]u8 = undefined;
+            var report_err_buffer: [report_buffer_size]u8 = undefined;
+            var report = Report.init(self.output, &report_out_buffer, &report_err_buffer);
+            report.print("<{d}", .{self.id});
+            var i: usize = 0;
+            while (i < 8) : (i += 1) report.print("-{d}", .{i});
+            report.print(">\n", .{});
+            self.output.writeBlock(report.out.buffered(), report.err.buffered());
+        }
+    };
+
+    var group: Io.Group = .init;
+    var tasks: [requests]Task = undefined;
+    for (&tasks, 0..) |*task, id| {
+        task.* = .{ .output = &output, .id = id };
+        try group.concurrent(io, Task.run, .{task});
+    }
+    try group.await(io);
+
+    // Each report must appear as one uninterrupted block: before staging, the
+    // fragments of these parallel requests were spliced together.
+    const text = sink.buffered();
+    var found: usize = 0;
+    var id: usize = 0;
+    while (id < requests) : (id += 1) {
+        var expected_buffer: [64]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_buffer, "<{d}-0-1-2-3-4-5-6-7>\n", .{id});
+        if (std.mem.indexOf(u8, text, expected) != null) found += 1;
+    }
+    try std.testing.expectEqual(requests, found);
+}
+
+// Pins the failure path: a request that dies on the wire returns after the
+// prefix was staged, and the staged line must still be terminated — otherwise
+// the caller's stderr diagnostic is written straight into the middle of that
+// stdout line. Exercises the real `sendRequestOn` with an at-EOF reader, which
+// is what a peer that vanished mid-exchange looks like (see `expectError`).
+test "a request that fails on the wire still emits a complete line" {
+    const alloc = std.testing.allocator;
+    var data = try kmsdata.parse(alloc, @embedFile("vlmcsd.kmd"));
+    defer data.deinit(alloc);
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var unused_out: [64]u8 = undefined;
+    var unused_err: [64]u8 = undefined;
+    var output = Output.init(io, &unused_out, &unused_err);
+    var sink_buffer: [1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buffer);
+    output.test_out = &sink;
+
+    const opts = ClientOptions{};
+    var prng: std.Random.DefaultPrng = .init(0);
+    const base = buildRequestBase(&opts, &data, 0, prng.random(), io);
+
+    // The peer is already gone: the fixed reader is at EOF, and the request
+    // goes out into a buffer that goes nowhere.
+    var no_bytes: [0]u8 = .{};
+    var reader: std.Io.Reader = .fixed(&no_bytes);
+    var sent: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&sent);
+    var call_id: u32 = 2;
+
+    try std.testing.expectError(error.EndOfStream, sendRequestOn(
+        alloc,
+        &reader,
+        &writer,
+        &call_id,
+        true,
+        base,
+        prng.random(),
+        &output,
+        &data,
+        false,
+    ));
+
+    try std.testing.expectEqualStrings("Sending activation request (KMS V6) \n", sink.buffered());
 }
