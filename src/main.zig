@@ -390,10 +390,9 @@ fn handleShutdown(sig: std.posix.SIG) callconv(.c) void {
 
 /// Create the self-pipe and install handlers so Ctrl-C / `docker stop` shut the
 /// server down cleanly.
-fn installSignalHandlers(log: *cli_helper.Logger) void {
+fn installSignalHandlers(io: Io, log: *cli_helper.Logger) void {
     if (std.c.pipe(&shutdown_pipe) != 0) {
-        log.err("failed to create shutdown pipe", .{});
-        std.process.exit(1);
+        fatal(log, io, "failed to create shutdown pipe", .{});
     }
     // Make the write end non-blocking so the handler never blocks when the
     // pipe is full (it only writes one byte, but correctness first). The
@@ -402,8 +401,7 @@ fn installSignalHandlers(log: *cli_helper.Logger) void {
     const nonblock_mask: i32 = @as(i32, 1) << @intCast(@bitOffsetOf(std.posix.O, "NONBLOCK"));
     const flags = std.c.fcntl(shutdown_pipe[1], std.c.F.GETFL, @as(i32, 0));
     if (flags < 0 or std.c.fcntl(shutdown_pipe[1], std.c.F.SETFL, flags | nonblock_mask) < 0) {
-        log.err("failed to make shutdown pipe non-blocking", .{});
-        std.process.exit(1);
+        fatal(log, io, "failed to make shutdown pipe non-blocking", .{});
     }
 
     const act = std.posix.Sigaction{
@@ -445,22 +443,19 @@ fn createListenSockets(
                 // host has no IPv6 stack; retry on IPv4 only.
                 if (std.mem.eql(u8, addr, "::") and e == error.AddressFamilyUnsupported) {
                     const s4 = network.listen(io, "0.0.0.0", opts.port) catch |e4| {
-                        log.err("failed to listen on 0.0.0.0:{d}: {s}", .{ opts.port, @errorName(e4) });
-                        std.process.exit(1);
+                        fatal(log, io, "failed to listen on 0.0.0.0:{d}: {s}", .{ opts.port, @errorName(e4) });
                     };
                     try servers.append(gpa, s4);
                     continue;
                 }
-                log.err("failed to listen on {s}:{d}: {s}", .{ addr, opts.port, @errorName(e) });
-                std.process.exit(1);
+                fatal(log, io, "failed to listen on {s}:{d}: {s}", .{ addr, opts.port, @errorName(e) });
             };
             try servers.append(gpa, s);
         }
     }
 
     if (servers.items.len == 0) {
-        log.err("could not listen on any socket", .{});
-        std.process.exit(1);
+        fatal(log, io, "could not listen on any socket", .{});
     }
 }
 
@@ -474,7 +469,7 @@ const ServerContext = struct {
     cfg: *const kms.ServerConfig,
     servers: []Io.net.Server,
     sem: *Io.Semaphore,
-    group: *Io.Group,
+    conn_group: *Io.Group,
     port_str: []const u8,
     prng: std.Random,
 
@@ -546,7 +541,7 @@ const ServerContext = struct {
                     .quiet_loopback = self.opts.quiet_loopback,
                 };
 
-                self.group.concurrent(self.io, serveClientThread, .{ctx}) catch |e| {
+                self.conn_group.concurrent(self.io, serveClientThread, .{ctx}) catch |e| {
                     ctx.stream.close(self.io);
                     if (sem_active) self.sem.post(self.io);
                     self.gpa.destroy(ctx);
@@ -557,6 +552,15 @@ const ServerContext = struct {
         }
     }
 };
+
+/// Report a fatal startup error and exit. `std.process.exit` skips the deferred
+/// cleanup, so the log queue is drained explicitly — otherwise the message the
+/// operator needs would still be sitting in the queue.
+fn fatal(log: *cli_helper.Logger, io: Io, comptime fmt: []const u8, args: anytype) noreturn {
+    log.err(fmt, args);
+    log.shutdown(io);
+    std.process.exit(1);
+}
 
 pub fn main(init: std.process.Init) !void {
     // Collect the raw arguments (skip argv[0]).
@@ -595,11 +599,24 @@ pub fn main(init: std.process.Init) !void {
 
     var out_buf: [4096]u8 = undefined;
     var err_buf: [4096]u8 = undefined;
-    var log: cli_helper.Logger = .init(init.io, &out_buf, &err_buf);
+    var log: cli_helper.Logger = try cli_helper.Logger.init(init.gpa, init.io, &out_buf, &err_buf);
+    defer log.deinit(init.gpa);
+
+    // Start the log writer before anything can log: `fatal` drains the queue on
+    // the way out, and a queue with no consumer would block that drain. The
+    // separate group lets shutdown drain it *after* the connection tasks have
+    // stopped, so lines they logged on the way out still reach the sink.
+    var log_group: Io.Group = .init;
+    defer log_group.cancel(init.io);
+    defer log.shutdown(init.io);
+    log_group.concurrent(init.io, cli_helper.Logger.writerLoop, .{&log}) catch |e| {
+        // Degraded mode: the pool refused the task, so log synchronously.
+        log.direct = true;
+        log.warn("failed to start log writer task: {s}; logging synchronously", .{@errorName(e)});
+    };
 
     var opts = resolveOptions(init.gpa, init.environ_map, &res) catch |e| {
-        log.err("invalid configuration: {s}", .{@errorName(e)});
-        std.process.exit(1);
+        fatal(&log, init.io, "invalid configuration: {s}", .{@errorName(e)});
     };
     defer opts.deinit(init.gpa);
     log.min_level = if (opts.quiet) .warn else if (opts.verbose) .debug else .info;
@@ -616,15 +633,13 @@ pub fn main(init: std.process.Init) !void {
     };
     if (opts.data_file) |path| {
         kmd_raw = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, path, init.gpa, .unlimited) catch |e| {
-            log.err("failed to read data file {s}: {s}", .{ path, @errorName(e) });
-            std.process.exit(1);
+            fatal(&log, init.io, "failed to read data file {s}: {s}", .{ path, @errorName(e) });
         };
         kmd_owned = true;
         loaded_from = path;
     } else {
         fhs_loaded = cli_helper.loadFhsKmd(init.io, init.gpa, init.minimal.environ) catch |e| {
-            log.err("failed to read FHS data file: {s}", .{@errorName(e)});
-            std.process.exit(1);
+            fatal(&log, init.io, "failed to read FHS data file: {s}", .{@errorName(e)});
         };
         if (fhs_loaded) |*f| {
             kmd_raw = f.data;
@@ -632,15 +647,13 @@ pub fn main(init: std.process.Init) !void {
         } else if (embedded_kmd.len > 0) {
             kmd_raw = embedded_kmd;
         } else {
-            log.err("no KMS data found; specify --data <file>", .{});
-            std.process.exit(1);
+            fatal(&log, init.io, "no KMS data found; specify --data <file>", .{});
         }
     }
     defer if (kmd_owned) init.gpa.free(@constCast(kmd_raw));
 
     var data = kmsdata.parse(init.gpa, kmd_raw) catch |e| {
-        log.err("invalid KMS data: {s}", .{@errorName(e)});
-        std.process.exit(1);
+        fatal(&log, init.io, "invalid KMS data: {s}", .{@errorName(e)});
     };
     defer data.deinit(init.gpa);
 
@@ -713,24 +726,23 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Concurrency limit: a counting semaphore gates the worker threads
-    // (mirrors the C `MaxTaskSemaphore`). 0 = unlimited.
+    // (mirrors the C `MaxTaskSemaphore`). 0 = unlimited. The log writer task is
+    // accounted separately: it is a service task, not a client.
     const sem_active = opts.max_clients != 0;
     var sem = Io.Semaphore{ .permits = if (sem_active) opts.max_clients else 0 };
 
-    // Long-lived task group: accepted connections are dispatched onto the
-    // `Io.Threaded` pool via `Group.concurrent`. Each task's resources are
-    // released when it returns; the group itself holds a token that is
-    // released by canceling on shutdown, which asks in-flight tasks to stop
-    // and waits for their cleanup to finish.
-    var group: Io.Group = .init;
-    defer group.cancel(init.io);
+    // Long-lived group for the connection tasks. Each task's resources are
+    // released when it returns; canceling the group on shutdown asks in-flight
+    // tasks to stop and waits for their cleanup, which is also what lets the
+    // log queue drain afterwards (see the `log_group` defers above).
+    var conn_group: Io.Group = .init;
+    defer conn_group.cancel(init.io);
 
     if (servers.items.len > max_listen_sockets) {
-        log.err("too many listen sockets (max {d})", .{max_listen_sockets});
-        std.process.exit(1);
+        fatal(&log, init.io, "too many listen sockets (max {d})", .{max_listen_sockets});
     }
 
-    installSignalHandlers(&log);
+    installSignalHandlers(init.io, &log);
     defer {
         _ = std.c.close(shutdown_pipe[0]);
         _ = std.c.close(shutdown_pipe[1]);
@@ -744,7 +756,7 @@ pub fn main(init: std.process.Init) !void {
         .cfg = &cfg,
         .servers = servers.items,
         .sem = &sem,
-        .group = &group,
+        .conn_group = &conn_group,
         .port_str = port_str,
         .prng = rng,
     };

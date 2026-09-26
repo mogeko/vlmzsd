@@ -254,7 +254,8 @@ test "concurrent producers keep per-producer order" {
         const count = queue.popBatch(io, &batch);
         if (count == 0) break;
         for (batch[0..count]) |slot| {
-            const text = std.mem.trimRight(u8, slot.bytes[0..slot.len], "\n");
+            // Every line is newline-terminated, so drop the last byte.
+            const text = slot.bytes[0 .. slot.len - 1];
             var parts = std.mem.splitScalar(u8, text, ':');
             const id = std.fmt.parseInt(usize, parts.next().?, 10) catch unreachable;
             const sequence = std.fmt.parseInt(usize, parts.next().?, 10) catch unreachable;

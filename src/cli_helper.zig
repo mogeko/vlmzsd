@@ -5,6 +5,7 @@
 //! `default < env < CLI` precedence from `docs/cli.md`.
 
 const std = @import("std");
+const line_queue = @import("line_queue.zig");
 
 pub const Io = std.Io;
 
@@ -280,33 +281,96 @@ pub const Level = enum {
 /// Timestamped, leveled logger. `debug`/`info` write to stdout; `warn`/`err`
 /// write to stderr (Unix convention). Every line is prefixed with a UTC
 /// ISO-8601 timestamp. The format is fixed — no CLI surface (see `docs/cli.md`).
+///
+/// A log call is a producer of a lossy FIFO (`line_queue`): it formats the line
+/// on the calling thread, hands it over, and returns without touching the
+/// stdout/stderr descriptors. The blocking `write`/`flush` belongs to a
+/// dedicated writer task (`writerLoop`), so a slow consumer can never stall a
+/// worker. If that task cannot be started, `direct` degrades to writing
+/// synchronously from the calling thread.
 pub const Logger = struct {
     io: Io,
-    out_writer: std.Io.File.Writer,
-    err_writer: std.Io.File.Writer,
-    mutex: Io.Mutex = .init,
-    /// Messages below this level are dropped.
+    /// Messages below this level are dropped. Written once by `main` before any
+    /// producer exists, so producers read it without synchronization.
     min_level: Level = .info,
+    queue: line_queue.LineQueue,
+    /// Backing buffers for the writer's stdout/stderr writers. They are owned by
+    /// the caller so that `init` can return by value: a `File.Writer` stored in
+    /// this struct would point into the temporary that was just moved.
+    out_buffer: []u8,
+    err_buffer: []u8,
+    /// Degraded mode: writers write synchronously (the pre-queue behavior).
+    /// Set once, before any producer thread starts.
+    direct: bool = false,
+    /// Test seam for the degraded path. When set, `writeDirect` writes here
+    /// instead of the process descriptors: `zig build test` runs the test binary
+    /// with `--listen=-`, where stdout carries the runner's protocol, so a test
+    /// must never write to the real stdout. Production leaves these null.
+    direct_out: ?*std.Io.Writer = null,
+    direct_err: ?*std.Io.Writer = null,
+    /// Set by the writer task once every accepted line has been flushed.
+    done: Io.Event = .unset,
+    /// Guards the degraded synchronous path only.
+    direct_mutex: Io.Mutex = .init,
+    /// Lines refused because the queue was full or already closed.
+    dropped: std.atomic.Value(u64) = .init(0),
+    /// Lines shortened to fit a slot (see `emit`).
+    truncated: std.atomic.Value(u64) = .init(0),
 
-    pub fn init(io: Io, out_buffer: []u8, err_buffer: []u8) Logger {
+    /// Slots the writer copies out per lock acquisition.
+    const batch_size = 16;
+
+    pub fn init(gpa: Allocator, io: Io, out_buffer: []u8, err_buffer: []u8) Allocator.Error!Logger {
         return .{
             .io = io,
-            .out_writer = std.Io.File.writer(std.Io.File.stdout(), io, out_buffer),
-            .err_writer = std.Io.File.writer(std.Io.File.stderr(), io, err_buffer),
+            .queue = try line_queue.LineQueue.init(gpa),
+            .out_buffer = out_buffer,
+            .err_buffer = err_buffer,
         };
+    }
+
+    /// Release the queue's slots. Only valid after `shutdown` returned and the
+    /// writer task has been joined (see `main`).
+    pub fn deinit(self: *Logger, gpa: Allocator) void {
+        self.queue.deinit(gpa);
     }
 
     fn emit(self: *Logger, level: Level, comptime fmt: []const u8, args: anytype) void {
         if (@intFromEnum(level) < @intFromEnum(self.min_level)) return;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+
+        // Format on the calling thread so the queue's critical section only has
+        // to copy. The timestamp is taken here, at call time: it records when
+        // the event happened, not when the writer got to it.
+        var line: [line_queue.slot_size]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&line);
+        writeTimestamp(&writer, self.io);
+        writer.writeAll(levelLabel(level)) catch {};
+        var full = false;
+        writer.print(fmt, args) catch {
+            full = true;
+        };
+        if (!full) writer.writeAll("\n") catch {
+            full = true;
+        };
+        var bytes = writer.buffered();
+        if (full) {
+            // A fixed writer only fails when the buffer is full, so the line
+            // holds exactly `slot_size` bytes. Overwrite the last byte with the
+            // newline to keep it a single, greppable line.
+            std.debug.assert(bytes.len == line_queue.slot_size);
+            line[line_queue.slot_size - 1] = '\n';
+            bytes = line[0..];
+            _ = self.truncated.fetchAdd(1, .monotonic);
+        }
+
         const to_err = level == .warn or level == .err;
-        const w: *std.Io.Writer = if (to_err) &self.err_writer.interface else &self.out_writer.interface;
-        writeTimestamp(w, self.io);
-        w.writeAll(levelLabel(level)) catch {};
-        w.print(fmt, args) catch {};
-        w.writeAll("\n") catch {};
-        w.flush() catch {};
+        if (self.direct) {
+            self.writeDirect(bytes, to_err);
+            return;
+        }
+        if (!self.queue.tryPush(self.io, bytes, to_err)) {
+            _ = self.dropped.fetchAdd(1, .monotonic);
+        }
     }
 
     pub fn debug(self: *Logger, comptime fmt: []const u8, args: anytype) void {
@@ -323,6 +387,102 @@ pub const Logger = struct {
 
     pub fn err(self: *Logger, comptime fmt: []const u8, args: anytype) void {
         self.emit(.err, fmt, args);
+    }
+
+    /// Synchronous fallback for `direct` mode: take the lock, write and flush
+    /// from the calling thread, exactly like the pre-queue logger did.
+    fn writeDirect(self: *Logger, bytes: []const u8, to_err: bool) void {
+        self.direct_mutex.lockUncancelable(self.io);
+        defer self.direct_mutex.unlock(self.io);
+        if (if (to_err) self.direct_err else self.direct_out) |writer| {
+            writer.writeAll(bytes) catch {};
+            writer.flush() catch {};
+            return;
+        }
+        const file = if (to_err) std.Io.File.stderr() else std.Io.File.stdout();
+        var file_writer = std.Io.File.writer(file, self.io, if (to_err) self.err_buffer else self.out_buffer);
+        file_writer.interface.writeAll(bytes) catch {};
+        file_writer.interface.flush() catch {};
+    }
+
+    /// Writer task body, dispatched with `Group.concurrent`. Owns the blocking
+    /// I/O for both streams.
+    pub fn writerLoop(self: *Logger) void {
+        std.debug.assert(!self.direct);
+        var out_writer = std.Io.File.writer(std.Io.File.stdout(), self.io, self.out_buffer);
+        var err_writer = std.Io.File.writer(std.Io.File.stderr(), self.io, self.err_buffer);
+        self.runWriter(&out_writer.interface, &err_writer.interface);
+    }
+
+    /// Drain the queue into the two sinks until it is closed and empty, then
+    /// flush and latch `done`. The sinks are parameters so that tests can run
+    /// this on the test thread against memory writers.
+    fn runWriter(self: *Logger, out_writer: *std.Io.Writer, err_writer: *std.Io.Writer) void {
+        var batch: [batch_size]line_queue.Slot = undefined;
+
+        while (true) {
+            // Reset *before* testing for work: a `set` that lands after this
+            // point is either observed by the pop below or stays latched (the
+            // event is sticky), so no wakeup can be lost.
+            self.queue.event.reset();
+            if (self.drainOnce(out_writer, err_writer, &batch) > 0) continue;
+            if (self.queue.isClosed()) break;
+            // `error.Canceled` means shutdown is stopping the writer; the final
+            // drain below still flushes every accepted line.
+            self.queue.waitForWork(self.io) catch break;
+        }
+
+        // Final drain: every line the queue accepted must reach the sink, and a
+        // cancelation request must not cut the flush short.
+        const previous = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(previous);
+        while (self.drainOnce(out_writer, err_writer, &batch) > 0) {}
+        self.writeCounters(err_writer);
+        out_writer.flush() catch {};
+        err_writer.flush() catch {};
+        self.done.set(self.io);
+    }
+
+    /// Pop one batch, write the lines, and flush both streams. Returns how many
+    /// lines were written.
+    fn drainOnce(
+        self: *Logger,
+        out_writer: *std.Io.Writer,
+        err_writer: *std.Io.Writer,
+        batch: []line_queue.Slot,
+    ) usize {
+        const count = self.queue.popBatch(self.io, batch);
+        if (count == 0) return 0;
+        for (batch[0..count]) |slot| {
+            const writer = if (slot.err) err_writer else out_writer;
+            writer.writeAll(slot.bytes[0..slot.len]) catch {};
+        }
+        // One flush per batch keeps the syscall count low; `runWriter` loops
+        // until the queue is empty, so a lone line is still flushed promptly.
+        out_writer.flush() catch {};
+        err_writer.flush() catch {};
+        return count;
+    }
+
+    /// Report lines that never made it into the log. Written by the consumer
+    /// itself: the queue is already closed, so these must not be enqueued.
+    fn writeCounters(self: *Logger, err_writer: *std.Io.Writer) void {
+        const dropped = self.dropped.load(.monotonic);
+        const truncated = self.truncated.load(.monotonic);
+        if (dropped == 0 and truncated == 0) return;
+        writeTimestamp(err_writer, self.io);
+        err_writer.writeAll(levelLabel(.warn)) catch {};
+        err_writer.print("logging: dropped {d} line(s), truncated {d} line(s)\n", .{ dropped, truncated }) catch {};
+        err_writer.flush() catch {};
+    }
+
+    /// Stop accepting lines and block until the writer task has drained and
+    /// flushed everything. Must be called before `Group.cancel` (which would
+    /// cancel the writer) and before `deinit`. Idempotent.
+    pub fn shutdown(self: *Logger, io: Io) void {
+        if (self.direct) return;
+        self.queue.close(io);
+        self.done.waitUncancelable(io);
     }
 };
 
@@ -531,4 +691,152 @@ test "help renders groups" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Connection:") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "--protocol [u16]") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "-v, --verbose") != null);
+}
+
+// The producer/writer split is pinned here: formatting and stream routing, the
+// `min_level` early return, drop/truncate accounting, drain-on-shutdown, and
+// the degraded `direct` path. The writer loop runs on the test thread against
+// memory sinks (they are parameters of `runWriter`), so each case is
+// deterministic; only the real task dispatch is left to `main`.
+//
+// No test may write to the process descriptors: `zig build test` runs the test
+// binary with `--listen=-`, where stdout is the runner's protocol channel, and a
+// stray line deadlocks the build. Hence the injectable `direct_*` sinks.
+test "logger routes levels to the matching sink" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out_buffer: [4096]u8 = undefined;
+    var err_buffer: [4096]u8 = undefined;
+    var log = try Logger.init(gpa, io, &out_buffer, &err_buffer);
+    defer log.deinit(gpa);
+    log.min_level = .debug;
+
+    log.info("hello {d}", .{1});
+    log.warn("careful {s}", .{"now"});
+
+    var out_sink: [512]u8 = undefined;
+    var err_sink: [512]u8 = undefined;
+    var out_writer: std.Io.Writer = .fixed(&out_sink);
+    var err_writer: std.Io.Writer = .fixed(&err_sink);
+    log.queue.close(io);
+    log.runWriter(&out_writer, &err_writer);
+
+    const out_text = out_writer.buffered();
+    const err_text = err_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out_text, "hello 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_text, "careful") == null);
+    try std.testing.expect(std.mem.indexOf(u8, err_text, "warning: careful now") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_text, "hello 1") == null);
+    // Both lines carry the fixed ISO-8601 UTC prefix.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out_text, "Z "));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, err_text, "Z "));
+}
+
+test "min_level filters before the queue" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out_buffer: [4096]u8 = undefined;
+    var err_buffer: [4096]u8 = undefined;
+    var log = try Logger.init(gpa, io, &out_buffer, &err_buffer);
+    defer log.deinit(gpa);
+    log.min_level = .info;
+
+    log.debug("filtered {d}", .{1});
+
+    var batch: [4]line_queue.Slot = undefined;
+    try std.testing.expectEqual(@as(usize, 0), log.queue.popBatch(io, &batch));
+    try std.testing.expectEqual(@as(u64, 0), log.dropped.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), log.truncated.load(.monotonic));
+}
+
+test "a full queue drops and counts instead of blocking" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out_buffer: [4096]u8 = undefined;
+    var err_buffer: [4096]u8 = undefined;
+    var log = try Logger.init(gpa, io, &out_buffer, &err_buffer);
+    defer log.deinit(gpa);
+    log.min_level = .debug;
+
+    const overflow = 8;
+    var i: usize = 0;
+    while (i < line_queue.capacity + overflow) : (i += 1) log.info("line {d}", .{i});
+    try std.testing.expectEqual(@as(u64, overflow), log.dropped.load(.monotonic));
+
+    // Every accepted line is intact (newline-terminated), and none is lost.
+    var batch: [Logger.batch_size]line_queue.Slot = undefined;
+    var drained: usize = 0;
+    while (true) {
+        const count = log.queue.popBatch(io, &batch);
+        if (count == 0) break;
+        for (batch[0..count]) |slot| {
+            try std.testing.expectEqual(@as(u8, '\n'), slot.bytes[slot.len - 1]);
+            drained += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, line_queue.capacity), drained);
+}
+
+test "an overlong line becomes one truncated line" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out_buffer: [4096]u8 = undefined;
+    var err_buffer: [4096]u8 = undefined;
+    var log = try Logger.init(gpa, io, &out_buffer, &err_buffer);
+    defer log.deinit(gpa);
+    log.min_level = .debug;
+
+    log.info("{d:>300}", .{1});
+
+    var batch: [4]line_queue.Slot = undefined;
+    try std.testing.expectEqual(@as(usize, 1), log.queue.popBatch(io, &batch));
+    try std.testing.expectEqual(@as(u16, line_queue.slot_size), batch[0].len);
+    try std.testing.expectEqual(@as(u8, '\n'), batch[0].bytes[line_queue.slot_size - 1]);
+    try std.testing.expectEqual(@as(u64, 1), log.truncated.load(.monotonic));
+}
+
+test "shutdown drains what the queue accepted and is idempotent" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out_buffer: [4096]u8 = undefined;
+    var err_buffer: [4096]u8 = undefined;
+    var log = try Logger.init(gpa, io, &out_buffer, &err_buffer);
+    defer log.deinit(gpa);
+    log.min_level = .debug;
+
+    log.info("before shutdown", .{});
+
+    // Pretend the writer task was already parked: close, then drain here.
+    log.queue.close(io);
+    var out_sink: [512]u8 = undefined;
+    var err_sink: [512]u8 = undefined;
+    var out_writer: std.Io.Writer = .fixed(&out_sink);
+    var err_writer: std.Io.Writer = .fixed(&err_sink);
+    log.runWriter(&out_writer, &err_writer);
+    try std.testing.expect(std.mem.indexOf(u8, out_writer.buffered(), "before shutdown") != null);
+
+    // `done` is latched by `runWriter`, so both calls return without blocking.
+    log.shutdown(io);
+    log.shutdown(io);
+}
+
+test "direct mode writes synchronously and bypasses the queue" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out_buffer: [4096]u8 = undefined;
+    var err_buffer: [4096]u8 = undefined;
+    var log = try Logger.init(gpa, io, &out_buffer, &err_buffer);
+    defer log.deinit(gpa);
+    log.direct = true;
+    log.min_level = .debug;
+
+    var sink: [512]u8 = undefined;
+    var sink_writer: std.Io.Writer = .fixed(&sink);
+    log.direct_out = &sink_writer;
+
+    log.info("direct {d}", .{1});
+
+    try std.testing.expect(std.mem.indexOf(u8, sink_writer.buffered(), "direct 1") != null);
+    var batch: [4]line_queue.Slot = undefined;
+    try std.testing.expectEqual(@as(usize, 0), log.queue.popBatch(io, &batch));
 }
