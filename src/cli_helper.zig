@@ -208,8 +208,10 @@ pub fn writeHelp(writer: *std.Io.Writer, prog: []const u8, opts: []const Opt, po
 }
 
 /// Parse `<n><unit>` into seconds. Units: `s`/`m`/`h`/`d`/`w`.
-/// Examples: `30s`, `2h`, `7d`, `90m`.
+/// Examples: `30s`, `2h`, `7d`, `90m`. A bare `0` is accepted as "disabled",
+/// which is how `--timeout 0` is documented for both binaries.
 pub fn parseDurationSeconds(str: []const u8) error{InvalidDuration}!u64 {
+    if (std.mem.eql(u8, str, "0")) return 0;
     if (str.len < 2) return error.InvalidDuration;
     const unit = str[str.len - 1];
     const n = std.fmt.parseInt(u64, str[0 .. str.len - 1], 10) catch
@@ -608,6 +610,9 @@ test "parseDurationSeconds" {
     try std.testing.expectEqual(@as(u64, 7200), try parseDurationSeconds("2h"));
     try std.testing.expectEqual(@as(u64, 604800), try parseDurationSeconds("7d"));
     try std.testing.expectEqual(@as(u64, 5400), try parseDurationSeconds("90m"));
+    // `--timeout 0` / `--activation-interval 0` mean "disabled" and are
+    // documented as such; a bare `0` is the only unit-less spelling accepted.
+    try std.testing.expectEqual(@as(u64, 0), try parseDurationSeconds("0"));
     try std.testing.expectError(error.InvalidDuration, parseDurationSeconds("h"));
     try std.testing.expectError(error.InvalidDuration, parseDurationSeconds("12x"));
     try std.testing.expectError(error.InvalidDuration, parseDurationSeconds(""));
