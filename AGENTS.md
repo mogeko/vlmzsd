@@ -34,7 +34,7 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
 | Crypto | `src/crypto.zig` | From-scratch AES (FIPS-197) + `std.crypto` SHA-256 / HMAC-SHA256 |
 | Data | `src/kmsdata.zig` | `.kmd` binary data parsing (embedded `src/vlmcsd.kmd`); format spec in `docs/kmd-format.md` |
 | Network | `src/network.zig` | `std.Io` sockets: server loop, client connect (DNS), private-IP detection |
-| Server | `src/main.zig` | `vlmzsd` CLI + accept loop + thread-per-connection |
+| Server | `src/main.zig` | `vlmzsd` CLI + accept loop + `Io.Group` task dispatch onto the `std.Io.Threaded` pool |
 | Client | `src/vlmzs.zig` | `vlmzs` activation client |
 | Shared | `src/cli_helper.zig` | data-driven CLI parser (Opt table → parse/help/validate), value parsers (duration/bool/GUID), timestamped logger |
 | Tests | `src/testutil.zig` | byte-compare / hex-diff helpers |
@@ -64,6 +64,11 @@ source linked above).
 - Logging: fixed format with a UTC timestamp; `debug`/`info` → stdout, `warn`/`err` → stderr.
   `--verbose` enables `debug`, `--quiet` drops `info` (see `docs/cli.md`).
 - Tests: byte-level round-trips and golden hex vectors (hard-coded in `src/crypto.zig`).
+- Concurrency: one `std.Io.Group` for the process lifetime; each accepted connection is one
+  `Group.concurrent` task on the `std.Io.Threaded` pool (threads are spawned on demand and reused,
+  never `std.Thread.spawn`/`detach`). `Io.Semaphore` caps `--max-clients`; `Group.cancel` joins
+  in-flight tasks at shutdown. Per-connection state (PRNG, 4 KiB read/write buffers) stays
+  task-local; shared mutable state uses `Io.Mutex` (logger) or `std.atomic.Mutex` (client lists).
 
 ## CLI implementation decisions
 

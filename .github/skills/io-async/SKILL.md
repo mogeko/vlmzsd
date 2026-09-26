@@ -1,23 +1,24 @@
 ---
 name: io-async
-description: 'Modernize the vlmzsd concurrency model using the stable std.Io.Threaded backend (thread pool + Future/Group/Semaphore), replacing hand-rolled std.Thread.spawn thread-per-connection. Use when improving server/client concurrency, capping parallel work, replacing manual thread management, or tuning async_limit/concurrent_limit. Keywords: std.Io.Threaded, async, concurrent, Future, Group, Semaphore, thread pool, concurrency, cancelation, Io.Limit.'
+description: 'Concurrency model of vlmzsd: the stable std.Io.Threaded backend (thread pool + Future/Group/Semaphore) instead of hand-rolled std.Thread.spawn. Use when adding or changing server/client concurrency, capping parallel work, joining tasks at shutdown, or tuning async_limit/concurrent_limit/--max-clients. Keywords: std.Io.Threaded, async, concurrent, Future, Group, Semaphore, thread pool, concurrency, cancelation, Io.Limit.'
 argument-hint: '<scope: server|client|all>'
 ---
 
 # Asynchronous I/O with std.Io.Threaded
 
-**Goal: replace the hand-rolled thread-per-connection model (`std.Thread.spawn` + `detach`) with
-the `std.Io.Threaded` task model — `Io.concurrent` for parallel work, `Io.async` for inline work,
-and `Future`/`Group` for lifecycle.** Zig 0.16 also ships experimental fiber/evented backends
-(`std.Io.fiber`, `std.Io.Dispatch` over `Kqueue`/`Uring`), but those are WIP and poorly documented —
-**do not use them here**. `std.Io.Threaded` is the thread-pool backend the project already uses;
-this skill is about using its task model correctly.
+**The migration is already done.** `src/main.zig` and `src/vlmzs.zig` run on the `std.Io.Threaded`
+task model: `Io.Group.concurrent` for per-connection / per-request work, `Group.await` / `Group.cancel`
+for lifecycle, `Io.Semaphore` for caps. There is **no `std.Thread.spawn` + `detach` in `src/`** — do
+not reintroduce it. Zig 0.16 also ships experimental fiber/evented backends (`std.Io.fiber`,
+`std.Io.Dispatch` over `Kqueue`/`Uring`), but those are WIP and poorly documented — **do not use them
+here**. This skill is about using the `Threaded` task model correctly and not regressing it.
 
 ## When to Use
 
-- Replacing the current thread-per-connection model (`std.Thread.spawn` + `detach` in `src/main.zig`).
+- Adding or changing per-connection work in `src/main.zig` (the accept loop) or per-request work in
+  `src/vlmzs.zig`.
 - Capping parallel work with `async_limit` / `concurrent_limit` or `Io.Semaphore`.
-- Adding any fire-and-forget or parallel-request work in `src/main.zig` / `src/vlmzs.zig`.
+- Auditing why a task leaks, never runs, or does not stop at shutdown.
 
 ## Key APIs (all WIP in 0.16 — verify against the stdlib source, not older tutorials)
 
@@ -33,61 +34,84 @@ this skill is about using its task model correctly.
 
 ## Procedure
 
-1. **Locate the thread boundary.** Find each `std.Thread.spawn(.{}, fn, .{args})` + `th.detach()`
-   (currently `serveClientThread` in `src/main.zig`).
+1. **Locate the task boundary.** The dispatch sites are `ServerContext.run` →
+   `self.group.concurrent(self.io, serveClientThread, .{ctx})` in `src/main.zig`, and
+   `group.concurrent(init.io, sendRequestTask, .{...})` in `src/vlmzs.zig`.
 
-2. **Choose `async` vs `concurrent`.** Use `concurrent` when the task must progress in parallel
-   while the main loop keeps accepting; prefer `async` when inline execution is acceptable and the
-   task just must not block the caller. Both return a `Future` that must eventually be
-   `await`ed or `cancel`ed — an ignored `Future` leaks its task.
+2. **Choose the unit and its lifetime.** The server's unit is one **accepted connection**, not one
+   request: `serveClientThread` loops over `network.serveRpc` until the peer closes, times out, or
+   `--disconnect-per-request` fires. Do not dispatch per-RPC unless you also handle the connection's
+   reader/writer state.
 
-3. **Shape the task as a closure.** Extract the worker body into a function returning
-   `Cancelable!void` (or any `Result`), passing context by value. Never capture stack state beyond
-   the closure args.
+3. **Choose `async` vs `concurrent`.** Use `Group.concurrent` when the task must make progress while
+   the caller keeps running (the accept loop); it guarantees a pool thread. `Group.async` may run
+   inline and is not guaranteed to run until `await` — avoid it for connection work.
 
-4. **Bound concurrency.** The core model is `Future`/`Group`; layer limits on top of it:
-   - fixed cap on all I/O parallelism → `InitOptions.async_limit` / `concurrent_limit`;
-   - per-connection cap (`--max-clients`) → keep the existing `Io.Semaphore` as a gate in front of
-     the task submission, or bound a `Group` before `Group.await`.
+4. **Shape the task as a closure.** The task function's return type must coerce to `Cancelable!void`;
+   pass context by value (the closure is copied into the pool's allocation). Never capture stack
+   state beyond the args. Own heap context explicitly: `gpa.create` before dispatch, `destroy` in the
+   task's `defer` (see `serveClientThread`).
 
-5. **Collect results.** `await` each `Future` (or the `Group`) at shutdown so tasks join; otherwise
-   the process exits with work still queued.
+5. **Bound concurrency.** `concurrent_limit` defaults to `.unlimited`, and `async_limit` does *not*
+   apply to `Group.concurrent`, so by default every concurrent connection grows the pool:
+   - per-connection cap (`--max-clients`) → the existing `Io.Semaphore` gate in front of the dispatch;
+   - a global cap → `InitOptions.concurrent_limit` (only settable when you construct the `Threaded`
+     yourself, not via `std.process.Init`), or another `Semaphore`.
 
-6. **Run.** `zig build test --summary all`; concurrency changes must keep the 35-test suite green
-   and pass a multi-client smoke test (`vlmzs` against `vlmzsd`).
+6. **Join at shutdown.** A long-lived `Group` is legal and does not leak, but it must be
+   `await`ed or `cancel`ed before the process exits — `main.zig` does `defer group.cancel(init.io)`.
+   For a finite batch (`vlmzs --reconnect-per-request`), submit then `group.await(init.io)`.
+
+7. **Run.** `zig build test --summary all`; concurrency changes must keep the suite green and pass a
+   multi-client smoke test (`vlmzs` against `vlmzsd`, e.g. `-n 32 --reconnect-per-request`).
 
 ## Patterns
 
 ```zig
-// Spawn a worker on the Threaded pool and block until it finishes.
-const future = try Io.concurrent(io, serveClient, .{ctx});
-defer _ = future.cancel(io); // cancel if the surrounding scope is abandoned
-const result = future.await(io);
-
-// Bounded batch: submit N tasks, wait for all. This is the target shape for the
-// server accept loop replacing `serveClientThread`.
+// Long-lived group (src/main.zig): each accepted connection is one task on the pool.
 var group: Io.Group = .init;
-for (clients) |c| Io.Group.concurrent(&group, io, handleClient, .{c});
-try group.await(io);
+defer group.cancel(io); // request cancelation + block until in-flight tasks finish
+for (clients) |c| group.concurrent(io, handleClient, .{c}) catch |e| handle(e);
+
+// Finite batch (src/vlmzs.zig --reconnect-per-request): submit N, then join.
+var group: Io.Group = .init;
+for (requests) |r| group.concurrent(io, sendRequestTask, .{r}) catch |e| handle(e);
+group.await(io) catch |e| handle(e);
 ```
 
 ## Pitfalls
 
-- **`Future`/`Group` resources are released when awaited/canceled.** A `Future` that is neither
-  awaited nor canceled leaks; a `Group` with pending tasks that is never awaited leaks.
-- **Cancelation points.** `Io` functions that can return `error.Canceled` (see `Future.cancel`
-  docs) are cancelation points. Ignoring `error.Canceled` is usually a bug — propagate it or use
-  `Io.recancel` / `CancelProtection` deliberately.
-- **`concurrent` can fail.** `error.ConcurrencyUnavailable` means the `concurrent_limit` was hit;
-  either raise the limit, use `async`, or handle the error.
+- **Group lifetime.** Per-task resources are released as soon as that task returns, so a long-lived
+  group that tasks are repeatedly added to is *not* a leak (stdlib `Group` docs). The one real leak
+  is a group with pending tasks that is never awaited nor canceled. An ignored `Future` does leak.
+- **`concurrent` can fail.** `error.ConcurrencyUnavailable` means `concurrent_limit` was hit (or the
+  thread spawn failed) — release whatever you reserved and drop the work (see `main.zig`'s
+  `Group.concurrent(...) catch`).
+- **Cancelation is delivered by signaling the thread.** `Threaded.init` installs a `SIG.IO` handler
+  precisely so a cancelation request can interrupt a blocked syscall; `Group.cancel` then blocks
+  until every member returns. Tasks that are not at a cancelation point keep running to completion.
+- **Repo gotcha: cancelation surfaces as `error.ReadFailed`.** `Io.net.Stream.Reader.readVec`
+  catches *every* socket error — including `error.Canceled` — and rewrites it as
+  `error.ReadFailed`, stashing the real error in `Stream.Reader.err`. A connection canceled at
+  shutdown therefore looks like a read failure. If you log errors at the `*Io.Reader` level you
+  cannot tell them apart; do not report "canceled at shutdown" as a `warn`.
+- **`std.posix.poll` is not a cancelation point.** It is interrupted by the signal but retried, so a
+  worker parked in `waitReadable` only notices cancelation after its check, bounding shutdown
+  latency by `--timeout`.
+- **`Semaphore.waitUncancelable` is not a cancelation point either.** Blocking on it in the accept
+  loop (only when `--max-clients` is set) means SIGINT is not honored until some task posts a permit.
+- **`Io.Mutex` vs `std.atomic.Mutex`.** `Io.Mutex` needs an `Io` and blocks on a futex — use it for
+  locks held across I/O (the logger). Use `std.atomic.Mutex` for short, `io`-free critical sections
+  (the KMS client lists) — it spins via `std.atomic.spinLoopHint`.
 - **No `std.time.sleep`/`std.posix.nanosleep` in 0.16.** Sleep via `Io.sleep(io, .{ .nanoseconds = n }, .real)`.
-- **`Io.Mutex` vs `std.atomic.Mutex`.** `Io.Mutex` needs an `Io`; use `std.atomic.Mutex` for locks
-  that must work without one.
 
 ## Checklist
 
-- [ ] No new `std.Thread.spawn`; tasks go through `Io.async`/`Io.concurrent` or a `Group`.
-- [ ] Every `Future`/`Group` is awaited or canceled on all paths.
-- [ ] `error.Canceled` and `error.ConcurrencyUnavailable` are handled, not silently swallowed.
-- [ ] Concurrency bounds are explicit (`async_limit`/`concurrent_limit`/`Semaphore`).
+- [ ] No `std.Thread.spawn`; parallel work goes through a `Group` (`Group.concurrent`).
+- [ ] The group is awaited or canceled on every exit path.
+- [ ] `error.ConcurrencyUnavailable` handled; per-task heap context freed in the task's `defer`.
+- [ ] Concurrency bounds are explicit (`Io.Semaphore` for `--max-clients`, or `concurrent_limit`).
+- [ ] Shared mutable state is locked (`Io.Mutex` / `std.atomic.Mutex`); per-connection PRNG and
+      buffers stay task-local.
+- [ ] `error.Canceled` is not misreported as a failure (see the `ReadFailed` pitfall).
 - [ ] `zig fmt` and `zig build test --summary all` pass; multi-client smoke test succeeds.
