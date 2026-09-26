@@ -151,6 +151,13 @@ messages go to **stderr** (Unix convention). `--verbose` enables `debug`;
 supervisor (systemd/journald, Docker). This is a deliberate simplification of
 the C `-l`/`-T`/`-e` options.
 
+Delivery is asynchronous (a bounded queue plus one writer task), and the queue
+is **lossy by design**: when it is full the line is dropped, so that a slow
+consumer can never block a worker. Dropped and truncated lines are counted and
+reported once, at shutdown, as a single
+`warning: logging: dropped N line(s), truncated M line(s)` line on stderr — it
+is absent when both counters are zero. The queue size is not configurable.
+
 ## 6. Client (`vlmzs`) options
 
 | Option | Short | Default | Notes |

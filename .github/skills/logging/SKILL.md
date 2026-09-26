@@ -17,8 +17,31 @@ Logger contract with widely-agreed logging best practices.
 - **Format**: every line is prefixed with a UTC ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`); the
   format is fixed and has no CLI surface.
 - **Filtering**: `min_level`; `--verbose` → `.debug`, `--quiet` → `.warn`, default `.info`.
-- The `Logger` writes via `Io.Mutex` (blocking), so a log call in a hot path is a real lock +
-  flush cost — see "Cost".
+- **Delivery**: asynchronous. A log call formats the line on the calling thread and hands it to a
+  bounded, **lossy** FIFO (`src/line_queue.zig`); a dedicated writer task owns the blocking
+  `write`/`flush`.
+
+## Pipeline, ordering, and loss
+
+`Logger` (producer) → `LineQueue` (bounded FIFO, 1024 × 256 B, preallocated at startup) → writer task
+(single consumer, `log_group`) → stdout/stderr.
+
+- **Filtered lines cost nothing**: the `min_level` check happens before formatting, locking, or
+  enqueuing.
+- **Ordering is *arrival* order, not event order.** Within one thread (one connection) lines keep
+  program order. Across threads there is no total order: whoever wins the queue lock is written
+  first, and the timestamp is taken by the producer at call time — so in a rare preemption window a
+  line's timestamp may be smaller than its predecessor's. Never infer cross-thread causality from
+  log order.
+- **A log call returning does not mean the line is on disk.** It sits in the queue until the writer
+  drains it. Only `log.shutdown(io)` — run after the connection tasks are joined and before
+  `Group.cancel` cancels the writer — guarantees that everything accepted has been flushed.
+- **Loss is explicit and counted.** Producers never block: when the queue is full the line is
+  dropped. At shutdown the writer prints one
+  `warning: logging: dropped N line(s), truncated M line(s)` line on stderr when either counter is
+  non-zero. Lines longer than 255 bytes are truncated to a single greppable line.
+- **`std.process.exit` skips `defer`s.** On a fatal startup path use `fatal(log, io, ...)` in
+  `src/main.zig`, never a bare `log.err(...)` + `exit`, or the message dies in the queue.
 
 ## Choosing a Level
 
@@ -51,9 +74,14 @@ Rule of thumb: if an operator does not need it to run the service, it is `debug`
 
 ## Cost
 
-A log call takes the `Logger` mutex and flushes (`w.flush()`) — a blocking syscall. On the
-thread-pool backend this blocks the worker thread. Keep `info`/`warn`/`err` out of per-packet or
-per-client tight loops; use `debug` (filtered out by default) there.
+The producer's cost is one `@memcpy` into a preallocated slot plus one uncontended `Io.Mutex` CAS —
+no syscall, no allocation. The blocking `write`/`flush` belongs to the writer task, so a slow
+consumer (a full pipe) can no longer stall a worker: it fills the queue, and then lines are dropped
+(and counted) rather than blocking the data plane.
+
+This does not make logging free — every emitted line still costs a format plus a copy, and the single
+writer task serializes all output. Keep `info`/`warn`/`err` out of per-packet or per-client tight
+loops; use `debug` (filtered out by default, and then truly zero cost).
 
 ## Procedure
 
@@ -72,6 +100,8 @@ per-client tight loops; use `debug` (filtered out by default) there.
 - [ ] No secrets or credentials in the message.
 - [ ] Destination correct: debug/info → stdout, warn/err → stderr.
 - [ ] Not a duplicate of a log at another layer for the same event.
+- [ ] No code assumes a line is on disk when the call returns (the writer flushes asynchronously).
+- [ ] New fatal-exit paths use `fatal(...)` (`main.zig`), so the queue is drained before `exit`.
 - [ ] `zig fmt` + `zig build test --summary all` pass.
 
 ## Related
