@@ -21,14 +21,14 @@ artifact: every change must be checked for legality, then pinned.
 1. **Establish what changed.** `git diff --stat src/vlmcsd.kmd` and note whether
    it is a regeneration (record counts changed) or a targeted edit (values changed).
 
-2. **Analyze the new layout.** Run [dump_kmd.py](../../../scripts/dump_kmd.py) on the
+2. **Analyze the new layout.** Run [dump_kmd.py](scripts/dump_kmd.py) on the
    changed file to dump the header, record values, and string-pool fields; it
    also runs the legality checks. Then invoke the `kmd-format` subagent to map
    the new header/record layout against `docs/kmd-format.md` (canonical) and
    `docs/migration.md` §3.4 (summary), and report the header fields (magic,
    major/minor version, counts, offsets) and record values that moved.
 
-3. **Validate legality.** [dump_kmd.py](../../../scripts/dump_kmd.py) reports these
+3. **Validate legality.** [dump_kmd.py](scripts/dump_kmd.py) reports these
    checks automatically (see `docs/kmd-format.md` §8):
    - `Magic[0..4] == "KMD\0"` and the last byte of the file is `0`.
    - `MajorVer == 2` (minor may vary).
@@ -57,6 +57,13 @@ artifact: every change must be checked for legality, then pinned.
 
 6. **Verify.** `zig fmt` and `zig build test --summary all` must pass; every
    updated assert carries a `// from docs/kmd-format.md` provenance comment.
+
+## Scripts
+
+[dump_kmd.py](scripts/dump_kmd.py) is a symlink to the repo-root
+`scripts/dump_kmd.py`, which stays canonical (it is also referenced from
+`docs/kmdconv.md`); edit that file, not the link. It needs only the Python 3
+standard library and exits non-zero when a legality check fails.
 
 ## Checklist
 
