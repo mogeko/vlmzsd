@@ -234,18 +234,17 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
   cap the listen sockets leave the poll set, so excess connections wait in the kernel backlog instead
   of occupying a worker. There is no `detach()` — the group owns the tasks, and shutdown joins them
   with `Io.Group.cancel`.
-- **Timeout**: `std.posix.poll` (replacing C's `SO_RCVTIMEO`). The poll runs before every *refill* of
-  the buffered reader (`network.readAll`), not once per packet: `readSliceAll` loops until the buffer is
-  full, so a peer that sends half a packet and then stalls would block past the deadline — and split
-  packets are the norm, since `writePacket` writes the header and the body separately. Bytes already
-  buffered are consumed without polling (the read-ahead pitfall). The server loop and the client
-  (`vlmzs --timeout`) share the same `IdleTimeout`. The server also arms `IdleTimeout.wake_fd` with
-  the read end of its shutdown pipe: SIGINT/SIGTERM writes one byte there and every parked read
-  returns `error.Canceled` at once (logged at `debug`), instead of each connection waiting out its
-  own `--timeout` — so shutdown latency is bounded by task teardown, not by `--timeout`, and even
-  `--timeout 0` connections stay interruptible. The client has **no connect deadline**:
-  `std.Io.Threaded` in 0.16 still panics on `ConnectOptions.timeout` ("TODO implement"), so an
-  unreachable host is bounded only by the kernel's SYN timeout.
+- **Timeout**: the read wait is an `Io` operation, not a hand-rolled poll. `network.readSome` issues
+  `io.operateTimeout(.{ .net_receive = … })` once per *refill* of `network.readAll`, not once per
+  packet: a peer that sends half a packet and then stalls must not block past the deadline — and split
+  packets are the norm, since `writePacket` writes the header and the body separately. The backend owns
+  both the deadline and the cancelation point, so SIGINT/SIGTERM ends every parked read with
+  `error.Canceled` (logged at `debug`) without a self-pipe, and a `--timeout 0` (`.none`) connection
+  stays interruptible. `net_receive` copies straight into the caller's buffer and reports EOF as a
+  zero-length message, so there is no read-ahead buffer and no buffered-bytes bookkeeping. The server
+  loop and the client (`vlmzs --timeout`) share the same `ReadOptions`. The client has **no connect
+  deadline**: `std.Io.Threaded` in 0.16 still panics on `ConnectOptions.timeout` ("TODO implement"),
+  so an unreachable host is bounded only by the kernel's SYN timeout.
 - Client: DNS via `Io.net.HostName.lookup` (with address-family filtering); default host `::1` (IPv6) or `127.0.0.1`;
   `--grace` default `43200` minutes written to `BindingExpiration`.
 

@@ -21,30 +21,26 @@ const Io = std.Io;
 // ---------------------------------------------------------------------------
 
 /// Read exactly `buf.len` bytes, waiting for the peer before each refill so that
-/// no single `read(2)` can block past the idle timeout (the reference used
+/// no single read can block past the deadline in `idle` (the reference used
 /// `SO_RCVTIMEO` for the same purpose).
 ///
 /// `Io.Reader.readSliceAll` alone does not bound the wait: it loops until `buf`
 /// is full, so a peer that delivers half a packet and then stalls parks the
 /// caller in the kernel. Split packets are the normal case here — `writePacket`
 /// sends the header and the body as two separate writes, and TCP may segment
-/// them further — which is why the poll happens per refill, not per packet.
+/// them further — which is why the deadline applies per refill, not per packet.
 ///
-/// The wait also ends early with `error.Canceled` when `IdleTimeout.wake_fd`
-/// becomes readable: that is how a shutdown signal abandons every parked
-/// connection at once instead of after its own timeout.
-pub fn readAll(idle: IdleTimeout, reader: *Io.Reader, buf: []u8) !void {
+/// A dead peer surfaces as `error.Timeout`, and a shutdown signal as
+/// `error.Canceled` (the wait is a backend cancelation point; see `ReadOptions`).
+pub fn readAll(idle: ReadOptions, reader: *Io.Reader, buf: []u8) !void {
     var off: usize = 0;
     while (off < buf.len) {
-        // Bytes already buffered cost neither a syscall nor a poll.
-        if (reader.bufferedLen() == 0) try waitReadable(idle);
-        var vec: [1][]u8 = .{buf[off..]};
-        const n = reader.readVec(&vec) catch |err| switch (err) {
+        const n = readSome(idle, reader, buf[off..]) catch |err| switch (err) {
             error.EndOfStream => return error.EndOfStream,
             else => |e| return e,
         };
-        // `readVec` returns 0 only when it drained the buffer and the socket
-        // had nothing more.
+        // Zero bytes means the peer is gone: `readVec` only reports 0 when the
+        // reader is drained, and the socket path maps EOF to `EndOfStream`.
         if (n == 0) return error.EndOfStream;
         off += n;
     }
@@ -88,8 +84,8 @@ pub const ServeOptions = struct {
     use_btfn: bool = false,
     /// Close the connection after each RESPONSE/FAULT (C `DisconnectImmediately`).
     disconnect_per_request: bool = false,
-    /// Idle timeout for packet reads (C `ServerTimeout`).
-    idle: IdleTimeout = .{},
+    /// Read source and deadline for packet reads (C `ServerTimeout`).
+    idle: ReadOptions = .{},
     /// Optional sink for protocol-level events (see `Event`). When null, the
     /// events are simply not reported.
     on_event: ?*const fn (context: ?*anyopaque, event: Event) void = null,
@@ -110,50 +106,67 @@ fn writePacket(
     try writeAll(writer, body);
 }
 
-/// Idle timeout for reads on a connected socket: how long to wait for the peer
-/// to answer (`seconds = 0` waits forever), which socket to poll, and an
-/// optional fd whose readability aborts the wait. Both the server loop and the
-/// client use it, so `--timeout` means the same on either side of the
-/// connection.
-pub const IdleTimeout = struct {
-    seconds: u32 = 0,
-    /// Connected socket, polled for readability before each packet read. `0`
-    /// disables the timeout (the fd is unknown).
-    socket_fd: std.posix.socket_t = 0,
-    /// Extra fd polled alongside the socket; `0` means none. The server passes
-    /// the read end of its shutdown pipe, so SIGINT/SIGTERM ends a parked read
-    /// with `error.Canceled` immediately — even with `--timeout 0` — instead of
-    /// letting each connection sit out its own idle timeout. The client leaves
-    /// it `0`: it installs no signal handler.
-    wake_fd: std.posix.socket_t = 0,
+/// Where a packet's bytes come from, and how long a read may wait for them.
+///
+/// `peer` present → read from that connected socket through
+/// `Io.operateTimeout(.net_receive)`: the **backend** owns both the deadline and
+/// the cancelation point, so a shutdown signal ends a parked read with
+/// `error.Canceled` without any self-pipe or wake fd.
+/// `peer` absent → read from the `Io.Reader` argument (canned input in tests).
+///
+/// Both the server loop and the client use these options, so `--timeout` means
+/// the same on either side of the connection.
+pub const ReadOptions = struct {
+    peer: ?Peer = null,
+
+    /// A connected socket, together with the `Io` handle that reaches it. `Io`
+    /// has no default value, so it travels with the socket instead of being
+    /// plumbed through every signature.
+    pub const Peer = struct {
+        io: Io,
+        handle: std.posix.socket_t,
+        /// Per-read deadline. `.none` waits without one (and stays cancelable).
+        timeout: Io.Timeout = .none,
+    };
 };
 
-/// Wait until the connected socket, or an armed wake fd, has something to read;
-/// return `error.Timeout` once the idle timeout elapses, or `error.Canceled`
-/// when the wake fd fires (the process is shutting down). A no-op when the
-/// socket is unknown (in-memory readers, tests); callers that already hold
-/// buffered bytes skip it entirely.
-fn waitReadable(idle: IdleTimeout) !void {
-    if (idle.socket_fd == 0) return;
+/// Translate the CLI's whole-second `--timeout` into a backend deadline.
+/// `0` means "no deadline": the read may wait forever, but a cancelation request
+/// still ends it.
+pub fn timeoutSeconds(seconds: u32) Io.Timeout {
+    if (seconds == 0) return .none;
+    return .{ .duration = .{ .raw = .{ .nanoseconds = @as(i96, seconds) * 1_000_000_000 }, .clock = .awake } };
+}
 
-    var fds = [2]std.posix.pollfd{
-        .{ .fd = idle.socket_fd, .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd = idle.wake_fd, .events = std.posix.POLL.IN, .revents = 0 },
+/// Read up to `buf.len` bytes into `buf`; returns how many arrived.
+/// `error.EndOfStream` means the peer closed the connection.
+fn readSome(idle: ReadOptions, reader: *Io.Reader, buf: []u8) !usize {
+    const peer = idle.peer orelse {
+        var vec: [1][]u8 = .{buf};
+        return reader.readVec(&vec);
     };
-    const count: usize = if (idle.wake_fd == 0) 1 else 2;
 
-    // `poll` takes an i32 millisecond count; clamp so a legal but huge
-    // `--timeout` (e.g. `30d`) cannot overflow it in a safety-checked build.
-    // `seconds = 0` means "no deadline": poll with `-1` (never times out) so
-    // the wait stays interruptible through the wake fd.
-    const max_ms: u64 = std.math.maxInt(i32);
-    const timeout_ms: i32 = if (idle.seconds == 0) -1 else @intCast(@min(@as(u64, idle.seconds) * 1000, max_ms));
-
-    const n = try std.posix.poll(fds[0..count], timeout_ms);
-    if (n == 0) return error.Timeout;
-    // The wake fd wins: on shutdown the socket may be readable at the same
-    // time, and abandoning the connection is what the caller wants.
-    if (idle.wake_fd != 0 and fds[1].revents != 0) return error.Canceled;
+    // `net_receive` is message oriented: one call copies at most one message
+    // (never more than `buf.len` bytes) straight into `buf`, and reports EOF as
+    // a zero-length message rather than as an error.
+    var messages = [1]Io.net.IncomingMessage{.{ .from = undefined, .data = undefined, .control = &.{}, .flags = undefined }};
+    const result = try peer.io.operateTimeout(.{ .net_receive = .{
+        .socket_handle = peer.handle,
+        .message_buffer = &messages,
+        .data_buffer = buf,
+        .flags = .{},
+    } }, peer.timeout);
+    const received = result.net_receive;
+    if (received[0]) |err| return err;
+    // A completed receive always fills the first message; treat the impossible
+    // empty case as EOF rather than spinning on it.
+    if (received[1] == 0) return error.EndOfStream;
+    const message = messages[0];
+    // The backend copies into `buf` itself, which is why `readAll` needs no
+    // second buffer (and no read-ahead accounting).
+    std.debug.assert(message.data.ptr == buf.ptr);
+    if (message.data.len == 0) return error.EndOfStream;
+    return message.data.len;
 }
 
 /// Serve the RPC loop over a connected stream (equivalent to the C `rpcServer`).
@@ -259,11 +272,11 @@ pub const ClientOptions = struct {
     use_ndr64: bool = true,
     use_btfn: bool = false,
     multiplexed: bool = false,
-    /// Idle timeout for the BIND reply and for every RESPONSE read. The client
-    /// has no *connect* deadline: `std.Io.Threaded` (0.16) still panics on
-    /// `ConnectOptions.timeout` ("TODO implement"), so a blackholed host is
-    /// bounded only by the kernel's own SYN timeout.
-    idle: IdleTimeout = .{},
+    /// Read source and deadline for the BIND reply and for every RESPONSE read.
+    /// The client has no *connect* deadline: `std.Io.Threaded` (0.16) still
+    /// panics on `ConnectOptions.timeout` ("TODO implement"), so a blackholed
+    /// host is bounded only by the kernel's own SYN timeout.
+    idle: ReadOptions = .{},
 };
 
 /// Perform the BIND handshake and return the negotiated transfer syntaxes.
@@ -305,7 +318,7 @@ pub fn clientSendRequest(
     call_id: *u32,
     kms_request: []const u8,
     use_ndr64: bool,
-    idle: IdleTimeout,
+    idle: ReadOptions,
 ) !SendResult {
     const req = try rpc.wrapKmsRequest(allocator, kms_request, use_ndr64, call_id.*);
     defer allocator.free(req);
@@ -324,7 +337,7 @@ pub fn clientSendRequest(
 }
 
 /// Read one RPC packet (header + body) and return its body bytes.
-fn readPacket(allocator: Allocator, idle: IdleTimeout, reader: *Io.Reader) ![]u8 {
+fn readPacket(allocator: Allocator, idle: ReadOptions, reader: *Io.Reader) ![]u8 {
     var header: rpc.RpcHeader = undefined;
     try readAll(idle, reader, std.mem.asBytes(&header));
 
@@ -842,17 +855,17 @@ test "client bind handshake" {
 }
 
 /// Test helper: a TCP connection whose ends are both owned by the test, so
-/// sending from the client end makes the accepted end readable. That is the
-/// stand-in for the shutdown pipe: `std.posix` exposes no `pipe` in 0.16, and
-/// `std.c.pipe` is off limits here — this module is built without libc
-/// (`build.zig`: the module sets `link_libc = false`, only the `vlmzsd`
-/// executable links it), so a `std.c` reference fails to *compile* on Linux.
+/// sending from the client end makes the accepted end readable. (Not
+/// `Io.net.Socket.createPair`: its default `family = .ip4` socketpair is
+/// Linux-only and aborts on macOS.) This module is built without libc — a
+/// `std.c` reference fails to compile on Linux — so no pipe either.
 const StreamPair = struct {
     server: Io.net.Server,
-    /// The end the test polls: readable only once the client sends.
+    /// The end the test reads from.
     accepted: Io.net.Stream,
     /// The end the test sends from.
     client: Io.net.Stream,
+    client_open: bool = true,
 
     fn init(io: Io) !StreamPair {
         const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -865,73 +878,177 @@ const StreamPair = struct {
     }
 
     fn deinit(self: *StreamPair, io: Io) void {
-        self.client.close(io);
+        self.closeClient(io);
         self.accepted.close(io);
         self.server.deinit(io);
     }
 
-    /// Make `accepted` readable.
-    fn sendByte(self: *StreamPair, io: Io) void {
-        var buffer: [1]u8 = undefined;
+    fn closeClient(self: *StreamPair, io: Io) void {
+        if (!self.client_open) return;
+        self.client.close(io);
+        self.client_open = false;
+    }
+
+    fn send(self: *StreamPair, io: Io, bytes: []const u8) !void {
+        var buffer: [16]u8 = undefined;
         var writer = self.client.writer(io, &buffer);
-        writer.interface.writeAll("x") catch return;
-        writer.interface.flush() catch return;
+        try writer.interface.writeAll(bytes);
+        try writer.interface.flush();
+    }
+
+    /// Options that read from the accepted end with `timeout` as the deadline.
+    fn readOptions(self: *StreamPair, io: Io, timeout: Io.Timeout) ReadOptions {
+        return .{ .peer = .{ .io = io, .handle = self.accepted.socket.handle, .timeout = timeout } };
     }
 };
 
-/// Test helper: wait, then make the pair's accepted end readable — stands in for
-/// the signal handler writing its byte to the shutdown pipe.
-fn wakeAfterDelay(io: Io, pair: *StreamPair) Io.Cancelable!void {
-    try io.sleep(.{ .nanoseconds = 200_000_000 }, .awake);
-    pair.sendByte(io);
+/// The socket path never consults the `Io.Reader` argument; these tests pass an
+/// empty one so both paths share a single call shape.
+fn emptyReader() Io.Reader {
+    return .fixed("");
 }
 
-// The server parks every idle connection in `waitReadable` with its shutdown
-// pipe as `wake_fd`; this is the contract that makes SIGINT/SIGTERM prompt. The
-// wake byte lands after the wait has parked but well before the deadline, so a
-// `Timeout` here would mean the wake fd was ignored — the failing case would
-// take a second instead of 200 ms.
-test "a parked read is aborted by the wake fd" {
+/// Test helper: `n` milliseconds as a backend deadline.
+fn ms(n: u64) Io.Timeout {
+    return .{ .duration = .{ .raw = .{ .nanoseconds = @as(i96, n) * 1_000_000 }, .clock = .awake } };
+}
+
+fn elapsedMs(from: Io.Timestamp, io: Io) i96 {
+    return @divTrunc(from.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds, 1_000_000);
+}
+
+/// Test helper: park in `readAll` so the test can cancel it.
+const ReadWaiter = struct {
+    idle: ReadOptions,
+    reader: *Io.Reader,
+    buf: []u8,
+    outcome: *?anyerror,
+
+    fn run(self: ReadWaiter) Io.Cancelable!void {
+        readAll(self.idle, self.reader, self.buf) catch |err| {
+            self.outcome.* = err;
+            return;
+        };
+        self.outcome.* = null;
+    }
+};
+
+test "timeoutSeconds maps 0 to no deadline" {
+    try std.testing.expect(timeoutSeconds(0) == .none);
+    const timeout = timeoutSeconds(30);
+    try std.testing.expectEqual(@as(i96, 30 * 1_000_000_000), timeout.duration.raw.nanoseconds);
+    try std.testing.expectEqual(Io.Clock.awake, timeout.duration.clock);
+}
+
+// `--timeout`: a peer that accepts the connection and then says nothing must not
+// park the read forever. The deadline comes from the backend, so it also holds
+// for a *partial* packet, which is what the per-refill loop is for.
+test "a silent peer hits the read deadline" {
     const alloc = std.testing.allocator;
 
     var threaded: std.Io.Threaded = .init(alloc, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Role split inside one connection: the client end stays silent (it is the
-    // socket being waited on), the accepted end is the fd that gets woken.
+    var pair = try StreamPair.init(io);
+    defer pair.deinit(io);
+
+    var reader = emptyReader();
+    var buffer: [16]u8 = undefined;
+
+    const started = Io.Timestamp.now(io, .awake);
+    const outcome = readAll(pair.readOptions(io, ms(300)), &reader, &buffer);
+    const dt = elapsedMs(started, io);
+
+    // 300 ms is the deadline; allow scheduling slack but insist the wait ended
+    // long before the 1 s (whole-second) `--timeout` this stands in for.
+    try std.testing.expectError(error.Timeout, outcome);
+    try std.testing.expect(dt >= 200 and dt < 900);
+}
+
+// Shutdown: this replaces the old self-pipe/wake-fd arrangement. The wait is a
+// backend cancelation point, so the group's cancelation request ends it by
+// itself — no second fd to poll, no `--timeout` to wait out.
+test "a cancelation request ends a parked read" {
+    const alloc = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try StreamPair.init(io);
+    defer pair.deinit(io);
+
+    var reader = emptyReader();
+    var buffer: [16]u8 = undefined;
+    var outcome: ?anyerror = null;
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, ReadWaiter.run, .{ReadWaiter{
+        .idle = pair.readOptions(io, .none), // no deadline: wait forever
+        .reader = &reader,
+        .buf = &buffer,
+        .outcome = &outcome,
+    }});
+
+    try io.sleep(.{ .nanoseconds = 100 * 1_000_000 }, .awake);
+    const started = Io.Timestamp.now(io, .awake);
+    group.cancel(io); // requests cancelation, then blocks until the task returns
+    const dt = elapsedMs(started, io);
+
+    // "Promptly" = the cancelation alone ended it, not the (absent) deadline.
+    try std.testing.expect(dt < 500);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), outcome);
+}
+
+// EOF is a zero-length message, not an error, and the bytes that *did* arrive
+// are already in the caller's buffer.
+test "a closed peer reads as end of stream" {
+    const alloc = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try StreamPair.init(io);
+    defer pair.deinit(io);
+
+    try pair.send(io, "ab");
+    pair.closeClient(io);
+
+    var reader = emptyReader();
+    var buffer: [4]u8 = undefined;
+    try std.testing.expectError(error.EndOfStream, readAll(pair.readOptions(io, ms(500)), &reader, &buffer));
+    try std.testing.expectEqualStrings("ab", buffer[0..2]);
+}
+
+// Split packets are the norm (`writePacket` writes the header and the body
+// separately), so the per-refill deadline must not treat a partial packet as a
+// failure: the two halves arrive 100 ms apart and the read still completes.
+test "a split packet arrives across refills" {
+    const alloc = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     var pair = try StreamPair.init(io);
     defer pair.deinit(io);
 
     var group: Io.Group = .init;
     defer group.cancel(io);
-    try group.concurrent(io, wakeAfterDelay, .{ io, &pair });
+    try group.concurrent(io, sendAfterDelay, .{ io, &pair });
 
-    try std.testing.expectError(error.Canceled, waitReadable(.{
-        .seconds = 1,
-        .socket_fd = pair.client.socket.handle,
-        .wake_fd = pair.accepted.socket.handle,
-    }));
+    try pair.send(io, "abc"); // first half now, second half after 100 ms
+
+    var reader = emptyReader();
+    var buffer: [6]u8 = undefined;
+    try readAll(pair.readOptions(io, ms(1_000)), &reader, &buffer);
+    try std.testing.expectEqualStrings("abcdef", &buffer);
 }
 
-// The converse: an armed but quiet wake fd must not steal time from the idle
-// timeout — an idle connection still times out exactly as `--timeout` promises.
-test "a quiet wake fd does not shorten the idle timeout" {
-    const alloc = std.testing.allocator;
-
-    var threaded: std.Io.Threaded = .init(alloc, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var pair = try StreamPair.init(io);
-    defer pair.deinit(io);
-
-    // One second is the smallest `--timeout` (seconds are the unit), so this
-    // test is as fast as the option itself allows. Nobody sends, so the wake fd
-    // stays quiet and only the deadline can end the wait.
-    try std.testing.expectError(error.Timeout, waitReadable(.{
-        .seconds = 1,
-        .socket_fd = pair.client.socket.handle,
-        .wake_fd = pair.accepted.socket.handle,
-    }));
+fn sendAfterDelay(io: Io, pair: *StreamPair) Io.Cancelable!void {
+    try io.sleep(.{ .nanoseconds = 100 * 1_000_000 }, .awake);
+    pair.send(io, "def") catch return;
 }

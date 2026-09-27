@@ -75,8 +75,10 @@ Signatures, semantics, and the evidence behind every claim below live in
 1. **Does it have to be parallel?** If not, use a deadline or a single task — no group needed.
 2. **Parallel, all must finish** → `Group` + `await`. **Parallel, first one wins** → `Io.Select`.
 3. **Must outlive the caller** → long-lived `Group`, canceled on shutdown; otherwise `await` immediately.
-4. **Waiting on a socket** → a deadline *plus* a wake fd (a pipe the shutdown path writes to). A bare
-   `poll` is neither cancelable nor interruptible.
+4. **Waiting on a socket** → express it as an `Io` operation
+   (`io.operateTimeout(.{ .net_receive = … })`): it brings its own deadline *and* cancelation point,
+   and the backend decides whether a thread is parked. Hand-roll `poll` only when no operation fits —
+   and then you own the deadline, the `EINTR` retry, and the wakeup as well.
 5. **Capping** → decide in the accept path (refuse and let the kernel queue, or drop), never in the
    pool.
 
@@ -88,8 +90,10 @@ Signatures, semantics, and the evidence behind every claim below live in
    client count) is an invariant of your loop, not a pool setting you do not control.
 3. **Every task has an owner and a join.** A `Group`/`Select` dropped while tasks are pending leaks;
    every exit path must reach an `await` or `cancel`.
-4. **Design the wake path together with the wait.** Every hand-rolled blocking wait needs something
-   that can end it: a deadline, a second fd, or a cancelation check the code actually reaches.
+4. **Prefer an `Io` wait over a hand-rolled one.** `Io` waits carry a backend-owned deadline and are
+   cancelation points; a hand-rolled `poll` is neither, and needs a second fd (or a deadline) to be
+   interruptible at all. Write the wait as `Operation` + `operateTimeout` and the same code keeps
+   working when the backend stops parking a thread per wait.
 5. **Shutdown is a feature with a case of its own.** Test it: SIGINT while saturated, a peer that
    never answers, a client that stops reading. "It exits eventually" is a bug report.
 6. **Keep mutable state task-local, or lock it.** Per-task buffers and RNGs by default; `Io.Mutex`
@@ -100,6 +104,8 @@ Signatures, semantics, and the evidence behind every claim below live in
 ## Anti-patterns
 
 - A raw `poll`/`read` loop with no wake fd — permanent if the deadline is disabled.
+- Hand-rolling a `poll` for something `Io.Operation` already covers: you then own the deadline, the
+  `EINTR` retry, and the wakeup.
 - Waiting on a limit (`Semaphore.waitUncancelable`) in the accept path: it hides backpressure from the
   kernel and ignores signals.
 - Logging `error.Canceled` (or the `ReadFailed` that can wrap it) as a failure.
@@ -116,19 +122,21 @@ usually miss:
    not after the longest deadline among its parked waits;
 2. connect a peer that never answers and confirm the deadline fires as configured;
 3. re-read every hand-rolled wait and name the thing that ends it (deadline, wake fd, or a
-   cancelation point the code actually reaches).
+   cancelation point the code actually reaches) — and ask whether an `Io` operation could replace it
+   entirely.
 
-The shipped probe `./scripts/select_probe.zig` (5 self-contained `zig test` cases) re-checks the
-`Io.Select` contract — completion order, `cancel`/drain semantics, the buffer-size trap, and the fact
-that `Select` cannot interrupt a raw `poll`. Point it at your own toolchain before relying on any of
-it.
+The shipped probes re-check the contracts these rules rest on: `./scripts/select_probe.zig` (5 cases,
+`Io.Select` completion order, `cancel`/drain, the buffer-size trap) and `./scripts/operate_probe.zig`
+(5 cases, `operateTimeout(.net_receive)`: deadline, cancelation with **no** wake fd, no extra thread,
+EOF as a zero-length message). Point them at your own toolchain before relying on any of it.
 
 ## Checklist
 
 - [ ] Parallel work goes through `Io`/`Group`/`Select`; no `std.Thread.spawn`.
 - [ ] Every group/future is awaited or canceled on every exit path.
 - [ ] The number of simultaneously live tasks is bounded by an invariant you own, and you can state it.
-- [ ] Every blocking wait has a way out: a deadline, a wake fd, or a cancelation point it reaches.
+- [ ] Every blocking wait has a way out: a deadline, a wake fd, or a cancelation point it reaches
+      (an `Io` operation gives you the first two for free).
 - [ ] `error.Canceled` is handled as a normal shutdown, not reported as a failure.
 - [ ] Shared mutable state is task-local, or locked with the right mutex.
 - [ ] Behavior is pinned by a test, and the APIs were checked against the *installed* stdlib.

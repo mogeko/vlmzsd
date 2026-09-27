@@ -413,14 +413,14 @@ fn serveClientThread(ctx: *ClientContext) void {
         .use_ndr64 = ctx.use_ndr64,
         .use_btfn = ctx.use_btfn,
         .disconnect_per_request = ctx.disconnect_per_request,
-        // `wake_fd` is the shutdown pipe's read end: the signal handler's byte
-        // ends every parked read with `error.Canceled`, so SIGINT/SIGTERM does
-        // not wait for each connection's `--timeout`.
-        .idle = .{
-            .seconds = ctx.timeout_seconds,
-            .socket_fd = ctx.stream.socket.handle,
-            .wake_fd = shutdown_pipe[0],
-        },
+        // Reads go through `Io.operateTimeout(.net_receive)`: the backend owns
+        // the deadline and the cancelation point, so SIGINT/SIGTERM ends every
+        // parked read at once (no self-pipe needed).
+        .idle = .{ .peer = .{
+            .io = ctx.io,
+            .handle = ctx.stream.socket.handle,
+            .timeout = network.timeoutSeconds(ctx.timeout_seconds),
+        } },
     }) catch |e| switch (e) {
         error.EndOfStream => {
             if (!ctx.quiet) ctx.log.debug("connection from {s} closed", .{peer});
@@ -429,8 +429,8 @@ fn serveClientThread(ctx: *ClientContext) void {
             if (!ctx.quiet) ctx.log.debug("connection from {s} timed out", .{peer});
         },
         error.Canceled => {
-            // The shutdown pipe woke this read (see `IdleTimeout.wake_fd`):
-            // that is a clean exit, not a failure.
+            // The read wait is a backend cancelation point, so a cancelation
+            // request (shutdown) ends it directly: a clean exit, not a failure.
             if (!ctx.quiet) ctx.log.debug("connection from {s} closed at shutdown", .{peer});
         },
         else => ctx.log.warn("connection from {s} error: {s}", .{ peer, @errorName(e) }),
@@ -847,10 +847,10 @@ pub fn main(init: std.process.Init) !void {
         fatal(&log, init.io, "too many listen sockets (max {d})", .{max_listen_sockets});
     }
 
-    // Signals first: the pipe's read end is handed to every connection as
-    // `IdleTimeout.wake_fd`, so it must outlive the tasks that poll it. Defers
-    // run in reverse, so this one has to be declared *before* the connection
-    // group's to run after it.
+    // Signals first, so the shutdown pipe outlives its waiters and its close
+    // runs after the connection group joins (defers run in reverse). Reads no
+    // longer poll the pipe — they are canceled through `Io` — but the accept
+    // loop does, and keeping the order rules out a close-before-join bug.
     installSignalHandlers(init.io, &log);
     defer {
         _ = std.c.close(shutdown_pipe[0]);
