@@ -7,29 +7,46 @@ Why this works
 the `std.Io.Threaded` pool. The pool spawns a fresh thread whenever a task is
 dispatched and no pool thread happens to be idle, and a worker thread only exits
 at `Threaded.deinit` — never while the process lives. So the process's thread
-count equals the **peak** number of simultaneously open connections (+2: the
-accept loop and the log writer), and it never shrinks again (see
-docs/migration.md -> Concurrency).
+count equals the **peak** number of *served* connections (+2: the accept loop
+and the log writer), and it never shrinks again — *served*, because
+`--max-clients` caps how many run at once (see `AGENTS.md` -> Concurrency;
+the deviation from C is in docs/migration.md §5).
 
 A connection needs to send nothing: the task blocks in the first packet read
 immediately after `accept`, so an idle socket already occupies one thread. This
 script therefore just keeps N sockets open at once and reconnects whenever the
-server drops one (e.g. on its idle `--timeout`), optionally ramping N up until a
-limit is hit.
+server drops one (e.g. on its idle `--timeout`), raising N on a ramp by default
+so the thread count can be watched climbing rather than appearing all at once.
 
 Usage:
-    thread_flood.py [HOST[:PORT]] [--connections N] [--duration SEC]
-                    [--ramp] [--max N] [--step N] [--step-seconds SEC] [--quiet]
+    thread_flood.py [HOST[:PORT]] [--start N] [--max N] [--step N]
+                    [--step-seconds SEC] [--duration SEC] [--quiet]
+    thread_flood.py [HOST[:PORT]] --connections N [--duration SEC] [--quiet]
+
+By default the flood **ramps**: it opens `--start` (default 128) sockets, then
+adds `--step` (128) more every `--step-seconds` (1s) until it reaches `--max`
+(2048 — twice the server's `--max-clients` default; `src/main.zig`
+`default_client_cap`, `docs/cli.md` §5). Slamming the full count down at once
+would spawn a thousand server threads in one burst and measure only the spawn
+path; climbing instead shows the thread count rise, plateau, and hold.
+`--connections N` pins a fixed count instead — `--connections 1024` is the
+churn-free run at exactly the cap.
 
 Watch the server's thread count while it runs (1s interval):
     watch -n1 "ls /proc/\\$(pidof vlmzsd)/task | wc -l"          # same host/ctr
     podman exec <ctr> sh -c 'ls /proc/$(pidof vlmzsd)/task | wc -l'
 
 Reading the result:
-    * thread count ≈ peak connections + 2, and it stays after this script exits;
-    * a plateau at N+2 means the server's client cap is doing its job
-      (`--max-clients N`, default 1024): the cap is checked *before* accept, so
-      further connections wait in the kernel backlog instead of being served;
+    * server thread count ≈ min(peak connections, `--max-clients`) + 2, and it
+      stays after this script exits;
+    * the cap is checked *before* `accept`, so once it is reached the listen
+      sockets leave the poll set and surplus connections sit in the kernel's
+      listen queue instead of occupying a worker;
+    * this script's open count therefore plateaus at the cap + that queue
+      (`kern.ipc.somaxconn`, 128 on macOS → measured 1152 open, 1026 server
+      threads against a default server). Whatever does not fit is refused by
+      the kernel, which shows up as `reconnect`/`fail` churn: expected, not a
+      server fault. `--connections 1024` gives a churn-free run at the cap;
     * connect storms that get closed immediately mean the server is refusing to
       dispatch ("failed to dispatch client task" in its log) — its thread/pids
       limit is reached.
@@ -48,6 +65,9 @@ import time
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 1688
 FD_TARGET = 65536
+# The server's own `--max-clients` default (src/main.zig `default_client_cap`,
+# docs/cli.md §5). Lives here so the flood target is derived, not duplicated.
+DEFAULT_CLIENT_CAP = 1024
 
 
 def parse_target(text):
@@ -161,12 +181,15 @@ class Flood:
 
 def main(argv):
     host, port = DEFAULT_HOST, DEFAULT_PORT
-    target = 256
+    # Ramping is the default: offering the whole count at once would create a
+    # thousand server threads in a single burst, which measures the spawn path
+    # and nothing else. `--connections N` pins a fixed count instead.
+    start = 128
+    target = None  # set by --connections; None means ramp
+    maximum = 2 * DEFAULT_CLIENT_CAP
+    step = 128
+    step_seconds = 1.0
     duration = 30.0
-    ramp = False
-    maximum = 8192
-    step = 64
-    step_seconds = 2.0
     quiet = False
 
     args = list(argv)
@@ -183,8 +206,9 @@ def main(argv):
         elif arg == "--duration":
             i += 1
             duration = float(args[i])
-        elif arg == "--ramp":
-            ramp = True
+        elif arg == "--start":
+            i += 1
+            start = int(args[i])
         elif arg == "--max":
             i += 1
             maximum = int(args[i])
@@ -206,10 +230,18 @@ def main(argv):
     if positional:
         host, port = parse_target(positional[0])
 
+    ramping = target is None
+    if ramping:
+        target = min(start, maximum)
+
     flood = Flood(host, port)
-    print(f"flooding {host}:{port} — target {target} open connections"
-          f"{', ramping to %d' % maximum if ramp else ''}"
-          f" for {duration:.0f}s (fd limit {flood.fd_limit})", flush=True)
+    if ramping:
+        print(f"flooding {host}:{port} — ramping {target} → {maximum} connections "
+              f"(+{step} every {step_seconds:g}s) for {duration:.0f}s "
+              f"(fd limit {flood.fd_limit})", flush=True)
+    else:
+        print(f"flooding {host}:{port} — target {target} open connections "
+              f"for {duration:.0f}s (fd limit {flood.fd_limit})", flush=True)
 
     started = time.monotonic()
     next_step = started + step_seconds
@@ -225,15 +257,15 @@ def main(argv):
             flood.connect_more(target)
 
             now = time.monotonic()
-            if ramp and now >= next_step and target < maximum:
+            if ramping and now >= next_step and target < maximum:
                 target = min(maximum, target + step)
                 next_step = now + step_seconds
             if not quiet and now >= next_report:
                 next_report = now + 1.0
-                print(f"  t={now - started:5.0f}s  open={len(flood.open):5d}"
-                      f"  peak={flood.peaks:5d}  opened={flood.opened:6d}"
-                      f"  reconnect={flood.reconnects:6d}  fail={flood.failures:5d}",
-                      flush=True)
+                print(f"  t={now - started:5.0f}s  target={target:5d}"
+                      f"  open={len(flood.open):5d}  peak={flood.peaks:5d}"
+                      f"  opened={flood.opened:6d}  reconnect={flood.reconnects:6d}"
+                      f"  fail={flood.failures:5d}", flush=True)
             # A capped server (--max-clients, default 1024) stops accepting while
             # it is saturated, so extra connects either wait in the kernel
             # backlog or come back reset once that is full. Say so rather than
@@ -252,8 +284,12 @@ def main(argv):
 
     print(f"done: peak {flood.peaks} simultaneous connections, "
           f"{flood.opened} opened, {flood.reconnects} reconnects, {flood.failures} failures", flush=True)
+    # The server serves at most its --max-clients cap, so its thread count
+    # follows min(peak, cap) + 2 — not peak + 2, which the surplus would inflate.
+    served = min(flood.peaks, DEFAULT_CLIENT_CAP)
     print(f"left open at exit: {open_now}  (sockets closed, but the server's thread count stays "
-          f"at ~{flood.peaks + 2} until it restarts)", flush=True)
+          f"at ~{served + 2} = min(peak {flood.peaks}, cap {DEFAULT_CLIENT_CAP}) + 2, until it "
+          f"restarts)", flush=True)
     return 0
 
 
