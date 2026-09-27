@@ -102,10 +102,17 @@ group.await(io) catch |e| handle(e);
   catches *every* socket error — including `error.Canceled` — and rewrites it as
   `error.ReadFailed`, stashing the real error in `Stream.Reader.err`. A connection canceled at
   shutdown therefore looks like a read failure. If you log errors at the `*Io.Reader` level you
-  cannot tell them apart; do not report "canceled at shutdown" as a `warn`.
-- **`std.posix.poll` is not a cancelation point.** It is interrupted by the signal but retried, so a
-  worker parked in `waitReadable` only notices cancelation after its check, bounding shutdown
-  latency by `--timeout`.
+  cannot tell them apart; do not report "canceled at shutdown" as a `warn`. (A connection parked in
+  the read wait is woken through `IdleTimeout.wake_fd` and unwinds as `error.Canceled` before ever
+  reaching `readVec`, so `serveClientThread` handles it at `debug`; a `ReadFailed` warn now means a
+  failure *inside* a read.)
+- **`std.posix.poll` is not a cancelation point — poll the shutdown pipe instead.** It is interrupted
+  by `SIG.IO` but retried, so a worker parked in `waitReadable` would only notice cancelation once its
+  poll deadline expired (bounding shutdown latency by `--timeout`). The server therefore passes the
+  read end of its shutdown pipe as `IdleTimeout.wake_fd`; the wait then ends with `error.Canceled` the
+  moment the signal handler writes its byte — including for `--timeout 0` connections. Anything new
+  that parks on a socket must be woken the same way, and the pipe must outlive the joins: that is why
+  the pipe-close `defer` is declared *before* `conn_group.cancel`'s (defers run in reverse).
 - **The accept loop must never block on a limit.** A `Semaphore.waitUncancelable` in front of the
   dispatch is not a cancelation point, so SIGINT would not be honored until a task posted a permit —
   and it accepts connections it cannot serve, hiding backpressure from the kernel. `InFlight`
@@ -119,7 +126,8 @@ group.await(io) catch |e| handle(e);
 ## Checklist
 
 - [ ] No `std.Thread.spawn`; parallel work goes through a `Group` (`Group.concurrent`).
-- [ ] The group is awaited or canceled on every exit path.
+- [ ] The group is awaited or canceled on every exit path; anything that parks on a socket is woken
+      at shutdown (`IdleTimeout.wake_fd`), and that wake fd outlives the joins.
 - [ ] `error.ConcurrencyUnavailable` handled; per-task heap context freed in the task's `defer`.
 - [ ] Concurrency bounds are explicit (the `InFlight` gate for `--max-clients`, or `concurrent_limit`).
 - [ ] Shared mutable state is locked (`Io.Mutex` / `std.atomic.Mutex`); per-connection PRNG and

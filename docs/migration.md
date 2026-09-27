@@ -239,7 +239,11 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
   full, so a peer that sends half a packet and then stalls would block past the deadline — and split
   packets are the norm, since `writePacket` writes the header and the body separately. Bytes already
   buffered are consumed without polling (the read-ahead pitfall). The server loop and the client
-  (`vlmzs --timeout`) share the same `IdleTimeout`. The client has **no connect deadline**:
+  (`vlmzs --timeout`) share the same `IdleTimeout`. The server also arms `IdleTimeout.wake_fd` with
+  the read end of its shutdown pipe: SIGINT/SIGTERM writes one byte there and every parked read
+  returns `error.Canceled` at once (logged at `debug`), instead of each connection waiting out its
+  own `--timeout` — so shutdown latency is bounded by task teardown, not by `--timeout`, and even
+  `--timeout 0` connections stay interruptible. The client has **no connect deadline**:
   `std.Io.Threaded` in 0.16 still panics on `ConnectOptions.timeout` ("TODO implement"), so an
   unreachable host is bounded only by the kernel's SYN timeout.
 - Client: DNS via `Io.net.HostName.lookup` (with address-family filtering); default host `::1` (IPv6) or `127.0.0.1`;

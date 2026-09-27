@@ -91,6 +91,11 @@ worker, and one warning is logged per saturation period. `0` restores the unboun
 reported as a warning at startup. The thread count is therefore at most
 `min(peak concurrent clients, --max-clients) + 2` (the accept loop and the log writer).
 
+`--timeout` bounds how long a read waits for its peer; `0` disables the idle timeout, so a silent
+peer is kept until it disconnects. Reads also wait on the shutdown pipe, so SIGINT/SIGTERM ends every
+parked read immediately (even with `--timeout 0`) and the server exits without waiting out live
+connections.
+
 ### Data
 
 | Option | Short | Default | Env var | Notes |

@@ -77,7 +77,8 @@ source linked above).
   (`InFlight`) checked *before* `accept`: while at the cap the listen sockets leave the poll set, so
   excess connections queue in the kernel backlog. The pool itself never shrinks (a worker lives until
   `deinit`), so this gate is what keeps threads at `min(peak clients, cap) + 2`. `Group.cancel` joins
-  in-flight tasks at shutdown. Per-connection state (PRNG, 4 KiB read/write buffers) stays
+  in-flight tasks at shutdown, and every connection read polls the shutdown pipe as
+  `IdleTimeout.wake_fd`, so SIGINT/SIGTERM ends a parked read with `error.Canceled` at once. Per-connection state (PRNG, 4 KiB read/write buffers) stays
   task-local; shared mutable state uses `Io.Mutex` (logger) or `std.atomic.Mutex` (client lists).
 
 ## CLI implementation decisions

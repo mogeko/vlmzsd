@@ -29,6 +29,10 @@ const Io = std.Io;
 /// caller in the kernel. Split packets are the normal case here — `writePacket`
 /// sends the header and the body as two separate writes, and TCP may segment
 /// them further — which is why the poll happens per refill, not per packet.
+///
+/// The wait also ends early with `error.Canceled` when `IdleTimeout.wake_fd`
+/// becomes readable: that is how a shutdown signal abandons every parked
+/// connection at once instead of after its own timeout.
 pub fn readAll(idle: IdleTimeout, reader: *Io.Reader, buf: []u8) !void {
     var off: usize = 0;
     while (off < buf.len) {
@@ -107,28 +111,49 @@ fn writePacket(
 }
 
 /// Idle timeout for reads on a connected socket: how long to wait for the peer
-/// to answer (`seconds = 0` waits forever) and which socket to poll. Both the
-/// server loop and the client use it, so `--timeout` means the same on either
-/// side of the connection.
+/// to answer (`seconds = 0` waits forever), which socket to poll, and an
+/// optional fd whose readability aborts the wait. Both the server loop and the
+/// client use it, so `--timeout` means the same on either side of the
+/// connection.
 pub const IdleTimeout = struct {
     seconds: u32 = 0,
     /// Connected socket, polled for readability before each packet read. `0`
     /// disables the timeout (the fd is unknown).
     socket_fd: std.posix.socket_t = 0,
+    /// Extra fd polled alongside the socket; `0` means none. The server passes
+    /// the read end of its shutdown pipe, so SIGINT/SIGTERM ends a parked read
+    /// with `error.Canceled` immediately — even with `--timeout 0` — instead of
+    /// letting each connection sit out its own idle timeout. The client leaves
+    /// it `0`: it installs no signal handler.
+    wake_fd: std.posix.socket_t = 0,
 };
 
-/// Wait until the connected socket has something to read, or return
-/// `error.Timeout` once the idle timeout elapses. A no-op when the timeout is
-/// disabled or the fd is unknown; callers that already hold buffered bytes
-/// skip it entirely.
+/// Wait until the connected socket, or an armed wake fd, has something to read;
+/// return `error.Timeout` once the idle timeout elapses, or `error.Canceled`
+/// when the wake fd fires (the process is shutting down). A no-op when the
+/// socket is unknown (in-memory readers, tests); callers that already hold
+/// buffered bytes skip it entirely.
 fn waitReadable(idle: IdleTimeout) !void {
-    if (idle.seconds == 0 or idle.socket_fd == 0) return;
-    var fds = [1]std.posix.pollfd{.{ .fd = idle.socket_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    if (idle.socket_fd == 0) return;
+
+    var fds = [2]std.posix.pollfd{
+        .{ .fd = idle.socket_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = idle.wake_fd, .events = std.posix.POLL.IN, .revents = 0 },
+    };
+    const count: usize = if (idle.wake_fd == 0) 1 else 2;
+
     // `poll` takes an i32 millisecond count; clamp so a legal but huge
     // `--timeout` (e.g. `30d`) cannot overflow it in a safety-checked build.
-    const timeout_ms: i32 = @intCast(@min(@as(u64, idle.seconds) * 1000, std.math.maxInt(i32)));
-    const n = try std.posix.poll(&fds, timeout_ms);
+    // `seconds = 0` means "no deadline": poll with `-1` (never times out) so
+    // the wait stays interruptible through the wake fd.
+    const max_ms: u64 = std.math.maxInt(i32);
+    const timeout_ms: i32 = if (idle.seconds == 0) -1 else @intCast(@min(@as(u64, idle.seconds) * 1000, max_ms));
+
+    const n = try std.posix.poll(fds[0..count], timeout_ms);
     if (n == 0) return error.Timeout;
+    // The wake fd wins: on shutdown the socket may be readable at the same
+    // time, and abandoning the connection is what the caller wants.
+    if (idle.wake_fd != 0 and fds[1].revents != 0) return error.Canceled;
 }
 
 /// Serve the RPC loop over a connected stream (equivalent to the C `rpcServer`).
@@ -814,4 +839,85 @@ test "client bind handshake" {
     try std.testing.expect(sent.len >= rpc.header_size);
     const sent_header = parseHeader(sent);
     try std.testing.expectEqual(rpc.packet_type.bind_req, sent_header.packet_type);
+}
+
+/// Test helper: a connected socket whose peer never writes, so a wait on it
+/// would block until the idle timeout fires.
+fn idleSocketPair(io: Io) !struct { server: Io.net.Server, stream: Io.net.Stream } {
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try Io.net.IpAddress.listen(&addr, io, .{ .mode = .stream });
+    errdefer server.deinit(io);
+    const stream = try Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
+    return .{ .server = server, .stream = stream };
+}
+
+/// Test helper: wait, then make `fd` readable — stands in for the signal
+/// handler writing its byte to the shutdown pipe.
+fn wakeAfterDelay(io: Io, fd: std.posix.fd_t) Io.Cancelable!void {
+    try io.sleep(.{ .nanoseconds = 200_000_000 }, .awake);
+    const byte: [1]u8 = .{1};
+    _ = std.c.write(fd, &byte, 1);
+}
+
+// The server parks every idle connection in `waitReadable` with its shutdown
+// pipe as `wake_fd`; this is the contract that makes SIGINT/SIGTERM prompt. The
+// wake byte lands after the wait has parked but well before the deadline, so a
+// `Timeout` here would mean the wake fd was ignored — the failing case would
+// take a second instead of 200 ms.
+test "a parked read is aborted by the wake fd" {
+    const alloc = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try idleSocketPair(io);
+    defer pair.server.deinit(io);
+    defer pair.stream.close(io);
+
+    var wake_fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&wake_fds));
+    defer {
+        _ = std.c.close(wake_fds[0]);
+        _ = std.c.close(wake_fds[1]);
+    }
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, wakeAfterDelay, .{ io, wake_fds[1] });
+
+    try std.testing.expectError(error.Canceled, waitReadable(.{
+        .seconds = 1,
+        .socket_fd = pair.stream.socket.handle,
+        .wake_fd = wake_fds[0],
+    }));
+}
+
+// The converse: an armed but quiet wake fd must not steal time from the idle
+// timeout — an idle connection still times out exactly as `--timeout` promises.
+test "a quiet wake fd does not shorten the idle timeout" {
+    const alloc = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try idleSocketPair(io);
+    defer pair.server.deinit(io);
+    defer pair.stream.close(io);
+
+    var wake_fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&wake_fds));
+    defer {
+        _ = std.c.close(wake_fds[0]);
+        _ = std.c.close(wake_fds[1]);
+    }
+
+    // One second is the smallest `--timeout` (seconds are the unit), so this
+    // test is as fast as the option itself allows.
+    try std.testing.expectError(error.Timeout, waitReadable(.{
+        .seconds = 1,
+        .socket_fd = pair.stream.socket.handle,
+        .wake_fd = wake_fds[0],
+    }));
 }

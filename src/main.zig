@@ -413,13 +413,25 @@ fn serveClientThread(ctx: *ClientContext) void {
         .use_ndr64 = ctx.use_ndr64,
         .use_btfn = ctx.use_btfn,
         .disconnect_per_request = ctx.disconnect_per_request,
-        .idle = .{ .seconds = ctx.timeout_seconds, .socket_fd = ctx.stream.socket.handle },
+        // `wake_fd` is the shutdown pipe's read end: the signal handler's byte
+        // ends every parked read with `error.Canceled`, so SIGINT/SIGTERM does
+        // not wait for each connection's `--timeout`.
+        .idle = .{
+            .seconds = ctx.timeout_seconds,
+            .socket_fd = ctx.stream.socket.handle,
+            .wake_fd = shutdown_pipe[0],
+        },
     }) catch |e| switch (e) {
         error.EndOfStream => {
             if (!ctx.quiet) ctx.log.debug("connection from {s} closed", .{peer});
         },
         error.Timeout => {
             if (!ctx.quiet) ctx.log.debug("connection from {s} timed out", .{peer});
+        },
+        error.Canceled => {
+            // The shutdown pipe woke this read (see `IdleTimeout.wake_fd`):
+            // that is a clean exit, not a failure.
+            if (!ctx.quiet) ctx.log.debug("connection from {s} closed at shutdown", .{peer});
         },
         else => ctx.log.warn("connection from {s} error: {s}", .{ peer, @errorName(e) }),
     };
@@ -831,22 +843,26 @@ pub fn main(init: std.process.Init) !void {
     // `deinit`), and `std.process.Init` does not expose its options, so the
     // bound has to be our own invariant.
 
+    if (servers.items.len > max_listen_sockets) {
+        fatal(&log, init.io, "too many listen sockets (max {d})", .{max_listen_sockets});
+    }
+
+    // Signals first: the pipe's read end is handed to every connection as
+    // `IdleTimeout.wake_fd`, so it must outlive the tasks that poll it. Defers
+    // run in reverse, so this one has to be declared *before* the connection
+    // group's to run after it.
+    installSignalHandlers(init.io, &log);
+    defer {
+        _ = std.c.close(shutdown_pipe[0]);
+        _ = std.c.close(shutdown_pipe[1]);
+    }
+
     // Long-lived group for the connection tasks. Each task's resources are
     // released when it returns; canceling the group on shutdown asks in-flight
     // tasks to stop and waits for their cleanup, which is also what lets the
     // log queue drain afterwards (see the `log_group` defers above).
     var conn_group: Io.Group = .init;
     defer conn_group.cancel(init.io);
-
-    if (servers.items.len > max_listen_sockets) {
-        fatal(&log, init.io, "too many listen sockets (max {d})", .{max_listen_sockets});
-    }
-
-    installSignalHandlers(init.io, &log);
-    defer {
-        _ = std.c.close(shutdown_pipe[0]);
-        _ = std.c.close(shutdown_pipe[1]);
-    }
 
     var server: ServerContext = .{
         .gpa = init.gpa,
