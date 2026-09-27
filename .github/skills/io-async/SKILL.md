@@ -118,6 +118,11 @@ usually miss:
 3. re-read every hand-rolled wait and name the thing that ends it (deadline, wake fd, or a
    cancelation point the code actually reaches).
 
+The shipped probe `./scripts/select_probe.zig` (5 self-contained `zig test` cases) re-checks the
+`Io.Select` contract — completion order, `cancel`/drain semantics, the buffer-size trap, and the fact
+that `Select` cannot interrupt a raw `poll`. Point it at your own toolchain before relying on any of
+it.
+
 ## Checklist
 
 - [ ] Parallel work goes through `Io`/`Group`/`Select`; no `std.Thread.spawn`.

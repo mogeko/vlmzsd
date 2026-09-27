@@ -146,6 +146,30 @@ pub fn Select(comptime U: type) type = struct {
 Each task's result is tagged into the union `U`; `await`/`cancel` must be called before the select is
 deinitialized. This is a *task* combinator — it cannot wait on a set of file descriptors.
 
+**It is usable on `Threaded`** (verified by running [select_probe.zig](../scripts/select_probe.zig),
+5/5 green, Zig 0.16.0 on macOS; re-run it on your toolchain — one command, self-contained):
+
+| Observation | Measured |
+|---|---|
+| `await` returns the first task to **complete**, not the first dispatched (slow one dispatched first, 400 ms vs 20 ms) | returned the fast one after **25 ms** |
+| `await` may be called again, and tasks may be added in between (docs: legal) | second `await` on the same select worked |
+| `cancel` interrupts tasks parked in a cancelation point (`Io.sleep`), then blocks until they finish | returned in **0 ms** for two 10 s sleepers; both reported the canceled path |
+| Draining: call `cancel` until it returns `null` (idempotent) | `0x77, 0x77, null, null` |
+| `awaitMany(buf, min)` returns ≥ `min` results in completion order, without waiting for the rest | `min=2` of 3 tasks (10/40/90 ms) → 2 results after **44 ms**: `.a, .b` |
+| `cancel` cannot interrupt a task parked in a raw `std.posix.poll` | still blocked after 300 ms; returned **302 ms**, only once the fd became readable |
+
+Two sharp edges the probe pins down:
+
+- **Buffer size is a correctness parameter.** `init(io, buffer)` must have room for every task that
+  can finish before you drain, otherwise a finished task parks inside `queue.putOneUncancelable`
+  (uncancelable — the queue is full) and `cancel`/`group.cancel` waits for it: the std docs' "a
+  deadlock occurs". Controlled probe: 2 tasks + 2 slots → `cancel` drained cleanly in 0 ms; 2 tasks +
+  **1** slot → `cancel` still blocked after 300 ms until a slot was freed by hand.
+- **Task return types are the union field, not `Cancelable!void`.** A `Select` task has nowhere to
+  propagate `error.Canceled`, so it must handle cancelation itself (e.g. `io.sleep(...) catch return
+  canceled_value`). And because the wait quality is inherited from the task, `Select` does not by
+  itself give "react to N sockets at once" — each task's own wait must be cancelable or wakeable.
+
 ## Typed operations
 
 ```zig
