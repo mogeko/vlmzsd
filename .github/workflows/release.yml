@@ -21,6 +21,8 @@ jobs:
       output: image
       push: ${{ github.event_name != 'pull_request' }}
       platforms: linux/amd64,linux/arm64
+      build-args: |
+        VLMZSD_GIT_SHA=${{ github.sha }}
       set-meta-labels: true
       set-meta-annotations: true
       meta-images: |

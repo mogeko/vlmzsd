@@ -15,5 +15,11 @@ jobs:
       - uses: mogeko/setup-zig@v1
       - run: zig build vlmzsd vlmzs kmdconv --summary all
       - run: zig build test --summary all
-      - run: ./zig-out/bin/vlmzsd --version
-      - run: ./zig-out/bin/vlmzs --version
+      - run: |
+          for bin in ./zig-out/bin/vlmzsd ./zig-out/bin/vlmzs; do
+            "$bin" --version
+            if "$bin" --version | grep -q unknown; then
+              echo "::error::$bin reports 'unknown': the git hash was not embedded"
+              exit 1
+            fi
+          done
