@@ -82,7 +82,19 @@ Grouped by concern (help is rendered in these groups).
 | `--port <n>` | `-p` | `1688` | `VLMZSD_PORT` | TCP listen port |
 | `--listen <addr>` | `-L` | `::` (dual-stack) | `VLMZSD_LISTEN` | repeatable / comma-separated |
 | `--timeout <dur>` | | `30s` | `VLMZSD_TIMEOUT` | idle timeout; `0` disables |
-| `--max-clients <n>` | `-m` | unlimited | `VLMZSD_MAX_CLIENTS` | concurrent client cap |
+| `--max-clients <n>` | `-m` | `1024` | `VLMZSD_MAX_CLIENTS` | concurrent client cap; `0` = unlimited |
+
+`--max-clients` bounds the number of concurrent client connections, and with it the server's worker
+threads (`std.Io.Threaded` never reclaims a thread). While the cap is reached the listener stops
+accepting: further connections wait in the kernel backlog (TCP backpressure) instead of occupying a
+worker, and one warning is logged per saturation period. `0` restores the unbounded behaviour and is
+reported as a warning at startup. The thread count is therefore at most
+`min(peak concurrent clients, --max-clients) + 2` (the accept loop and the log writer).
+
+`--timeout` bounds how long a read waits for its peer; `0` disables the idle timeout, so a silent
+peer is kept until it disconnects. Reads also wait on the shutdown pipe, so SIGINT/SIGTERM ends every
+parked read immediately (even with `--timeout 0`) and the server exits without waiting out live
+connections.
 
 ### Data
 

@@ -30,6 +30,16 @@ const max_listen_sockets = 64;
 /// Longest decimal PID string (generous upper bound).
 const pid_str_buffer_size = 16;
 
+/// Default `--max-clients` cap. Bounds the concurrent client tasks, and with
+/// them the pooled threads: `std.Io.Threaded` neither reclaims idle workers nor
+/// reports its options (see `ServerContext.in_flight`). `0` still means
+/// "unlimited" (docs/cli.md §5).
+const default_client_cap: u32 = 1024;
+/// Poll timeout in milliseconds while the client cap is reached. Nothing else
+/// would wake the accept loop when a slot frees, so the loop re-checks the gate
+/// on this interval instead of blocking indefinitely.
+const saturated_poll_ms: i32 = 100;
+
 /// Embedded default `.kmd` data, unless built with `-Dno-embedded-data`
 /// (then `--data <file>` is required at runtime).
 const embedded_kmd: []const u8 = if (build_options.embedded_data) @embedFile("vlmcsd.kmd") else &.{};
@@ -43,7 +53,7 @@ const vlmzsd_opts = [_]cli_helper.Opt{
     .{ .name = "port", .short = 'p', .kind = .int, .hint = "u16", .group = "Network", .desc = "TCP listen port (default 1688)" },
     .{ .name = "listen", .short = 'L', .kind = .str, .hint = "addr", .group = "Network", .desc = "Listen address, repeatable (default ::, dual-stack)", .repeatable = true },
     .{ .name = "timeout", .kind = .str, .hint = "dur", .group = "Network", .desc = "Idle timeout (default 30s, 0 disables)" },
-    .{ .name = "max-clients", .short = 'm', .kind = .int, .hint = "u32", .group = "Network", .desc = "Concurrent client cap (default unlimited)" },
+    .{ .name = "max-clients", .short = 'm', .kind = .int, .hint = "u32", .group = "Network", .desc = "Concurrent client cap (default 1024, 0 = unlimited)" },
     .{ .name = "data", .kind = .str, .hint = "file", .group = "Data", .desc = "External .kmd data file (default embedded)" },
     .{ .name = "epid", .kind = .str, .hint = "name=epid", .group = "ePID", .desc = "ePID override name=epid, repeatable", .repeatable = true },
     .{ .name = "randomize", .kind = .int, .hint = "u8", .group = "ePID", .desc = "ePID randomization level 0/1/2 (default 1)" },
@@ -70,7 +80,7 @@ const ServerOptions = struct {
     port: u16 = default_port,
     listen: []const []const u8 = &.{"::"},
     timeout_seconds: u64 = 30,
-    max_clients: u32 = 0,
+    max_clients: u32 = default_client_cap,
     data_file: ?[]const u8 = null,
     epids: []const []const u8 = &.{},
     randomize: u8 = 1,
@@ -192,7 +202,7 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, res: *const cli_helper
         break :blk try cli_helper.parseDurationSeconds(raw);
     };
 
-    opts.max_clients = try resolveInt(u32, res.get("max-clients"), env, "VLMZSD_MAX_CLIENTS", 0);
+    opts.max_clients = try resolveInt(u32, res.get("max-clients"), env, "VLMZSD_MAX_CLIENTS", default_client_cap);
     opts.data_file = resolveStr(res.get("data"), env, "VLMZSD_DATA", null);
 
     const epids = res.getAll("epid");
@@ -283,6 +293,46 @@ fn buildEpidOverrides(
     return overrides;
 }
 
+/// Admission gate for concurrent client tasks, replacing a blocking
+/// `Io.Semaphore` wait: `Io.Semaphore` offers no non-blocking query, so the
+/// accept loop could not ask "is there room?" *before* accepting, and would sit
+/// in `waitUncancelable` (not a cancelation point) after every extra `accept`.
+///
+/// Invariant: the accept loop is the sole acquirer, which is what lets `peak`
+/// be a plain counter. A second acceptor would also need a CAS loop for it (and
+/// could race the cap check in `acceptOne`).
+const InFlight = struct {
+    count: std.atomic.Value(u32) = .init(0),
+    /// Maximum concurrent client tasks; `0` means unlimited.
+    cap: u32,
+    /// High-water mark of `count`; written only by the accept loop.
+    peak: u32 = 0,
+
+    /// Take a slot, or report that the gate is closed. Never blocks.
+    fn tryAcquire(self: *InFlight) bool {
+        if (self.cap != 0) {
+            if (self.count.load(.acquire) >= self.cap) return false;
+        }
+        const n = self.count.fetchAdd(1, .acq_rel) + 1;
+        self.peak = @max(self.peak, n);
+        std.debug.assert(n <= self.cap or self.cap == 0);
+        return true;
+    }
+
+    /// Return a slot taken by `tryAcquire`; must be called exactly once per
+    /// successful acquire.
+    fn release(self: *InFlight) void {
+        const previous = self.count.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+    }
+
+    /// True while no slot is free. Always false when the cap is `0`.
+    fn atCap(self: *const InFlight) bool {
+        if (self.cap == 0) return false;
+        return self.count.load(.acquire) >= self.cap;
+    }
+};
+
 /// Per-connection worker context. Allocated per accepted client and owned by
 /// the worker thread, which destroys it on exit.
 const ClientContext = struct {
@@ -296,7 +346,7 @@ const ClientContext = struct {
     use_btfn: bool,
     disconnect_per_request: bool,
     timeout_seconds: u32,
-    sem: ?*Io.Semaphore,
+    in_flight: *InFlight,
     log: *cli_helper.Logger,
     /// Mirror of `ServerOptions.quiet_loopback` (the opt-in).
     quiet_loopback: bool = false,
@@ -328,12 +378,16 @@ fn logProtocolEvent(context: ?*anyopaque, event: network.Event) void {
 }
 
 /// Serve one connection as a pooled task (dispatched via `Group.concurrent`).
-/// Releases the semaphore and frees the context on exit.
+/// Releases its admission slot and frees the context on exit.
 fn serveClientThread(ctx: *ClientContext) void {
     defer {
         ctx.stream.close(ctx.io);
-        if (ctx.sem) |sem| sem.post(ctx.io);
+        // Copy the gate out before `destroy` invalidates `ctx`, and release
+        // last: the count must never lag behind the resources it accounts for,
+        // or the accept loop could admit a client over the cap.
+        const in_flight = ctx.in_flight;
         ctx.gpa.destroy(ctx);
+        in_flight.release();
     }
 
     // Only when --quiet-loopback is on, and only for loopback peers (the
@@ -359,13 +413,25 @@ fn serveClientThread(ctx: *ClientContext) void {
         .use_ndr64 = ctx.use_ndr64,
         .use_btfn = ctx.use_btfn,
         .disconnect_per_request = ctx.disconnect_per_request,
-        .idle = .{ .seconds = ctx.timeout_seconds, .socket_fd = ctx.stream.socket.handle },
+        // `wake_fd` is the shutdown pipe's read end: the signal handler's byte
+        // ends every parked read with `error.Canceled`, so SIGINT/SIGTERM does
+        // not wait for each connection's `--timeout`.
+        .idle = .{
+            .seconds = ctx.timeout_seconds,
+            .socket_fd = ctx.stream.socket.handle,
+            .wake_fd = shutdown_pipe[0],
+        },
     }) catch |e| switch (e) {
         error.EndOfStream => {
             if (!ctx.quiet) ctx.log.debug("connection from {s} closed", .{peer});
         },
         error.Timeout => {
             if (!ctx.quiet) ctx.log.debug("connection from {s} timed out", .{peer});
+        },
+        error.Canceled => {
+            // The shutdown pipe woke this read (see `IdleTimeout.wake_fd`):
+            // that is a clean exit, not a failure.
+            if (!ctx.quiet) ctx.log.debug("connection from {s} closed at shutdown", .{peer});
         },
         else => ctx.log.warn("connection from {s} error: {s}", .{ peer, @errorName(e) }),
     };
@@ -459,7 +525,8 @@ fn createListenSockets(
 }
 
 /// State shared by the accept loop: everything it needs to poll the listen
-/// sockets and dispatch accepted connections onto the worker pool.
+/// sockets, gate accepted clients on `in_flight`, and dispatch them onto the
+/// worker pool.
 const ServerContext = struct {
     gpa: Allocator,
     io: Io,
@@ -467,7 +534,7 @@ const ServerContext = struct {
     log: *cli_helper.Logger,
     cfg: *const kms.ServerConfig,
     servers: []Io.net.Server,
-    sem: *Io.Semaphore,
+    in_flight: InFlight,
     conn_group: *Io.Group,
     port_str: []const u8,
     prng: std.Random,
@@ -475,18 +542,41 @@ const ServerContext = struct {
     /// Poll the listen sockets and the shutdown pipe, accepting and
     /// dispatching clients until SIGINT/SIGTERM arrives.
     fn run(self: *ServerContext) !void {
-        const sem_active = self.opts.max_clients != 0;
         var poll_fds: [max_listen_sockets + 1]std.posix.pollfd = undefined;
         const pipe_index = self.servers.len; // the shutdown pipe's slot in `fds`
+        // One warn per saturation period: saturation is a property of the
+        // period, not of each poll iteration.
+        var saturated_logged = false;
 
         while (true) {
-            const fds = poll_fds[0 .. pipe_index + 1];
-            for (self.servers, 0..) |*s, i| {
-                fds[i] = .{ .fd = s.socket.handle, .events = std.posix.POLL.IN, .revents = 0 };
+            // Admission control runs *before* `accept`: while the cap is
+            // reached, the listen sockets stay out of the poll set, so excess
+            // connections wait in the kernel backlog (TCP backpressure) instead
+            // of being accepted into a worker that has nowhere to go.
+            const saturated = self.in_flight.atCap();
+            if (saturated and !saturated_logged) {
+                saturated_logged = true;
+                self.log.warn("client cap reached ({d}), deferring accept", .{self.in_flight.cap});
             }
-            fds[pipe_index] = .{ .fd = shutdown_pipe[0], .events = std.posix.POLL.IN, .revents = 0 };
+            if (!saturated) saturated_logged = false;
 
-            const nready = std.posix.poll(fds, -1) catch |e| {
+            // While saturated only the shutdown pipe is polled, so SIGINT is
+            // still handled promptly; the pipe sits last in `poll_fds`, so it
+            // is at `fds[pipe_slot]` in either case.
+            const first: usize = if (saturated) pipe_index else 0;
+            const fds = poll_fds[first .. pipe_index + 1];
+            const pipe_slot: usize = pipe_index - first;
+            if (!saturated) {
+                for (self.servers, 0..) |*s, i| {
+                    fds[i] = .{ .fd = s.socket.handle, .events = std.posix.POLL.IN, .revents = 0 };
+                }
+            }
+            fds[pipe_slot] = .{ .fd = shutdown_pipe[0], .events = std.posix.POLL.IN, .revents = 0 };
+
+            // Blocking indefinitely is only safe while unsaturated: at the cap
+            // a slot can free at any moment, and nothing else would wake us.
+            const timeout_ms: i32 = if (saturated) saturated_poll_ms else -1;
+            const nready = std.posix.poll(fds, timeout_ms) catch |e| {
                 self.log.err("poll failed: {s}", .{@errorName(e)});
                 return e;
             };
@@ -494,61 +584,79 @@ const ServerContext = struct {
 
             // A byte on the shutdown pipe means SIGINT/SIGTERM arrived: return
             // so the defers run their cleanup.
-            if (fds[pipe_index].revents & std.posix.POLL.IN != 0) {
+            if (fds[pipe_slot].revents & std.posix.POLL.IN != 0) {
                 self.log.info("shutdown signal received, exiting", .{});
+                self.log.info("peak concurrent clients: {d}", .{self.in_flight.peak});
                 return;
             }
 
-            for (self.servers, 0..) |*s, i| {
-                if (fds[i].revents & std.posix.POLL.IN == 0) continue;
-                const stream = s.accept(self.io) catch |e| {
-                    self.log.warn("accept failed: {s}", .{@errorName(e)});
-                    continue;
-                };
-
-                // ip-protection level 2: reject clients with a public IP.
-                if (self.opts.ip_protection & ip_protect_reject_public != 0) {
-                    if (!network.isClientPrivate(stream.socket.handle)) {
-                        stream.close(self.io);
-                        self.log.debug("client with public IP address rejected", .{});
-                        continue;
-                    }
+            // No listen socket is in the poll set while saturated, so no
+            // server slot can be ready.
+            if (!saturated) {
+                for (self.servers, 0..) |*s, i| {
+                    if (fds[i].revents & std.posix.POLL.IN == 0) continue;
+                    self.acceptOne(s);
                 }
-
-                // Block until a worker slot is available (if the cap is enabled).
-                if (sem_active) self.sem.waitUncancelable(self.io);
-
-                const ctx = self.gpa.create(ClientContext) catch |e| {
-                    stream.close(self.io);
-                    if (sem_active) self.sem.post(self.io);
-                    self.log.warn("out of memory accepting client: {s}", .{@errorName(e)});
-                    continue;
-                };
-                ctx.* = .{
-                    .stream = stream,
-                    .io = self.io,
-                    .gpa = self.gpa,
-                    .cfg = self.cfg,
-                    .prng = std.Random.DefaultPrng.init(self.prng.int(u64)),
-                    .port_str = self.port_str,
-                    .use_ndr64 = self.opts.ndr64,
-                    .use_btfn = self.opts.btfn,
-                    .disconnect_per_request = self.opts.disconnect_per_request,
-                    .timeout_seconds = @intCast(self.opts.timeout_seconds),
-                    .sem = if (sem_active) self.sem else null,
-                    .log = self.log,
-                    .quiet_loopback = self.opts.quiet_loopback,
-                };
-
-                self.conn_group.concurrent(self.io, serveClientThread, .{ctx}) catch |e| {
-                    ctx.stream.close(self.io);
-                    if (sem_active) self.sem.post(self.io);
-                    self.gpa.destroy(ctx);
-                    self.log.warn("failed to dispatch client task: {s}", .{@errorName(e)});
-                    continue;
-                };
             }
         }
+    }
+
+    /// Accept one client from `server`, apply ip-protection, take an admission
+    /// slot, and dispatch the connection onto the pool. Every early return
+    /// closes the stream and leaves the slot count unchanged.
+    fn acceptOne(self: *ServerContext, server: *Io.net.Server) void {
+        const stream = server.accept(self.io) catch |e| {
+            self.log.warn("accept failed: {s}", .{@errorName(e)});
+            return;
+        };
+
+        // ip-protection level 2: reject clients with a public IP.
+        if (self.opts.ip_protection & ip_protect_reject_public != 0) {
+            if (!network.isClientPrivate(stream.socket.handle)) {
+                stream.close(self.io);
+                self.log.debug("client with public IP address rejected", .{});
+                return;
+            }
+        }
+
+        // The loop checked `atCap` just before polling and is the only
+        // acquirer, so this can only fail if a second acceptor appears (which
+        // would also invalidate `InFlight.peak`). Drop the connection rather
+        // than exceed the cap.
+        if (!self.in_flight.tryAcquire()) {
+            stream.close(self.io);
+            self.log.warn("admission gate refused an accepted client, dropping connection", .{});
+            return;
+        }
+
+        const ctx = self.gpa.create(ClientContext) catch |e| {
+            stream.close(self.io);
+            self.in_flight.release();
+            self.log.warn("out of memory accepting client: {s}", .{@errorName(e)});
+            return;
+        };
+        ctx.* = .{
+            .stream = stream,
+            .io = self.io,
+            .gpa = self.gpa,
+            .cfg = self.cfg,
+            .prng = std.Random.DefaultPrng.init(self.prng.int(u64)),
+            .port_str = self.port_str,
+            .use_ndr64 = self.opts.ndr64,
+            .use_btfn = self.opts.btfn,
+            .disconnect_per_request = self.opts.disconnect_per_request,
+            .timeout_seconds = @intCast(self.opts.timeout_seconds),
+            .in_flight = &self.in_flight,
+            .log = self.log,
+            .quiet_loopback = self.opts.quiet_loopback,
+        };
+
+        self.conn_group.concurrent(self.io, serveClientThread, .{ctx}) catch |e| {
+            ctx.stream.close(self.io);
+            self.gpa.destroy(ctx);
+            self.in_flight.release();
+            self.log.warn("failed to dispatch client task: {s}", .{@errorName(e)});
+        };
     }
 };
 
@@ -712,6 +820,11 @@ pub fn main(init: std.process.Init) !void {
     try createListenSockets(init.gpa, init.io, &opts, &log, &servers);
 
     log.info("vlmzsd {s} listening on port {d}", .{ version, opts.port });
+    if (opts.max_clients == 0) {
+        log.warn("client cap disabled: concurrent client tasks are unbounded", .{});
+    } else {
+        log.info("client cap: {d} concurrent clients", .{opts.max_clients});
+    }
 
     // Write the PID file (best effort; mirrors the C `writePidFile`, which
     // only logs on failure).
@@ -724,11 +837,25 @@ pub fn main(init: std.process.Init) !void {
         }) catch |e| log.warn("failed to write pid file {s}: {s}", .{ path, @errorName(e) });
     }
 
-    // Concurrency limit: a counting semaphore gates the worker threads
-    // (mirrors the C `MaxTaskSemaphore`). 0 = unlimited. The log writer task is
-    // accounted separately: it is a service task, not a client.
-    const sem_active = opts.max_clients != 0;
-    var sem = Io.Semaphore{ .permits = if (sem_active) opts.max_clients else 0 };
+    // The client cap is enforced by `ServerContext.in_flight`, an admission
+    // gate checked *before* `accept`. It is not delegated to the pool:
+    // `std.Io.Threaded` never reclaims an idle worker (they live until
+    // `deinit`), and `std.process.Init` does not expose its options, so the
+    // bound has to be our own invariant.
+
+    if (servers.items.len > max_listen_sockets) {
+        fatal(&log, init.io, "too many listen sockets (max {d})", .{max_listen_sockets});
+    }
+
+    // Signals first: the pipe's read end is handed to every connection as
+    // `IdleTimeout.wake_fd`, so it must outlive the tasks that poll it. Defers
+    // run in reverse, so this one has to be declared *before* the connection
+    // group's to run after it.
+    installSignalHandlers(init.io, &log);
+    defer {
+        _ = std.c.close(shutdown_pipe[0]);
+        _ = std.c.close(shutdown_pipe[1]);
+    }
 
     // Long-lived group for the connection tasks. Each task's resources are
     // released when it returns; canceling the group on shutdown asks in-flight
@@ -737,16 +864,6 @@ pub fn main(init: std.process.Init) !void {
     var conn_group: Io.Group = .init;
     defer conn_group.cancel(init.io);
 
-    if (servers.items.len > max_listen_sockets) {
-        fatal(&log, init.io, "too many listen sockets (max {d})", .{max_listen_sockets});
-    }
-
-    installSignalHandlers(init.io, &log);
-    defer {
-        _ = std.c.close(shutdown_pipe[0]);
-        _ = std.c.close(shutdown_pipe[1]);
-    }
-
     var server: ServerContext = .{
         .gpa = init.gpa,
         .io = init.io,
@@ -754,10 +871,80 @@ pub fn main(init: std.process.Init) !void {
         .log = &log,
         .cfg = &cfg,
         .servers = servers.items,
-        .sem = &sem,
+        .in_flight = .{ .cap = opts.max_clients },
         .conn_group = &conn_group,
         .port_str = port_str,
         .prng = rng,
     };
     try server.run();
+}
+
+test "InFlight admits up to the cap, then refuses without leaking slots" {
+    var gate: InFlight = .{ .cap = 2 };
+    try std.testing.expectEqual(@as(u32, 0), gate.count.load(.acquire));
+    try std.testing.expect(!gate.atCap());
+
+    try std.testing.expect(gate.tryAcquire());
+    try std.testing.expect(!gate.atCap());
+    try std.testing.expect(gate.tryAcquire());
+    try std.testing.expect(gate.atCap());
+
+    // The refusal must not consume a slot: a third acquire still fails, and
+    // the count still matches the two live tasks.
+    try std.testing.expect(!gate.tryAcquire());
+    try std.testing.expectEqual(@as(u32, 2), gate.count.load(.acquire));
+
+    gate.release();
+    try std.testing.expect(!gate.atCap());
+    try std.testing.expect(gate.tryAcquire());
+    try std.testing.expectEqual(@as(u32, 2), gate.count.load(.acquire));
+
+    gate.release();
+    gate.release();
+    try std.testing.expectEqual(@as(u32, 0), gate.count.load(.acquire));
+}
+
+test "InFlight peak survives idle periods" {
+    var gate: InFlight = .{ .cap = 8 };
+    try std.testing.expectEqual(@as(u32, 0), gate.peak);
+
+    var round: u32 = 0;
+    while (round < 3) : (round += 1) {
+        try std.testing.expect(gate.tryAcquire());
+        try std.testing.expect(gate.tryAcquire());
+        try std.testing.expect(gate.tryAcquire());
+        try std.testing.expectEqual(@as(u32, 3), gate.peak);
+
+        gate.release();
+        gate.release();
+        gate.release();
+        // Idle again: the high-water mark is what shutdown reports, so it must
+        // not be reset when the count drops.
+        try std.testing.expectEqual(@as(u32, 0), gate.count.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 3), gate.peak);
+    }
+
+    // A wider burst advances the mark; the earlier 3 is not sticky.
+    const four = [_]u32{ 1, 2, 3, 4 };
+    for (four) |_| try std.testing.expect(gate.tryAcquire());
+    try std.testing.expectEqual(@as(u32, 4), gate.peak);
+    for (four) |_| gate.release();
+    try std.testing.expectEqual(@as(u32, 0), gate.count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 4), gate.peak);
+}
+
+test "InFlight cap of 0 is unlimited" {
+    var gate: InFlight = .{ .cap = 0 };
+    try std.testing.expect(!gate.atCap());
+
+    var i: u32 = 0;
+    while (i < 1000) : (i += 1) {
+        try std.testing.expect(gate.tryAcquire());
+        try std.testing.expect(!gate.atCap());
+    }
+    try std.testing.expectEqual(@as(u32, 1000), gate.count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1000), gate.peak);
+
+    while (i > 0) : (i -= 1) gate.release();
+    try std.testing.expectEqual(@as(u32, 0), gate.count.load(.acquire));
 }

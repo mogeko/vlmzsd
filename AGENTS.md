@@ -73,8 +73,12 @@ source linked above).
 - Tests: byte-level round-trips and golden hex vectors (hard-coded in `src/crypto.zig`).
 - Concurrency: one `std.Io.Group` for the process lifetime; each accepted connection is one
   `Group.concurrent` task on the `std.Io.Threaded` pool (threads are spawned on demand and reused,
-  never `std.Thread.spawn`/`detach`). `Io.Semaphore` caps `--max-clients`; `Group.cancel` joins
-  in-flight tasks at shutdown. Per-connection state (PRNG, 4 KiB read/write buffers) stays
+  never `std.Thread.spawn`/`detach`). `--max-clients` is enforced by an atomic in-flight counter
+  (`InFlight`) checked *before* `accept`: while at the cap the listen sockets leave the poll set, so
+  excess connections queue in the kernel backlog. The pool itself never shrinks (a worker lives until
+  `deinit`), so this gate is what keeps threads at `min(peak clients, cap) + 2`. `Group.cancel` joins
+  in-flight tasks at shutdown, and every connection read polls the shutdown pipe as
+  `IdleTimeout.wake_fd`, so SIGINT/SIGTERM ends a parked read with `error.Canceled` at once. Per-connection state (PRNG, 4 KiB read/write buffers) stays
   task-local; shared mutable state uses `Io.Mutex` (logger) or `std.atomic.Mutex` (client lists).
 
 ## CLI implementation decisions
@@ -101,6 +105,14 @@ source linked above).
 - **Container builds must use `-Dcpu=baseline`.** `zig build` defaults to the *native* CPU model;
   a CI ARM runner (e.g. Graviton) then emits SVE instructions that crash with SIGILL on CPUs
   without SVE (e.g. Apple Silicon). The `Dockerfile` pins `-Dcpu=baseline` for portability.
+- **Module code must not reference `std.c`.** `build.zig` sets `link_libc = false` for the `vlmzsd`
+  module; only the `vlmzsd` executable links libc (for `std.c.pipe`/`fcntl`/`getpid` in
+  `src/main.zig`). A `std.c` reference in a module file — including inside a `test` block, which is
+  compiled only for test artifacts, so `zig build vlmzsd …` still passes — fails to *compile* on
+  Linux with `dependency on libc must be explicitly specified`. macOS hides it (libSystem is always
+  linked). Reach for `std.posix` / `std.Io` / `Io.net` instead — a TCP connection whose both ends the
+  test owns is a portable wake fd — and pre-check with
+  `zig test -ODebug --dep vlmzsd -Mroot=src/network.zig -Mvlmzsd=src/root.zig -target x86_64-linux-gnu --test-no-exec`.
 - The `zig-fmt` (PostToolUse) and `zig-build-test` (Stop) hooks auto-format and run tests; keep
   `.zig` files formatted and tests green.
 - **Never write to the real stdout/stderr from a test.** `zig build test` runs each test binary with

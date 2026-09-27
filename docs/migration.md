@@ -228,15 +228,22 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
   explicitly (`fatal`), because `std.process.exit` skips the `defer`s.
 - **Concurrency**: the `std.Io.Threaded` thread pool (provided by `std.process.Init`), not hand-rolled
   `std.Thread.spawn`. Each accepted connection is dispatched as one task with `Io.Group.concurrent`
-  (the pool spawns a thread only when every thread is busy, and reuses it afterwards); `--max-clients`
-  is a counting `Io.Semaphore` gate in front of the dispatch. There is no `detach()` — the group owns
-  the tasks, and shutdown joins them with `Io.Group.cancel`.
+  (the pool spawns a thread only when every thread is busy, and reuses it afterwards, but never
+  reclaims it — the thread count follows the peak, not the current load), and `--max-clients`
+  (default 1024) is an atomic in-flight counter (`InFlight`) checked *before* `accept`: while at the
+  cap the listen sockets leave the poll set, so excess connections wait in the kernel backlog instead
+  of occupying a worker. There is no `detach()` — the group owns the tasks, and shutdown joins them
+  with `Io.Group.cancel`.
 - **Timeout**: `std.posix.poll` (replacing C's `SO_RCVTIMEO`). The poll runs before every *refill* of
   the buffered reader (`network.readAll`), not once per packet: `readSliceAll` loops until the buffer is
   full, so a peer that sends half a packet and then stalls would block past the deadline — and split
   packets are the norm, since `writePacket` writes the header and the body separately. Bytes already
   buffered are consumed without polling (the read-ahead pitfall). The server loop and the client
-  (`vlmzs --timeout`) share the same `IdleTimeout`. The client has **no connect deadline**:
+  (`vlmzs --timeout`) share the same `IdleTimeout`. The server also arms `IdleTimeout.wake_fd` with
+  the read end of its shutdown pipe: SIGINT/SIGTERM writes one byte there and every parked read
+  returns `error.Canceled` at once (logged at `debug`), instead of each connection waiting out its
+  own `--timeout` — so shutdown latency is bounded by task teardown, not by `--timeout`, and even
+  `--timeout 0` connections stay interruptible. The client has **no connect deadline**:
   `std.Io.Threaded` in 0.16 still panics on `ConnectOptions.timeout` ("TODO implement"), so an
   unreachable host is bounded only by the kernel's SYN timeout.
 - Client: DNS via `Io.net.HostName.lookup` (with address-family filtering); default host `::1` (IPv6) or `127.0.0.1`;
