@@ -251,8 +251,7 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 
 ## 6. Verification
 
-- **Unit tests**: `zig build test --summary all` → all pass (115 at v0.4.0; the command is the source
-  of truth — the count grows with the suite, so it is deliberately not restated elsewhere).
+- **Unit tests**: `zig build test --summary all` → all pass.
   - `kms.zig`: struct layout comptime asserts; v4/v5/v6 request→response→decrypt round-trips; ePID format; client list insert/evict.
   - `rpc.zig`: BIND negotiation (NDR32/NDR64/BTFN); request wrap (NDR32/NDR64); dispatch end-to-end; invalid-version HRESULT.
   - `crypto.zig`: v4 CMAC / v5 / v6 encryption / CBC / HMAC-SHA256 golden vectors.
