@@ -265,6 +265,40 @@ test "buffer size decides whether cancel can drain (documented trap)" {
 
 const Raw = union(enum) { polled: u32 };
 
+/// A TCP connection whose ends are both owned by the test: sending from the
+/// client end makes the accepted end readable. Used instead of a pipe because
+/// this file must stay libc-free (`std.c.pipe` needs `-lc`, and `std.posix`
+/// exposes no `pipe` in 0.16), so it compiles wherever `zig test` runs.
+const Pair = struct {
+    server: Io.net.Server,
+    accepted: Io.net.Stream,
+    client: Io.net.Stream,
+
+    fn init(io: Io) !Pair {
+        const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        var server = try Io.net.IpAddress.listen(&addr, io, .{ .mode = .stream });
+        errdefer server.deinit(io);
+        const client = try Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
+        errdefer client.close(io);
+        const accepted = try server.accept(io);
+        return .{ .server = server, .accepted = accepted, .client = client };
+    }
+
+    fn deinit(self: *Pair, io: Io) void {
+        self.client.close(io);
+        self.accepted.close(io);
+        self.server.deinit(io);
+    }
+
+    /// Make the accepted end readable — the pipe write, libc-free.
+    fn sendByte(self: *Pair, io: Io) void {
+        var buffer: [1]u8 = undefined;
+        var writer = self.client.writer(io, &buffer);
+        writer.interface.writeAll("x") catch return;
+        writer.interface.flush() catch return;
+    }
+};
+
 /// Parks in a *raw* poll: not a cancelation point, so only data can end it.
 fn parkedPoller(io: Io, fd: std.posix.fd_t) u32 {
     _ = io;
@@ -282,18 +316,14 @@ test "cancel cannot interrupt a raw poll" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var pipe_fds: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&pipe_fds));
-    defer {
-        _ = std.c.close(pipe_fds[0]);
-        _ = std.c.close(pipe_fds[1]);
-    }
+    var pair = try Pair.init(io);
+    defer pair.deinit(io);
 
     var sel_buf: [1]Raw = undefined;
     var sel: Io.Select(Raw) = .init(io, &sel_buf);
     defer sel.cancelDiscard();
 
-    sel.async(.polled, parkedPoller, .{ io, pipe_fds[0] });
+    sel.async(.polled, parkedPoller, .{ io, pair.accepted.socket.handle });
 
     var done = std.atomic.Value(bool).init(false);
     var value: ?Raw = null;
@@ -305,8 +335,7 @@ test "cancel cannot interrupt a raw poll" {
     _ = sleepMs(300, io);
     const blocked = !done.load(.acquire);
     // Only now does the parked poll have a reason to return.
-    const byte: [1]u8 = .{1};
-    _ = std.c.write(pipe_fds[1], &byte, 1);
+    pair.sendByte(io);
     try outer.await(io);
     const dt = elapsedMs(started, io);
     std.debug.print("[5] cancel on a task parked in raw poll: returned within 300 ms = {}, took {d} ms\n", .{ !blocked, dt });

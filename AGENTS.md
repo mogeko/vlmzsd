@@ -105,6 +105,14 @@ source linked above).
 - **Container builds must use `-Dcpu=baseline`.** `zig build` defaults to the *native* CPU model;
   a CI ARM runner (e.g. Graviton) then emits SVE instructions that crash with SIGILL on CPUs
   without SVE (e.g. Apple Silicon). The `Dockerfile` pins `-Dcpu=baseline` for portability.
+- **Module code must not reference `std.c`.** `build.zig` sets `link_libc = false` for the `vlmzsd`
+  module; only the `vlmzsd` executable links libc (for `std.c.pipe`/`fcntl`/`getpid` in
+  `src/main.zig`). A `std.c` reference in a module file — including inside a `test` block, which is
+  compiled only for test artifacts, so `zig build vlmzsd …` still passes — fails to *compile* on
+  Linux with `dependency on libc must be explicitly specified`. macOS hides it (libSystem is always
+  linked). Reach for `std.posix` / `std.Io` / `Io.net` instead — a TCP connection whose both ends the
+  test owns is a portable wake fd — and pre-check with
+  `zig test -ODebug --dep vlmzsd -Mroot=src/network.zig -Mvlmzsd=src/root.zig -target x86_64-linux-gnu --test-no-exec`.
 - The `zig-fmt` (PostToolUse) and `zig-build-test` (Stop) hooks auto-format and run tests; keep
   `.zig` files formatted and tests green.
 - **Never write to the real stdout/stderr from a test.** `zig build test` runs each test binary with
