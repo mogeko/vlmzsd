@@ -183,6 +183,28 @@ pub fn operate(io: Io, operation: Operation) Cancelable!Operation.Result;
 it buys portability across backends plus uniform cancelation/timeout semantics, *not* extra
 concurrency. `net_receive`'s result is `struct { ?net.Socket.ReceiveError, usize }`.
 
+`operateTimeout(io, op, timeout)` is `Batch` + `awaitConcurrent`, and on `Threaded`
+(`batchAwaitConcurrent`) that means: try the operation non-blocking, and on `WouldBlock` poll the
+operation's fds **inline on the calling thread** until the deadline. Verified by running
+[operate_probe.zig](../scripts/operate_probe.zig) — 5/5 green, Zig 0.16.0 on macOS:
+
+| Property | Measured |
+|---|---|
+| Deadline is the backend's: a silent peer returns `error.Timeout` at the requested deadline | **200 ms** for a 200 ms timeout |
+| Cancelation ends a parked wait with no wake fd, no self-pipe | `Group.cancel` → task returned **0 ms** later with `error.Canceled` |
+| No thread is dispatched to wait: it works with a **pool of zero workers** (`concurrent_limit = .nothing`) | `error.Timeout` after **199 ms** (never `error.ConcurrencyUnavailable`) |
+| Bytes arrive over the caller's own buffer (no read-ahead copy) | 1 message, `data = "abc"` |
+| EOF is explicit: a closed peer yields **one message with `data.len == 0`** | returned in **0 ms** |
+
+So on `Threaded` this is the thread-parks-anyway situation — but expressed in `Io` terms, which is
+what a reactor backend would need to stop parking a thread, and which removes the need to hand-roll
+`poll` + wake-fd + cancelation plumbing. Two caveats found by the probe:
+
+- **`Io.net.Socket.createPair` is not usable on macOS**: its default `family = .ip4` socketpair is
+  Linux-only, and it aborts with `unexpectedErrno` (the probe builds a connected TCP pair instead).
+- `Operation` has **no send variant** (`net_receive` only), so the *write* path cannot be expressed
+  as an operation today; it stays on `Io.Writer` → `netWrite`.
+
 ## Known gaps in 0.16.0
 
 | Gap | Detail |
