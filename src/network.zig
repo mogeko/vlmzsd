@@ -841,22 +841,49 @@ test "client bind handshake" {
     try std.testing.expectEqual(rpc.packet_type.bind_req, sent_header.packet_type);
 }
 
-/// Test helper: a connected socket whose peer never writes, so a wait on it
-/// would block until the idle timeout fires.
-fn idleSocketPair(io: Io) !struct { server: Io.net.Server, stream: Io.net.Stream } {
-    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
-    var server = try Io.net.IpAddress.listen(&addr, io, .{ .mode = .stream });
-    errdefer server.deinit(io);
-    const stream = try Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
-    return .{ .server = server, .stream = stream };
-}
+/// Test helper: a TCP connection whose ends are both owned by the test, so
+/// sending from the client end makes the accepted end readable. That is the
+/// stand-in for the shutdown pipe: `std.posix` exposes no `pipe` in 0.16, and
+/// `std.c.pipe` is off limits here — this module is built without libc
+/// (`build.zig`: the module sets `link_libc = false`, only the `vlmzsd`
+/// executable links it), so a `std.c` reference fails to *compile* on Linux.
+const StreamPair = struct {
+    server: Io.net.Server,
+    /// The end the test polls: readable only once the client sends.
+    accepted: Io.net.Stream,
+    /// The end the test sends from.
+    client: Io.net.Stream,
 
-/// Test helper: wait, then make `fd` readable — stands in for the signal
-/// handler writing its byte to the shutdown pipe.
-fn wakeAfterDelay(io: Io, fd: std.posix.fd_t) Io.Cancelable!void {
+    fn init(io: Io) !StreamPair {
+        const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        var server = try Io.net.IpAddress.listen(&addr, io, .{ .mode = .stream });
+        errdefer server.deinit(io);
+        const client = try Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
+        errdefer client.close(io);
+        const accepted = try server.accept(io);
+        return .{ .server = server, .accepted = accepted, .client = client };
+    }
+
+    fn deinit(self: *StreamPair, io: Io) void {
+        self.client.close(io);
+        self.accepted.close(io);
+        self.server.deinit(io);
+    }
+
+    /// Make `accepted` readable.
+    fn sendByte(self: *StreamPair, io: Io) void {
+        var buffer: [1]u8 = undefined;
+        var writer = self.client.writer(io, &buffer);
+        writer.interface.writeAll("x") catch return;
+        writer.interface.flush() catch return;
+    }
+};
+
+/// Test helper: wait, then make the pair's accepted end readable — stands in for
+/// the signal handler writing its byte to the shutdown pipe.
+fn wakeAfterDelay(io: Io, pair: *StreamPair) Io.Cancelable!void {
     try io.sleep(.{ .nanoseconds = 200_000_000 }, .awake);
-    const byte: [1]u8 = .{1};
-    _ = std.c.write(fd, &byte, 1);
+    pair.sendByte(io);
 }
 
 // The server parks every idle connection in `waitReadable` with its shutdown
@@ -871,25 +898,19 @@ test "a parked read is aborted by the wake fd" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var pair = try idleSocketPair(io);
-    defer pair.server.deinit(io);
-    defer pair.stream.close(io);
-
-    var wake_fds: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&wake_fds));
-    defer {
-        _ = std.c.close(wake_fds[0]);
-        _ = std.c.close(wake_fds[1]);
-    }
+    // Role split inside one connection: the client end stays silent (it is the
+    // socket being waited on), the accepted end is the fd that gets woken.
+    var pair = try StreamPair.init(io);
+    defer pair.deinit(io);
 
     var group: Io.Group = .init;
     defer group.cancel(io);
-    try group.concurrent(io, wakeAfterDelay, .{ io, wake_fds[1] });
+    try group.concurrent(io, wakeAfterDelay, .{ io, &pair });
 
     try std.testing.expectError(error.Canceled, waitReadable(.{
         .seconds = 1,
-        .socket_fd = pair.stream.socket.handle,
-        .wake_fd = wake_fds[0],
+        .socket_fd = pair.client.socket.handle,
+        .wake_fd = pair.accepted.socket.handle,
     }));
 }
 
@@ -902,22 +923,15 @@ test "a quiet wake fd does not shorten the idle timeout" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var pair = try idleSocketPair(io);
-    defer pair.server.deinit(io);
-    defer pair.stream.close(io);
-
-    var wake_fds: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&wake_fds));
-    defer {
-        _ = std.c.close(wake_fds[0]);
-        _ = std.c.close(wake_fds[1]);
-    }
+    var pair = try StreamPair.init(io);
+    defer pair.deinit(io);
 
     // One second is the smallest `--timeout` (seconds are the unit), so this
-    // test is as fast as the option itself allows.
+    // test is as fast as the option itself allows. Nobody sends, so the wake fd
+    // stays quiet and only the deadline can end the wait.
     try std.testing.expectError(error.Timeout, waitReadable(.{
         .seconds = 1,
-        .socket_fd = pair.stream.socket.handle,
-        .wake_fd = wake_fds[0],
+        .socket_fd = pair.client.socket.handle,
+        .wake_fd = pair.accepted.socket.handle,
     }));
 }
