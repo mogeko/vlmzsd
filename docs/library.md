@@ -24,7 +24,7 @@ Add it with `zig fetch --save` — Zig resolves the URL and fills in the `url`
 and `hash` for you:
 
 ```sh
-zig fetch --save git+https://github.com/mogeko/vlmzsd.git#v0.4.1
+zig fetch --save git+https://github.com/mogeko/vlmzsd.git#v0.4.2
 ```
 
 ## Wiring it into `build.zig`
