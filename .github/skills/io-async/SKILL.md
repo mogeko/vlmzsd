@@ -8,7 +8,8 @@ argument-hint: '<scope: server|client|all>'
 
 **The migration is already done.** `src/main.zig` and `src/vlmzs.zig` run on the `std.Io.Threaded`
 task model: `Io.Group.concurrent` for per-connection / per-request work, `Group.await` / `Group.cancel`
-for lifecycle, `Io.Semaphore` for caps. There is **no `std.Thread.spawn` + `detach` in `src/`** — do
+for lifecycle, and an atomic in-flight gate (`InFlight`) checked before `accept` for the
+`--max-clients` cap. There is **no `std.Thread.spawn` + `detach` in `src/`** — do
 not reintroduce it. Zig 0.16 also ships experimental fiber/evented backends (`std.Io.fiber`,
 `std.Io.Dispatch` over `Kqueue`/`Uring`), but those are WIP and poorly documented — **do not use them
 here**. This skill is about using the `Threaded` task model correctly and not regressing it.
@@ -17,7 +18,8 @@ here**. This skill is about using the `Threaded` task model correctly and not re
 
 - Adding or changing per-connection work in `src/main.zig` (the accept loop) or per-request work in
   `src/vlmzs.zig`.
-- Capping parallel work with `async_limit` / `concurrent_limit` or `Io.Semaphore`.
+- Capping parallel work with `async_limit` / `concurrent_limit`, or with an in-flight gate in the
+  accept loop.
 - Auditing why a task leaks, never runs, or does not stop at shutdown.
 
 ## Key APIs (all WIP in 0.16 — verify against the stdlib source, not older tutorials)
@@ -30,7 +32,7 @@ here**. This skill is about using the `Threaded` task model correctly and not re
 | Wait | `Future.await(io)` / `Future.cancel(io)` | both idempotent, not thread-safe |
 | Batch | `Group.async` / `Group.concurrent` / `Group.await` / `Group.cancel` | unordered task set, awaited/canceled as a whole |
 | Limit | `Io.Limit` = `.nothing` / `.unlimited` / `.limited(n)` | bound on pool size |
-| Semaphore | `Io.Semaphore{ .permits = n }` + `wait(io)` / `waitUncancelable(io)` / `post(io)` | counting gate (already used for `--max-clients`) |
+| Semaphore | `Io.Semaphore{ .permits = n }` + `wait(io)` / `waitUncancelable(io)` / `post(io)` | counting gate; **not** used for `--max-clients` (it has no non-blocking query, so the accept loop cannot ask "is there room?" before `accept`) |
 
 ## Procedure
 
@@ -53,10 +55,16 @@ here**. This skill is about using the `Threaded` task model correctly and not re
    task's `defer` (see `serveClientThread`).
 
 5. **Bound concurrency.** `concurrent_limit` defaults to `.unlimited`, and `async_limit` does *not*
-   apply to `Group.concurrent`, so by default every concurrent connection grows the pool:
-   - per-connection cap (`--max-clients`) → the existing `Io.Semaphore` gate in front of the dispatch;
+   apply to `Group.concurrent`, so by default every concurrent connection grows the pool — and an
+   idle worker is never reclaimed (it lives until `deinit`). Bound the work in *our* code:
+   - per-connection cap (`--max-clients`) → the `InFlight` gate in `src/main.zig`, queried with
+     `atCap()` *before* polling the listen sockets. While at the cap the listen sockets stay out of
+     the poll set, so excess connections queue in the kernel backlog (TCP backpressure) instead of
+     occupying a worker; the loop then polls only the shutdown pipe with a short timeout so a freed
+     slot (and SIGINT) is still noticed.
    - a global cap → `InitOptions.concurrent_limit` (only settable when you construct the `Threaded`
-     yourself, not via `std.process.Init`), or another `Semaphore`.
+     yourself, not via `std.process.Init`), or another atomic gate. Prefer the gate: an
+     over-limit `Group.concurrent` *fails* with `error.ConcurrencyUnavailable`, it does not wait.
 
 6. **Join at shutdown.** A long-lived `Group` is legal and does not leak, but it must be
    `await`ed or `cancel`ed before the process exits — `main.zig` does `defer group.cancel(init.io)`.
@@ -98,8 +106,11 @@ group.await(io) catch |e| handle(e);
 - **`std.posix.poll` is not a cancelation point.** It is interrupted by the signal but retried, so a
   worker parked in `waitReadable` only notices cancelation after its check, bounding shutdown
   latency by `--timeout`.
-- **`Semaphore.waitUncancelable` is not a cancelation point either.** Blocking on it in the accept
-  loop (only when `--max-clients` is set) means SIGINT is not honored until some task posts a permit.
+- **The accept loop must never block on a limit.** A `Semaphore.waitUncancelable` in front of the
+  dispatch is not a cancelation point, so SIGINT would not be honored until a task posted a permit —
+  and it accepts connections it cannot serve, hiding backpressure from the kernel. `InFlight`
+  (`tryAcquire`/`release`/`atCap`) is the non-blocking alternative; `release()` must be the last step
+  of the task's `defer`, with the gate pointer copied out before `destroy(ctx)`.
 - **`Io.Mutex` vs `std.atomic.Mutex`.** `Io.Mutex` needs an `Io` and blocks on a futex — use it for
   locks held across I/O (the logger). Use `std.atomic.Mutex` for short, `io`-free critical sections
   (the KMS client lists) — it spins via `std.atomic.spinLoopHint`.
@@ -110,7 +121,7 @@ group.await(io) catch |e| handle(e);
 - [ ] No `std.Thread.spawn`; parallel work goes through a `Group` (`Group.concurrent`).
 - [ ] The group is awaited or canceled on every exit path.
 - [ ] `error.ConcurrencyUnavailable` handled; per-task heap context freed in the task's `defer`.
-- [ ] Concurrency bounds are explicit (`Io.Semaphore` for `--max-clients`, or `concurrent_limit`).
+- [ ] Concurrency bounds are explicit (the `InFlight` gate for `--max-clients`, or `concurrent_limit`).
 - [ ] Shared mutable state is locked (`Io.Mutex` / `std.atomic.Mutex`); per-connection PRNG and
       buffers stay task-local.
 - [ ] `error.Canceled` is not misreported as a failure (see the `ReadFailed` pitfall).

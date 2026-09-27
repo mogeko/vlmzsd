@@ -73,7 +73,10 @@ source linked above).
 - Tests: byte-level round-trips and golden hex vectors (hard-coded in `src/crypto.zig`).
 - Concurrency: one `std.Io.Group` for the process lifetime; each accepted connection is one
   `Group.concurrent` task on the `std.Io.Threaded` pool (threads are spawned on demand and reused,
-  never `std.Thread.spawn`/`detach`). `Io.Semaphore` caps `--max-clients`; `Group.cancel` joins
+  never `std.Thread.spawn`/`detach`). `--max-clients` is enforced by an atomic in-flight counter
+  (`InFlight`) checked *before* `accept`: while at the cap the listen sockets leave the poll set, so
+  excess connections queue in the kernel backlog. The pool itself never shrinks (a worker lives until
+  `deinit`), so this gate is what keeps threads at `min(peak clients, cap) + 2`. `Group.cancel` joins
   in-flight tasks at shutdown. Per-connection state (PRNG, 4 KiB read/write buffers) stays
   task-local; shared mutable state uses `Io.Mutex` (logger) or `std.atomic.Mutex` (client lists).
 

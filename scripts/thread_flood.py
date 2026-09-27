@@ -27,7 +27,9 @@ Watch the server's thread count while it runs (1s interval):
 
 Reading the result:
     * thread count ≈ peak connections + 2, and it stays after this script exits;
-    * a plateau at N+2 means the server caps clients (`--max-clients N`);
+    * a plateau at N+2 means the server's client cap is doing its job
+      (`--max-clients N`, default 1024): the cap is checked *before* accept, so
+      further connections wait in the kernel backlog instead of being served;
     * connect storms that get closed immediately mean the server is refusing to
       dispatch ("failed to dispatch client task" in its log) — its thread/pids
       limit is reached.
@@ -232,9 +234,10 @@ def main(argv):
                       f"  peak={flood.peaks:5d}  opened={flood.opened:6d}"
                       f"  reconnect={flood.reconnects:6d}  fail={flood.failures:5d}",
                       flush=True)
-            # A capped server (--max-clients) accepts into the kernel backlog and
-            # dispatches only N at a time, so the extra connects either sit there
-            # or come back reset. Say so rather than leaving the numbers a riddle.
+            # A capped server (--max-clients, default 1024) stops accepting while
+            # it is saturated, so extra connects either wait in the kernel
+            # backlog or come back reset once that is full. Say so rather than
+            # leaving the numbers a riddle.
             if flood.failures >= max(64, target // 4):
                 flood.warn_once(
                     "refused",
