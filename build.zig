@@ -2,12 +2,32 @@ const std = @import("std");
 /// The project version, read from `build.zig.zon` (single source of truth).
 const version = @import("build.zig.zon").version;
 
-/// Short git commit hash of HEAD (e.g. "4c25aa9"), or "unknown" when the
-/// build runs outside a git checkout.
+/// The commit hash embedded in the binaries, always in the short (7-char) form.
+/// Precedence: `-Dgit-sha=...` > `git rev-parse --short HEAD` > "unknown" —
+/// the last when there is no checkout to ask, e.g. the container build, whose
+/// context carries no `.git` and whose image installs no `git`.
 fn gitCommitHash(b: *std.Build) []const u8 {
+    const description = "Commit hash to embed; defaults to `git rev-parse --short HEAD`";
+    if (b.option([]const u8, "git-sha", description)) |given| {
+        if (shortCommitHash(given)) |hash| return hash;
+    }
     var code: u8 = undefined;
     const out = b.runAllowFail(&.{ "git", "rev-parse", "--short", "HEAD" }, &code, .ignore) catch return "unknown";
     return std.mem.trim(u8, out, " \t\r\n");
+}
+
+/// Trim a supplied hash to 7 characters, so `-Dgit-sha=$GITHUB_SHA` (40 hex
+/// chars) prints exactly like a local `git rev-parse --short`. A value that is
+/// not hex, or already short, is returned as given; an empty one is rejected so
+/// that `-Dgit-sha=` still falls back to git.
+fn shortCommitHash(given: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, given, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (trimmed.len <= 7) return trimmed;
+    for (trimmed) |c| {
+        if (!std.ascii.isHex(c)) return trimmed;
+    }
+    return trimmed[0..7];
 }
 
 /// Current UTC date as `YYYY-MM-DD`.

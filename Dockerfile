@@ -43,7 +43,12 @@ COPY ./build.zig.zon /opt/app/build.zig.zon
 COPY ./LICENSE /opt/app/LICENSE
 COPY ./README.md /opt/app/README.md
 
-RUN zig build vlmzsd vlmzs --release=safe -Dcpu=baseline -Dno-embedded-data
+# Pass it in — `--build-arg VLMZSD_GIT_SHA=$(git rev-parse --short HEAD)`,
+# or `$(git rev-parse HEAD)`, since `build.zig` trims it to 7 characters.
+ARG VLMZSD_GIT_SHA
+
+RUN zig build vlmzsd vlmzs -Dcpu=baseline -Doptimize=ReleaseSafe \
+        -Dgit-sha="${VLMZSD_GIT_SHA}" -Dno-embedded-data
 
 FROM gcr.io/distroless/base-nossl-debian13:latest
 
