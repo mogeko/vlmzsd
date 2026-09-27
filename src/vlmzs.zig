@@ -539,7 +539,7 @@ const Conn = struct {
     /// Next DCE/RPC CallId; BIND consumed 2.
     call_id: u32 = 2,
     /// Applied to the BIND reply and to every RESPONSE read.
-    idle: network.IdleTimeout,
+    idle: network.ReadOptions,
 };
 
 fn sendRequest(
@@ -559,10 +559,11 @@ fn sendRequest(
     var reader = stream.reader(io, &rbuf);
     var writer = stream.writer(io, &wbuf);
 
-    const idle: network.IdleTimeout = .{
-        .seconds = opts.timeout_seconds,
-        .socket_fd = stream.socket.handle,
-    };
+    const idle: network.ReadOptions = .{ .peer = .{
+        .io = io,
+        .handle = stream.socket.handle,
+        .timeout = network.timeoutSeconds(opts.timeout_seconds),
+    } };
     var call_id: u32 = 2;
     const bind = try network.clientBind(gpa, &reader.interface, &writer.interface, &call_id, .{
         .use_ndr64 = opts.ndr64,
@@ -679,10 +680,11 @@ fn sendRequestsReused(
     var reader = stream.reader(io, &rbuf);
     var writer = stream.writer(io, &wbuf);
 
-    const idle: network.IdleTimeout = .{
-        .seconds = opts.timeout_seconds,
-        .socket_fd = stream.socket.handle,
-    };
+    const idle: network.ReadOptions = .{ .peer = .{
+        .io = io,
+        .handle = stream.socket.handle,
+        .timeout = network.timeoutSeconds(opts.timeout_seconds),
+    } };
     var call_id: u32 = 2;
     const bind = try network.clientBind(gpa, &reader.interface, &writer.interface, &call_id, .{
         .use_ndr64 = opts.ndr64,
@@ -1034,6 +1036,10 @@ test "--timeout bounds a peer that never answers" {
         &reader.interface,
         &writer.interface,
         &call_id,
-        .{ .use_ndr64 = false, .idle = .{ .seconds = 1, .socket_fd = stream.socket.handle } },
+        .{ .use_ndr64 = false, .idle = .{ .peer = .{
+            .io = io,
+            .handle = stream.socket.handle,
+            .timeout = network.timeoutSeconds(1),
+        } } },
     ));
 }

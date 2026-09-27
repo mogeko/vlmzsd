@@ -19,7 +19,8 @@ vendored in this repository.**
 - Error/exception paths (invalid version, short request, unknown context, data-file validation) are aligned with C behavior.
 - All remaining differences fall into one of two classes — "intentional design" or "defect fix" — and are itemized in section 5; none constitutes a wire incompatibility.
 
-Verification: 35/35 unit tests pass (including byte-level golden vectors), plus `vlmzs` ↔ `vlmzsd` end-to-end (v4/v5/v6, NDR32/NDR64, DNS, dual-stack).
+Verification: the full suite (`zig build test`) passes — struct-layout asserts, byte-level golden
+vectors, round-trips — plus `vlmzs` ↔ `vlmzsd` end-to-end (v4/v5/v6, NDR32/NDR64, DNS, dual-stack).
 
 ---
 
@@ -216,38 +217,16 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 
 ### 4.6 `src/main.zig` / `src/vlmzs.zig` / `src/cli_helper.zig`
 
-- **CLI redesign** (`docs/cli.md`): no config file; three-tier precedence `default < VLMZSD_*/env < CLI`;
-  data-driven `Opt`-table parsing (`src/cli_helper.zig`, std-only); fixed-format stdout logging
-  (the KMS client lists use `std.atomic.Mutex`).
-- **Logging**: the format, levels and switches are unchanged, but delivery is asynchronous.
-  `Logger.emit` formats on the calling thread and pushes into a bounded, preallocated, **lossy** FIFO
-  (`src/line_queue.zig`, 1024 × 256 B); a dedicated writer task (`log_group`) owns the blocking
-  `write`/`flush`, so a slow consumer can no longer stall a worker — the queue drops the line instead
-  and reports the `dropped`/`truncated` counts at shutdown. The queue is closed and drained after the
-  connection tasks are joined and before the writer group is canceled; a fatal startup path drains it
-  explicitly (`fatal`), because `std.process.exit` skips the `defer`s.
-- **Concurrency**: the `std.Io.Threaded` thread pool (provided by `std.process.Init`), not hand-rolled
-  `std.Thread.spawn`. Each accepted connection is dispatched as one task with `Io.Group.concurrent`
-  (the pool spawns a thread only when every thread is busy, and reuses it afterwards, but never
-  reclaims it — the thread count follows the peak, not the current load), and `--max-clients`
-  (default 1024) is an atomic in-flight counter (`InFlight`) checked *before* `accept`: while at the
-  cap the listen sockets leave the poll set, so excess connections wait in the kernel backlog instead
-  of occupying a worker. There is no `detach()` — the group owns the tasks, and shutdown joins them
-  with `Io.Group.cancel`.
-- **Timeout**: `std.posix.poll` (replacing C's `SO_RCVTIMEO`). The poll runs before every *refill* of
-  the buffered reader (`network.readAll`), not once per packet: `readSliceAll` loops until the buffer is
-  full, so a peer that sends half a packet and then stalls would block past the deadline — and split
-  packets are the norm, since `writePacket` writes the header and the body separately. Bytes already
-  buffered are consumed without polling (the read-ahead pitfall). The server loop and the client
-  (`vlmzs --timeout`) share the same `IdleTimeout`. The server also arms `IdleTimeout.wake_fd` with
-  the read end of its shutdown pipe: SIGINT/SIGTERM writes one byte there and every parked read
-  returns `error.Canceled` at once (logged at `debug`), instead of each connection waiting out its
-  own `--timeout` — so shutdown latency is bounded by task teardown, not by `--timeout`, and even
-  `--timeout 0` connections stay interruptible. The client has **no connect deadline**:
-  `std.Io.Threaded` in 0.16 still panics on `ConnectOptions.timeout` ("TODO implement"), so an
-  unreachable host is bounded only by the kernel's SYN timeout.
-- Client: DNS via `Io.net.HostName.lookup` (with address-family filtering); default host `::1` (IPv6) or `127.0.0.1`;
-  `--grace` default `43200` minutes written to `BindingExpiration`.
+- **CLI redesign**: no config file, three-tier precedence `default < VLMZSD_*/env < CLI`, and
+  data-driven `Opt`-table parsing (`src/cli_helper.zig`, std-only). The surface is specified in
+  `docs/cli.md` §5–§6; the C options that were dropped or deferred are itemized in §8 below.
+- **Process / logging / concurrency**: `std.Io.Threaded` instead of hand-rolled threads, and a
+  fixed-format logger whose delivery is asynchronous and **lossy** instead of C's blocking direct
+  writes; an admission gate in front of `accept` replaces C's task semaphore. Mechanism and
+  invariants: `AGENTS.md` → Logging, Concurrency; async-I/O guide: `.github/skills/io-async/`.
+- **Read deadline / cancelation**: each socket read is an `Io` operation, so the backend owns the
+  deadline and the cancelation point (no `SO_RCVTIMEO`, no self-pipe). Two *observable* consequences
+  are recorded in §5; there is no byte-level contract here for a regression test to pin.
 
 ---
 
@@ -265,16 +244,21 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 | Invalid ePID (overlong / non-BMP) | **Intentional hardening** | C ignores `utf8_to_ucs2` failure, producing a malformed PIDSize; Zig returns `0x8007000D`. Default ePIDs are all short ASCII, unaffected. |
 | Very short request (< 16-byte body) | **Known deviation** | C over-reads `ContextId` and usually replies FAULT; Zig disconnects. Real KMS requests are ≥ 268 bytes, unreachable. |
 | FAULT `CallId` | **Aligned** | Server FAULT header `CallId` is fixed at 2 (C global value). |
+| Concurrency limit | **Intentional design** | C bounds concurrent work with a `MaxTaskSemaphore`; Zig checks an atomic in-flight gate (`InFlight`) *before* `accept`, so connections over `--max-clients` (default 1024) stay in the kernel backlog — queued rather than accepted into a blocked worker, and reset once the backlog overflows. Process thread count follows the peak of concurrent connections, never the current count. |
+| Log delivery | **Intentional design** | C writes every line from the worker thread, so a slow consumer stalls that worker; Zig keeps the format and levels but delivers through a bounded, **lossy** queue drained by a writer task, so under load lines can be **dropped** (counted and reported once at shutdown). The C log options (`-l`, `-T0`/`-T1`, `-e`) are dropped — §8. |
 
 ---
 
 ## 6. Verification
 
-- **Unit tests**: `zig build test --summary all` → 35/35 pass.
+- **Unit tests**: `zig build test --summary all` → all pass.
   - `kms.zig`: struct layout comptime asserts; v4/v5/v6 request→response→decrypt round-trips; ePID format; client list insert/evict.
   - `rpc.zig`: BIND negotiation (NDR32/NDR64/BTFN); request wrap (NDR32/NDR64); dispatch end-to-end; invalid-version HRESULT.
   - `crypto.zig`: v4 CMAC / v5 / v6 encryption / CBC / HMAC-SHA256 golden vectors.
   - `kmsdata.zig`: `.kmd` parsing field asserts.
+  - `network.zig`: private-IP classification; the read path (deadline, cancelation with no self-pipe, EOF, split packets).
+  - `main.zig` / `vlmzs.zig` / `cli_helper.zig`: the admission gate (`InFlight`); client report staging and `--timeout`; option parsing and validation.
+  - `line_queue.zig`: bounded lossy FIFO — drop/truncate accounting and the drain-before-cancel order.
 - **Golden vectors**: hard-coded hex constants in `src/crypto.zig` tests, derived from the upstream C `dump_vectors`.
 - **End-to-end**: `vlmzs` ↔ `vlmzsd` (v4/v5/v6, NDR32/NDR64, DNS, IPv4/IPv6 dual-stack, invalid-version rejection,
   10 concurrent clients, `--max-clients` throttling).
