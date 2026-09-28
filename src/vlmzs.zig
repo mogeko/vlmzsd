@@ -9,6 +9,7 @@ const cli_helper = @import("cli_helper.zig");
 const network = @import("network.zig");
 const kms = vlmzsd.kms;
 const kmsdata = vlmzsd.kmsdata;
+const rpc = vlmzsd.rpc;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -542,6 +543,48 @@ const Conn = struct {
     idle: network.ReadOptions,
 };
 
+/// Transfer syntax for a request: the reference client sends the first request
+/// after BIND as NDR32 and later ones as NDR64 (`firstPacketSent` in
+/// `rpcSendRequest`) — the Windows KMS client behaves the same way. NDR64 is an
+/// option only when the server accepted it.
+fn requestUseNdr64(bind: rpc.BindResult, first: bool, ndr64_allowed: bool) bool {
+    const ndr64_ok = ndr64_allowed and bind.has_ndr64;
+    return if (first) !bind.has_ndr32 and ndr64_ok else ndr64_ok;
+}
+
+/// Bind the presentation contexts and report what the server accepted. Mirrors
+/// the reference `rpcBindClient`: the BIND is followed by an ALTER-CONTEXT
+/// whenever NDR32 was NACKed — which a server does while NDR64 is available
+/// (Microsoft behavior), so this is also the path a Windows KMS client takes.
+/// Without it the first request would have to go out as NDR64, and a server
+/// without NDR64 could not be served at all.
+fn bindContexts(
+    gpa: Allocator,
+    reader: *Io.Reader,
+    writer: *Io.Writer,
+    call_id: *u32,
+    opts: *const ClientOptions,
+    idle: network.ReadOptions,
+) !rpc.BindResult {
+    var bind = try network.clientBind(gpa, reader, writer, call_id, .{
+        .use_ndr64 = opts.ndr64,
+        .use_btfn = opts.btfn,
+        .multiplexed = opts.multiplexed,
+        .idle = idle,
+    });
+    if (!bind.has_ndr32) {
+        const alter = try network.clientAlterContext(gpa, reader, writer, call_id, .{
+            .multiplexed = opts.multiplexed,
+            .idle = idle,
+        });
+        if (alter.has_ndr32) bind.has_ndr32 = true;
+    }
+    // The reference reports `RPC_S_NO_PROTSEQS` here; fail before sending a
+    // request that no negotiated context could carry.
+    if (!bind.has_ndr32 and !bind.has_ndr64) return error.NoTransferSyntax;
+    return bind;
+}
+
 fn sendRequest(
     gpa: Allocator,
     io: Io,
@@ -565,17 +608,12 @@ fn sendRequest(
         .timeout = network.timeoutSeconds(opts.timeout_seconds),
     } };
     var call_id: u32 = 2;
-    const bind = try network.clientBind(gpa, &reader.interface, &writer.interface, &call_id, .{
-        .use_ndr64 = opts.ndr64,
-        .use_btfn = opts.btfn,
-        .multiplexed = opts.multiplexed,
-        .idle = idle,
-    });
+    const bind = try bindContexts(gpa, &reader.interface, &writer.interface, &call_id, opts, idle);
 
     var conn = Conn{
         .reader = &reader.interface,
         .writer = &writer.interface,
-        .use_ndr64 = if (opts.ndr64 and bind.has_ndr64) true else bind.has_ndr32,
+        .use_ndr64 = requestUseNdr64(bind, true, opts.ndr64),
         .call_id = call_id,
         .idle = idle,
     };
@@ -686,17 +724,12 @@ fn sendRequestsReused(
         .timeout = network.timeoutSeconds(opts.timeout_seconds),
     } };
     var call_id: u32 = 2;
-    const bind = try network.clientBind(gpa, &reader.interface, &writer.interface, &call_id, .{
-        .use_ndr64 = opts.ndr64,
-        .use_btfn = opts.btfn,
-        .multiplexed = opts.multiplexed,
-        .idle = idle,
-    });
+    const bind = try bindContexts(gpa, &reader.interface, &writer.interface, &call_id, opts, idle);
 
     var conn = Conn{
         .reader = &reader.interface,
         .writer = &writer.interface,
-        .use_ndr64 = if (opts.ndr64 and bind.has_ndr64) true else bind.has_ndr32,
+        .use_ndr64 = requestUseNdr64(bind, true, opts.ndr64),
         .call_id = call_id,
         .idle = idle,
     };
@@ -705,6 +738,9 @@ fn sendRequestsReused(
     while (i < opts.count) : (i += 1) {
         const base = buildRequestBase(opts, data, sku_index, rng, io);
         try sendRequestOn(gpa, &conn, base, rng, out, data, opts.verbose);
+        // Later requests on the same association use NDR64 when the server
+        // supports it (C `firstPacketSent` in `rpcSendRequest`).
+        conn.use_ndr64 = requestUseNdr64(bind, false, opts.ndr64);
     }
 }
 
@@ -842,6 +878,26 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
     }
+}
+
+test "request syntax follows the reference first-packet policy" {
+    const both: rpc.BindResult = .{ .has_ndr32 = true, .has_ndr64 = true };
+    try std.testing.expect(!requestUseNdr64(both, true, true)); // first: NDR32
+    try std.testing.expect(requestUseNdr64(both, false, true)); // later: NDR64
+
+    // NDR32-only server: both requests go out as NDR32. This is the regression
+    // that made `vlmzs` fail against `vlmzsd --no-ndr64` with NCA 0x1C010003.
+    const ndr32_only: rpc.BindResult = .{ .has_ndr32 = true, .has_ndr64 = false };
+    try std.testing.expect(!requestUseNdr64(ndr32_only, true, true));
+    try std.testing.expect(!requestUseNdr64(ndr32_only, false, true));
+
+    // NDR64-only server: the first request cannot be NDR32.
+    const ndr64_only: rpc.BindResult = .{ .has_ndr32 = false, .has_ndr64 = true };
+    try std.testing.expect(requestUseNdr64(ndr64_only, true, true));
+    try std.testing.expect(requestUseNdr64(ndr64_only, false, true));
+
+    // `--no-ndr64` on the client: NDR64 is never used, not even later on.
+    try std.testing.expect(!requestUseNdr64(both, false, false));
 }
 
 test "buildRequestBase binding expiration" {

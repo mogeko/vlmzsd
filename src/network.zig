@@ -64,6 +64,10 @@ pub fn writeAll(writer: *Io.Writer, buf: []const u8) !void {
 pub const Event = union(enum) {
     /// BIND/ALTER-CONTEXT negotiation; payload is true when NDR64 was selected.
     bind_negotiated: bool,
+    /// A received PDU that is not a `REQUEST` (BIND, ALTER-CONTEXT, or a type
+    /// this server does not handle), reported as it arrives so the caller can
+    /// log what the peer actually sent.
+    packet: struct { packet_type: u8, frag_length: u16 },
     /// A FAULT was sent; payload is the NCA status code.
     fault: u32,
     /// A KMS request was rejected; `major` is the request's major version
@@ -76,6 +80,9 @@ pub const Event = union(enum) {
 
 pub const ServeOptions = struct {
     cfg: *const kms.ServerConfig,
+    /// Association group id echoed in BIND/ALTER-CONTEXT responses. The
+    /// reference assigns a random non-zero value at startup and increments it
+    /// per client (`network.c` `runServer`); callers should do the same.
     rpc_assoc_group: u32 = 0,
     /// Port-number string to embed in BIND responses ("" → none).
     secondary_address: []const u8 = "",
@@ -169,8 +176,23 @@ fn readSome(idle: ReadOptions, reader: *Io.Reader, buf: []u8) !usize {
     return message.data.len;
 }
 
-/// Serve the RPC loop over a connected stream (equivalent to the C `rpcServer`).
-/// Returns when the peer closes the stream or sends an unsupported packet type.
+/// Why the server loop stopped. Every value is a normal end of the connection,
+/// and every exit path of `serveRpc` reports one, so the caller can log exactly
+/// one close line per connection.
+pub const ServeEnd = enum {
+    /// The peer closed the stream.
+    peer_closed,
+    /// The peer sent a packet type this server does not handle (the C
+    /// `rpcServer` returns from its `default:` arm).
+    unsupported_packet,
+    /// `disconnect_per_request` closed the connection after a RESPONSE/FAULT
+    /// (the C `DisconnectImmediately`).
+    after_request,
+};
+
+/// Serve the RPC loop over a connected stream (equivalent to the C `rpcServer`),
+/// returning why the connection ended (`ServeEnd`). Failures — including
+/// `error.Timeout` when a read outlives `options.idle` — stay errors.
 pub fn serveRpc(
     allocator: Allocator,
     reader: *Io.Reader,
@@ -178,21 +200,36 @@ pub fn serveRpc(
     rng: std.Random,
     now_unix: i64,
     options: ServeOptions,
-) !void {
+) !ServeEnd {
     var negotiation = rpc.BindNegotiation{};
 
     while (true) {
         var header: rpc.RpcHeader = undefined;
         readAll(options.idle, reader, std.mem.asBytes(&header)) catch |err| switch (err) {
-            error.EndOfStream => return,
+            error.EndOfStream => return .peer_closed,
             else => return err,
         };
+
+        // Report every PDU except a `REQUEST` (whose outcome the `response` /
+        // `request_rejected` events already describe). Without this a BIND
+        // followed by an ALTER-CONTEXT — or by a type dropped below — leaves no
+        // trace, and "BIND then nothing" is indistinguishable from "the peer
+        // went silent".
+        if (header.packet_type != rpc.packet_type.request) {
+            if (options.on_event) |cb| cb(options.event_context, .{ .packet = .{
+                .packet_type = header.packet_type,
+                .frag_length = header.frag_length,
+            } });
+        }
 
         const action: usize = switch (header.packet_type) {
             rpc.packet_type.bind_req => 0,
             rpc.packet_type.request => 1,
             rpc.packet_type.alter_context_req => 2,
-            else => return,
+            // Unsupported packet type: close the connection (C `rpcServer`
+            // returns from its `default:` arm). Report it through `ServeEnd` so
+            // the caller logs the close instead of losing it.
+            else => return .unsupported_packet,
         };
 
         const frag_len: usize = header.frag_length;
@@ -200,7 +237,7 @@ pub fn serveRpc(
         const request_body = try allocator.alloc(u8, frag_len - rpc.header_size);
         defer allocator.free(request_body);
         readAll(options.idle, reader, request_body) catch |err| switch (err) {
-            error.EndOfStream => return,
+            error.EndOfStream => return .peer_closed,
             else => return err,
         };
 
@@ -208,7 +245,11 @@ pub fn serveRpc(
             const resp_body = try rpc.buildBindResponse(allocator, request_body, options.rpc_assoc_group, .{
                 .use_ndr64 = options.use_ndr64,
                 .use_btfn = options.use_btfn,
-                .secondary_address = options.secondary_address,
+                // The local port string belongs in a BIND response only: the
+                // reference suppresses it for ALTER-CONTEXT (`rpc.c` `rpcBind`
+                // sets `SecondaryAddressLength = 0` when the packet type is
+                // `RPC_PT_ALTERCONTEXT_REQ`).
+                .secondary_address = if (action == 0) options.secondary_address else "",
             }, &negotiation);
             defer allocator.free(resp_body);
 
@@ -238,7 +279,7 @@ pub fn serveRpc(
                         &fault_body,
                         rpc.packet_flags.first | rpc.packet_flags.last | rpc.packet_flags.not_exec,
                     );
-                    if (options.disconnect_per_request) return;
+                    if (options.disconnect_per_request) return .after_request;
                 },
                 .response => |resp_body| {
                     defer allocator.free(resp_body);
@@ -257,7 +298,7 @@ pub fn serveRpc(
                     }
                     // RESPONSE echoes the request's packet flags (incl. MULTIPLEX).
                     try writePacket(writer, rpc.packet_type.response, header.call_id, resp_body, header.packet_flags);
-                    if (options.disconnect_per_request) return;
+                    if (options.disconnect_per_request) return .after_request;
                 },
             }
         }
@@ -290,6 +331,36 @@ pub fn clientBind(
     const req = try rpc.buildBindRequest(allocator, rpc.packet_type.bind_req, call_id.*, .{
         .use_ndr64 = options.use_ndr64,
         .use_btfn = options.use_btfn,
+        .multiplexed = options.multiplexed,
+    });
+    defer allocator.free(req);
+    call_id.* += 1;
+
+    try writeAll(writer, req);
+
+    const resp_body = try readPacket(allocator, options.idle, reader);
+    defer allocator.free(resp_body);
+
+    return rpc.parseBindResponse(resp_body);
+}
+
+/// Bind the presentation context the BIND left out. The reference client
+/// (`rpcBindClient`) always wants NDR32 for its first request and adds it with
+/// an ALTER-CONTEXT when the server NACKed it — which a server does whenever
+/// NDR64 is available (Microsoft behavior), so this is also the sequence the
+/// Windows KMS client sends.
+pub fn clientAlterContext(
+    allocator: Allocator,
+    reader: *Io.Reader,
+    writer: *Io.Writer,
+    call_id: *u32,
+    options: ClientOptions,
+) !rpc.BindResult {
+    // `buildBindRequest` attaches the NDR64/BTFN contexts to a BIND only, so the
+    // request carries the single NDR32 item, as context id 0.
+    const req = try rpc.buildBindRequest(allocator, rpc.packet_type.alter_context_req, call_id.*, .{
+        .use_ndr64 = false,
+        .use_btfn = false,
         .multiplexed = options.multiplexed,
     });
     defer allocator.free(req);
@@ -786,7 +857,9 @@ test "serveRpc end-to-end (bind + v6 request)" {
     var output_buf: [4096]u8 align(4) = undefined;
     var writer = Io.Writer.fixed(&output_buf);
 
-    try serveRpc(alloc, &reader, &writer, rng, 1_700_000_000, .{ .cfg = &cfg });
+    // The stream ends after the request: `serveRpc` reports the peer close.
+    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, rng, 1_700_000_000, .{ .cfg = &cfg });
+    try std.testing.expectEqual(ServeEnd.peer_closed, end);
 
     const output = writer.buffered();
     try std.testing.expect(output.len >= 2 * rpc.header_size);
@@ -811,6 +884,174 @@ test "serveRpc end-to-end (bind + v6 request)" {
     var resp: kms.ResponseV6 = undefined;
     const result = kms.decryptResponseV6(&resp, parsed.data.len, @constCast(parsed.data), &request_client, null);
     try std.testing.expect(result.ok());
+}
+
+test "ALTER-CONTEXT response carries no secondary address" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = kms.ServerConfig{ .data = &td.data };
+    var prng: std.Random.DefaultPrng = .init(0x9e37_79b9);
+
+    const alter_req = try rpc.buildBindRequest(alloc, rpc.packet_type.alter_context_req, 4, .{});
+    defer alloc.free(alter_req);
+
+    var reader = Io.Reader.fixed(alter_req);
+    var output_buf: [4096]u8 align(4) = undefined;
+    var writer = Io.Writer.fixed(&output_buf);
+
+    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, prng.random(), 1_700_000_000, .{
+        .cfg = &cfg,
+        .secondary_address = "1688",
+    });
+    try std.testing.expectEqual(ServeEnd.peer_closed, end); // the trailing close
+
+    const output = writer.buffered();
+    const header = parseHeader(output);
+    try std.testing.expectEqual(rpc.packet_type.alter_context_ack, header.packet_type);
+
+    const body = output[rpc.header_size..header.frag_length];
+    // `rpcBind` leaves `SecondaryAddressLength` at 0 for ALTER-CONTEXT, so
+    // `NumResults` sits at offset 12 and the body is 16 + 24 * ctx-items bytes
+    // — docs/migration.md §4.2.
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, body[8..10], .little));
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, body[12..16], .little));
+    try std.testing.expectEqual(@as(usize, 40), body.len);
+}
+
+test "BIND response layout" {
+    const alloc = std.testing.allocator;
+
+    const bind_req = try rpc.buildBindRequest(alloc, rpc.packet_type.bind_req, 2, .{ .use_ndr64 = true });
+    defer alloc.free(bind_req);
+
+    var negotiation = rpc.BindNegotiation{};
+    const body = try rpc.buildBindResponse(alloc, bind_req[rpc.header_size..], 7, .{
+        .use_ndr64 = true,
+        .secondary_address = "1688",
+    }, &negotiation);
+    defer alloc.free(body);
+
+    // MaxXmitFrag/MaxRecvFrag are echoed verbatim, then the caller's AssocGroup.
+    try std.testing.expectEqualSlices(u8, bind_req[rpc.header_size..][0..4], body[0..4]);
+    try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, body[4..8], .little));
+    // Secondary address: length includes the NUL, then the port string; the
+    // result block starts at the next 4-byte boundary — docs/migration.md §4.2.
+    try std.testing.expectEqual(@as(u16, 5), std.mem.readInt(u16, body[8..10], .little));
+    try std.testing.expectEqualSlices(u8, "1688", body[10..14]);
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, body[16..20], .little));
+    try std.testing.expectEqual(@as(usize, 20 + 2 * 24), body.len);
+
+    // Context 0 (NDR32) is NACKed while NDR64 is available; context 1 (NDR64)
+    // is accepted with syntax version 1.
+    const ndr32_result = body[20..44];
+    try std.testing.expectEqual(rpc.bind_nack, std.mem.readInt(u16, ndr32_result[0..2], .little));
+    try std.testing.expectEqual(rpc.syntax_unsupported, std.mem.readInt(u16, ndr32_result[2..4], .little));
+    const ndr64_result = body[44..68];
+    try std.testing.expectEqual(rpc.bind_accept, std.mem.readInt(u16, ndr64_result[0..2], .little));
+    try std.testing.expectEqualSlices(u8, rpc.transfer_syntax_ndr64[0..], ndr64_result[4..20]);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, ndr64_result[20..24], .little));
+}
+
+test "disconnect-per-request ends the loop after the response" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = kms.ServerConfig{ .data = &td.data };
+    const base = makeBase(&td.data);
+    var prng: std.Random.DefaultPrng = .init(0x2545_f491);
+    const rng = prng.random();
+
+    const bind_req = try rpc.buildBindRequest(alloc, rpc.packet_type.bind_req, 2, .{ .use_ndr64 = false });
+    defer alloc.free(bind_req);
+
+    var request_v6: kms.RequestV6 = undefined;
+    kms.createRequestV6(&request_v6, &base, rng);
+    const rpc_req = try rpc.wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), false, 3);
+    defer alloc.free(rpc_req);
+
+    const input = try std.mem.concat(alloc, u8, &.{ bind_req, rpc_req });
+    defer alloc.free(input);
+
+    var reader = Io.Reader.fixed(input);
+    var output_buf: [8192]u8 align(4) = undefined;
+    var writer = Io.Writer.fixed(&output_buf);
+
+    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, rng, 1_700_000_000, .{
+        .cfg = &cfg,
+        .disconnect_per_request = true,
+    });
+    // The loop stops after the RESPONSE instead of waiting for another request,
+    // and says so — the caller logs `closed: after request`. A BIND_ACK alone
+    // does not disconnect: the C reference only reacts to RESPONSE/FAULT.
+    try std.testing.expectEqual(ServeEnd.after_request, end);
+
+    const output = writer.buffered();
+    const ack_header = parseHeader(output);
+    try std.testing.expectEqual(rpc.packet_type.bind_ack, ack_header.packet_type);
+    const resp_header = parseHeader(output[ack_header.frag_length..]);
+    try std.testing.expectEqual(rpc.packet_type.response, resp_header.packet_type);
+    // Exactly those two packets, and nothing was awaited afterwards.
+    try std.testing.expectEqual(output.len, @as(usize, ack_header.frag_length) + @as(usize, resp_header.frag_length));
+}
+
+test "ALTER-CONTEXT lets an NDR32 request follow a NDR64-only BIND" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = kms.ServerConfig{ .data = &td.data };
+    const base = makeBase(&td.data);
+    var prng: std.Random.DefaultPrng = .init(0x0bad_c0de);
+    const rng = prng.random();
+
+    // The wire sequence of the reference client: BIND offering both syntaxes,
+    // then — because the server NACKs NDR32 while NDR64 is available — an
+    // ALTER-CONTEXT that binds NDR32, then an NDR32 request on context 0.
+    const bind_req = try rpc.buildBindRequest(alloc, rpc.packet_type.bind_req, 2, .{ .use_ndr64 = true });
+    defer alloc.free(bind_req);
+    const alter_req = try rpc.buildBindRequest(alloc, rpc.packet_type.alter_context_req, 3, .{});
+    defer alloc.free(alter_req);
+
+    var request_v6: kms.RequestV6 = undefined;
+    kms.createRequestV6(&request_v6, &base, rng);
+    const rpc_req = try rpc.wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), false, 4);
+    defer alloc.free(rpc_req);
+
+    const input = try std.mem.concat(alloc, u8, &.{ bind_req, alter_req, rpc_req });
+    defer alloc.free(input);
+
+    var reader = Io.Reader.fixed(input);
+    var output_buf: [8192]u8 align(4) = undefined;
+    var writer = Io.Writer.fixed(&output_buf);
+
+    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, rng, 1_700_000_000, .{
+        .cfg = &cfg,
+        .use_ndr64 = true,
+        .secondary_address = "1688",
+    });
+    try std.testing.expectEqual(ServeEnd.peer_closed, end);
+
+    const output = writer.buffered();
+    const ack_header = parseHeader(output);
+    try std.testing.expectEqual(rpc.packet_type.bind_ack, ack_header.packet_type);
+
+    const alter_offset: usize = ack_header.frag_length;
+    const alter_header = parseHeader(output[alter_offset..]);
+    try std.testing.expectEqual(rpc.packet_type.alter_context_ack, alter_header.packet_type);
+
+    const resp_offset: usize = alter_offset + alter_header.frag_length;
+    const resp_header = parseHeader(output[resp_offset..]);
+    try std.testing.expectEqual(rpc.packet_type.response, resp_header.packet_type);
+
+    // A RESPONSE — not the `nca_unk_if` FAULT an unbound context would produce:
+    // the ALTER-CONTEXT made context 0 the NDR32 context on the server too.
+    const resp_body = output[resp_offset + rpc.header_size .. resp_offset + resp_header.frag_length];
+    const parsed = rpc.parseKmsResponse(resp_body, false);
+    try std.testing.expectEqual(@as(i32, 0), parsed.status);
+    try std.testing.expect(parsed.data.len > 0);
 }
 
 test "client bind handshake" {

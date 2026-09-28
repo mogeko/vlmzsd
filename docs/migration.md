@@ -179,10 +179,14 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 
 - `rpc.zig` is pure wire format (no sockets): RPC header, BIND negotiation, NDR wrapping, FAULT, client parsing.
 - `network.zig` is byte-stream I/O (`std.Io` replacing `sendrecv`): `serveRpc` (server loop),
-  `clientBind` / `clientSendRequest` (client), socket glue (`connect`/`listen`).
+  `clientBind` / `clientAlterContext` / `clientSendRequest` (client), socket glue (`connect`/`listen`).
 - **BIND negotiation**: context item 44B / result 24B; secondary address length includes NUL, 4-byte aligned
-  (`results_offset = (10 + port_size + 3) & ~3`); NACK NDR32 whenever NDR64 is available (Microsoft behavior);
-  BTFN feature mask = `transfer_syntax[8..10] & 0x3`.
+  (`results_offset = (10 + port_size + 3) & ~3`); the local port string is written **only** into a BIND
+  response — an ALTER-CONTEXT response carries no secondary address (`rpcBind` sets `SecondaryAddressLength = 0`
+  for `RPC_PT_ALTERCONTEXT_REQ`, so `NumResults` sits at offset 12); `AssocGroup` is a non-zero per-client value
+  (`rand32()` then `++` in `runServer`); NACK NDR32 whenever NDR64 is available (Microsoft behavior), and the
+  client answers that NACK with an ALTER-CONTEXT before its first (NDR32) request — the Windows KMS client's
+  sequence; BTFN feature mask = `transfer_syntax[8..10] & 0x3`.
 - **Request dispatch** (`dispatchKmsRequest`, mirroring C `checkRpcRequestSize` + `rpcRequest`):
   - context mismatch → **FAULT** `nca_unk_if` (`AllocHint=32`, `Error.Code@8`, `CallId=2`).
   - too-short request / major outside 4..6 / minor != 0 → **RESPONSE** + `0x8007000D` (`DataSizeMax=DataLength=0`,
@@ -236,7 +240,7 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 |---|---|---|
 | IPv4-mapped private detection | **C defect fix** | C treats `::ffff:x.x.x.x` as always private (`word0` is not `2000::/3`); Zig extracts the embedded IPv4 for an exact decision, so ip-protection level 2 correctly rejects public IPv4 clients over a dual-stack socket. |
 | Client return-code read position | **C defect fix** | C reads a misaligned offset on non-4-aligned responses (`+*responseSize + pad`); Zig reads `data_offset + response_size` (correct position). |
-| Client first-packet NDR32 policy | **Intentional simplification** | C forces the first request after BIND to NDR32 (`firstPacketSent`); Zig uses NDR64 whenever available. Both are legal; not a wire error. |
+| Client first-packet NDR32 policy | **Aligned** | The client mirrors C `rpcBindClient` + `rpcSendRequest`: when the BIND reply left NDR32 NACKed (as it is whenever the server has NDR64), an ALTER-CONTEXT binds NDR32, the first request goes out as NDR32 and later ones as NDR64 (`firstPacketSent`). The Windows KMS client sends the same sequence — its absence is what the client-side regression could not see. |
 | Client `DataLength==DataSizeIs` check | **Intentionally omitted** | C's `sizesMatch` defensive check is not replicated; does not affect normal interaction. |
 | Uninitialized bytes | **Intentionally zeroed** | C's FAULT body, BIND response padding, etc. are stack garbage; Zig `@memset(0)` everywhere. Clients never read these bytes. |
 | `AesCmacV4` in-place side effect | **Intentional difference** | C writes the `0x80` padding into the input buffer; Zig uses a separate pad buffer. MAC output and final sent bytes are identical. |
