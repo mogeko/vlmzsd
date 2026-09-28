@@ -530,8 +530,8 @@ fn printResponseVerbose(base: *const kms.Response, hwid: ?*const [8]u8, result: 
 /// A BIND-completed connection a request is sent over: the buffered streams
 /// (borrowed — they stay in the caller's frame), the transfer syntax the BIND
 /// reply negotiated, the CallId sequence, and the read timeout. The timeout
-/// travels with the connection because it has to poll the very socket the
-/// streams were opened on.
+/// travels with the connection because the deadline applies to the very socket
+/// the streams were opened on.
 const Conn = struct {
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
@@ -1061,9 +1061,9 @@ test "a request that fails on the wire still emits a complete line" {
 }
 
 // A peer that completes the TCP handshake and then says nothing is the failure
-// mode `--timeout` exists for: without the poll, the client blocks in `read(2)`
-// forever. Uses the real `clientBind` against a listening socket nobody
-// accepts from, so the timeout is exercised on the actual packet read.
+// mode `--timeout` exists for: without the deadline, the client blocks in
+// `read(2)` forever. Uses the real `clientBind` against a listening socket
+// nobody accepts from, so the timeout is exercised on the actual packet read.
 test "--timeout bounds a peer that never answers" {
     const alloc = std.testing.allocator;
 
