@@ -68,8 +68,9 @@ source linked above).
   bounded, **lossy** queue (`src/line_queue.zig`) and written by a dedicated writer task; a full
   queue drops the line (counted, reported at shutdown) instead of blocking a worker. Shutdown order
   is `conn_group.cancel` → `log.shutdown` → `log_group.cancel` → `log.deinit`, so lines logged while
-  connections stop are still flushed. On a fatal startup path use `fatal(...)` — `std.process.exit`
-  skips the `defer`s that would drain the queue.
+  connections stop are still flushed. A second `SIGINT`/`SIGTERM` skips that drain and `_exit`s with
+  `128 + signum`, so a blocked log sink cannot wedge a stop (see `docs/cli.md`). On a fatal startup
+  path use `fatal(...)` — `std.process.exit` skips the `defer`s that would drain the queue.
 - Tests: byte-level round-trips and golden hex vectors (hard-coded in `src/crypto.zig`).
 - Concurrency: one `std.Io.Group` for the process lifetime; each accepted connection is one
   `Group.concurrent` task on the `std.Io.Threaded` pool (threads are spawned on demand and reused,

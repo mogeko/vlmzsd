@@ -153,6 +153,14 @@ with `-Dno-embedded-data`, startup fails with an error.
 | `--quiet` | `-q` | off | `VLMZSD_QUIET` | drop `info` logging |
 | `--quiet-loopback` | | off | `VLMZSD_QUIET_LOOPBACK` | suppress debug logs from loopback (localhost) clients |
 
+Signals: the first `SIGINT`/`SIGTERM` shuts the server down gracefully — the listener stops
+accepting, the client tasks are canceled (a parked read is a cancelable `Io` operation), and the log
+queue is drained before the process exits with status `0`. A **second** signal (and any later one)
+exits immediately with status `128 + signum` (`130` for `SIGINT`, `143` for `SIGTERM`) without
+draining. It exists for a supervisor whose log sink is blocked, and it deliberately prints nothing —
+a `write` would block on that same sink, so the exit code is the only channel still reliable.
+`SIGKILL` cannot be caught.
+
 ### Logging
 
 Logging has **no CLI surface**. Output is a **fixed format** prefixed with a
