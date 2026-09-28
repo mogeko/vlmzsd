@@ -250,6 +250,7 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 | FAULT `CallId` | **Aligned** | Server FAULT header `CallId` is fixed at 2 (C global value). |
 | Concurrency limit | **Intentional design** | C bounds concurrent work with a `MaxTaskSemaphore`; Zig checks an atomic in-flight gate (`InFlight`) *before* `accept`, so connections over `--max-clients` (default 1024) stay in the kernel backlog — queued rather than accepted into a blocked worker, and reset once the backlog overflows. Process thread count follows the peak of concurrent connections, never the current count. |
 | Log delivery | **Intentional design** | C writes every line from the worker thread, so a slow consumer stalls that worker; Zig keeps the format and levels but delivers through a bounded, **lossy** queue drained by a writer task, so under load lines can be **dropped** (counted and reported once at shutdown). The C log options (`-l`, `-T0`/`-T1`, `-e`) are dropped — §8. |
+| Second shutdown signal | **Intentional design** | C acts on the first signal only; Zig keeps that graceful path (cancel client tasks, drain the log queue) and treats a **second** `SIGINT`/`SIGTERM` as "stop draining": the handler `_exit`s with `128 + signum`, so a supervisor whose log sink is blocked can still stop the server. Nothing is printed on that path by design. |
 
 ---
 

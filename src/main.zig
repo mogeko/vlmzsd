@@ -1,4 +1,4 @@
-//! `vlmzsd` — the KMS server binary (Phase 6).
+//! `vlmzsd` — the KMS server binary.
 //!
 //! Implements the `vlmzsd` CLI surface from `docs/cli.md`: no config file,
 //! three-tier precedence (default < `VLMZSD_*` env var < CLI flag), fixed-format
@@ -473,12 +473,40 @@ fn serveClientThread(ctx: *ClientContext) void {
 /// no cleanup itself, so the normal control flow (and its defers) runs the
 /// shutdown. The pipe is the one piece of unavoidable global state: a signal
 /// handler cannot take a context pointer.
+///
+/// The first signal wakes the accept loop, which runs the shutdown; a second one
+/// exits hard from the handler itself (see `handleShutdown`).
 var shutdown_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 
+/// A second SIGINT/SIGTERM abandons the drain and exits hard; the first one is
+/// the graceful path.
+const force_exit_signal_count: u32 = 2;
+
+/// Shutdown signals seen so far. Written only by `handleShutdown`, which two
+/// threads can run concurrently (a signal is delivered to an arbitrary thread),
+/// so the increment must be atomic. `u32` is lock-free on every supported
+/// target, so this is async-signal-safe.
+var shutdown_signals: std.atomic.Value(u32) = .init(0);
+
+/// Record one shutdown signal; `false` means the operator asked again, so the
+/// caller must exit without draining. Parameterised on the counter rather than
+/// reading the global directly, so tests can exercise the policy without
+/// touching signals, the pipe, or `_exit`.
+fn noteShutdownSignal(counter: *std.atomic.Value(u32)) bool {
+    return counter.fetchAdd(1, .monotonic) + 1 < force_exit_signal_count;
+}
+
 fn handleShutdown(sig: std.posix.SIG) callconv(.c) void {
-    _ = sig;
-    // The only async-signal-safe work: write one byte to wake poll(). A flag
-    // alone would not work — std.posix.poll swallows EINTR and keeps blocking.
+    if (!noteShutdownSignal(&shutdown_signals)) {
+        // `std.process.exit` would run atexit handlers and flush stdio, which
+        // is not async-signal-safe; `_exit` is. Nothing is printed on purpose:
+        // a second signal usually exists because the log sink is blocked, and a
+        // `write` would block on that same sink — the exit code (`128 + signum`)
+        // is the only channel still guaranteed to work.
+        std.c._exit(128 + @as(c_int, @intCast(@intFromEnum(sig))));
+    }
+    // Wake the accept loop: write one byte. A flag alone would not work —
+    // std.posix.poll swallows EINTR and keeps blocking.
     const byte: [1]u8 = .{1};
     _ = std.c.write(shutdown_pipe[1], &byte, 1);
 }
@@ -984,4 +1012,22 @@ test "InFlight cap of 0 is unlimited" {
 
     while (i > 0) : (i -= 1) gate.release();
     try std.testing.expectEqual(@as(u32, 0), gate.count.load(.acquire));
+}
+
+// The shutdown policy is exercised through `noteShutdownSignal` and a local
+// counter: a test must never reach `_exit` (it would take the test runner with
+// it), and it must never install the real handler or write to the real pipe
+// (stdout carries the test runner protocol).
+test "the first shutdown signal asks for a graceful exit" {
+    var counter: std.atomic.Value(u32) = .init(0);
+    try std.testing.expect(noteShutdownSignal(&counter));
+    try std.testing.expectEqual(@as(u32, 1), counter.load(.acquire));
+}
+
+test "a second shutdown signal forces an exit" {
+    var counter: std.atomic.Value(u32) = .init(0);
+    try std.testing.expect(noteShutdownSignal(&counter)); // 1st: graceful
+    try std.testing.expect(!noteShutdownSignal(&counter)); // 2nd: hard exit
+    try std.testing.expect(!noteShutdownSignal(&counter)); // later ones too
+    try std.testing.expectEqual(@as(u32, 3), counter.load(.acquire));
 }

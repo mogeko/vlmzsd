@@ -153,6 +153,14 @@ with `-Dno-embedded-data`, startup fails with an error.
 | `--quiet` | `-q` | off | `VLMZSD_QUIET` | drop `info` logging |
 | `--quiet-loopback` | | off | `VLMZSD_QUIET_LOOPBACK` | suppress debug logs from loopback (localhost) clients |
 
+Signals: the first `SIGINT`/`SIGTERM` shuts the server down gracefully — the listener stops
+accepting, the client tasks are canceled (a parked read is a cancelable `Io` operation), and the log
+queue is drained before the process exits with status `0`. A **second** signal (and any later one)
+exits immediately with status `128 + signum` (`130` for `SIGINT`, `143` for `SIGTERM`) without
+draining. It exists for a supervisor whose log sink is blocked, and it deliberately prints nothing —
+a `write` would block on that same sink, so the exit code is the only channel still reliable.
+`SIGKILL` cannot be caught.
+
 ### Logging
 
 Logging has **no CLI surface**. Output is a **fixed format** prefixed with a
@@ -198,10 +206,10 @@ is absent when both counters are zero. The queue size is not configurable.
 | `--timeout <dur>` | | `30s` | idle timeout; `0` disables |
 | `--verbose` | `-v` | off | verbosity |
 
-`--timeout` applies to the BIND reply and to every RESPONSE read: the client
-polls the socket for readability before each packet read and fails with
-`error.Timeout` rather than blocking forever on a peer that accepted the
-connection and then went silent. It does **not** bound `connect` — Zig 0.16's
-`std.Io.Threaded` backend still panics on `ConnectOptions.timeout` ("TODO
-implement"), so an unreachable host is bounded only by the kernel's own SYN
-timeout.
+`--timeout` applies to the BIND reply and to every RESPONSE read: each packet
+read waits through a cancelable `Io` operation whose deadline the backend owns,
+so the client fails with `error.Timeout` rather than blocking forever on a peer
+that accepted the connection and then went silent. It does **not** bound
+`connect` — Zig 0.16's `std.Io.Threaded` backend still panics on
+`ConnectOptions.timeout` ("TODO implement"), so an unreachable host is bounded
+only by the kernel's own SYN timeout.
