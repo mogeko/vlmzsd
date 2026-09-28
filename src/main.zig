@@ -387,6 +387,14 @@ fn logProtocolEvent(context: ?*anyopaque, event: network.Event) void {
     }
 }
 
+/// Log the single close line that pairs with the `accepted` line. Every close
+/// goes through here, so the phrasing cannot drift between paths:
+/// `connection from <peer> closed <cause>`.
+fn logClosed(ctx: *ClientContext, comptime cause: []const u8, args: anytype) void {
+    if (ctx.quiet) return;
+    ctx.log.debug("connection from {s} closed " ++ cause, .{ctx.peer} ++ args);
+}
+
 /// Serve one connection as a pooled task (dispatched via `Group.concurrent`).
 /// Releases its admission slot and frees the context on exit.
 fn serveClientThread(ctx: *ClientContext) void {
@@ -413,7 +421,7 @@ fn serveClientThread(ctx: *ClientContext) void {
     var reader = ctx.stream.reader(ctx.io, &rbuf);
     var writer = ctx.stream.writer(ctx.io, &wbuf);
 
-    network.serveRpc(ctx.gpa, &reader.interface, &writer.interface, ctx.prng.random(), now_unix, .{
+    const end: network.ServeEnd = network.serveRpc(ctx.gpa, &reader.interface, &writer.interface, ctx.prng.random(), now_unix, .{
         .cfg = ctx.cfg,
         .on_event = logProtocolEvent,
         .event_context = ctx,
@@ -431,22 +439,32 @@ fn serveClientThread(ctx: *ClientContext) void {
             .timeout = network.timeoutSeconds(ctx.timeout_seconds),
         } },
     }) catch |e| switch (e) {
-        error.EndOfStream => {
-            if (!ctx.quiet) ctx.log.debug("connection from {s} closed", .{ctx.peer});
-        },
         error.Timeout => {
-            if (!ctx.quiet) ctx.log.debug("connection from {s} timed out", .{ctx.peer});
-        },
-        error.UnsupportedPacketType => {
-            if (!ctx.quiet) ctx.log.debug("connection from {s} closed: unsupported RPC packet type", .{ctx.peer});
+            // Nothing arrived for `--timeout` seconds (the C `SO_RCVTIMEO`).
+            // The connection is not broken and the last request was answered:
+            // this is an idle cleanup, not a failure.
+            logClosed(ctx, "after {d}s idle", .{ctx.timeout_seconds});
+            return;
         },
         error.Canceled => {
             // The read wait is a backend cancelation point, so a cancelation
             // request (shutdown) ends it directly: a clean exit, not a failure.
-            if (!ctx.quiet) ctx.log.debug("connection from {s} closed at shutdown", .{ctx.peer});
+            logClosed(ctx, "at shutdown", .{});
+            return;
         },
-        else => ctx.log.warn("connection from {s} error: {s}", .{ ctx.peer, @errorName(e) }),
+        else => {
+            ctx.log.warn("connection from {s} error: {s}", .{ ctx.peer, @errorName(e) });
+            return;
+        },
     };
+
+    // `serveRpc` reports why it stopped, so every connection gets exactly one
+    // close line, paired with the `accepted` line above.
+    switch (end) {
+        .peer_closed => logClosed(ctx, "by peer", .{}),
+        .unsupported_packet => logClosed(ctx, "on unsupported RPC packet type", .{}),
+        .after_request => logClosed(ctx, "after request", .{}),
+    }
 }
 
 /// Self-pipe write end (`[1]`): the SIGINT/SIGTERM handler writes one byte here
