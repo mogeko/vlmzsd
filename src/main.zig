@@ -346,8 +346,15 @@ const ClientContext = struct {
     use_btfn: bool,
     disconnect_per_request: bool,
     timeout_seconds: u32,
+    /// Association group id echoed in this connection's BIND/ALTER-CONTEXT
+    /// responses (non-zero, one per connection — C `RpcAssocGroup++`).
+    rpc_assoc_group: u32,
     in_flight: *InFlight,
     log: *cli_helper.Logger,
+    /// Peer address ("host:port") formatted into `peer_buf` on entry, so every
+    /// protocol event can name the connection it belongs to.
+    peer_buf: [64]u8 = undefined,
+    peer: []const u8 = "",
     /// Mirror of `ServerOptions.quiet_loopback` (the opt-in).
     quiet_loopback: bool = false,
     /// Computed per connection: `quiet_loopback` AND the peer is loopback.
@@ -360,19 +367,22 @@ const ClientContext = struct {
 fn logProtocolEvent(context: ?*anyopaque, event: network.Event) void {
     const ctx: *ClientContext = @ptrCast(@alignCast(context orelse return));
     switch (event) {
-        .bind_negotiated => |ndr64| {
-            if (!ctx.quiet) ctx.log.debug("BIND: negotiated {s}", .{if (ndr64) "NDR64" else "NDR32"});
+        .packet => |p| {
+            if (!ctx.quiet) ctx.log.debug("{s}: RPC packet type {d}, frag_length {d}", .{ ctx.peer, p.packet_type, p.frag_length });
         },
-        .fault => |nca| ctx.log.warn("RPC fault (NCA 0x{X:0>8})", .{nca}),
+        .bind_negotiated => |ndr64| {
+            if (!ctx.quiet) ctx.log.debug("{s}: BIND: negotiated {s}", .{ ctx.peer, if (ndr64) "NDR64" else "NDR32" });
+        },
+        .fault => |nca| ctx.log.warn("{s}: RPC fault (NCA 0x{X:0>8})", .{ ctx.peer, nca }),
         .request_rejected => |r| {
             if (r.major != 0) {
-                ctx.log.warn("KMS v{d} request rejected (HRESULT 0x{X:0>8})", .{ r.major, r.hr });
+                ctx.log.warn("{s}: KMS v{d} request rejected (HRESULT 0x{X:0>8})", .{ ctx.peer, r.major, r.hr });
             } else {
-                ctx.log.warn("invalid KMS request rejected (HRESULT 0x{X:0>8})", .{r.hr});
+                ctx.log.warn("{s}: invalid KMS request rejected (HRESULT 0x{X:0>8})", .{ ctx.peer, r.hr });
             }
         },
         .response => |r| {
-            if (!ctx.quiet) ctx.log.debug("KMS v{d} request → {d}-byte response", .{ r.major, r.size });
+            if (!ctx.quiet) ctx.log.debug("{s}: KMS v{d} request → {d}-byte response", .{ ctx.peer, r.major, r.size });
         },
     }
 }
@@ -393,10 +403,8 @@ fn serveClientThread(ctx: *ClientContext) void {
     // Only when --quiet-loopback is on, and only for loopback peers (the
     // container HEALTHCHECK): suppress debug chatter; warn/err still logs.
     ctx.quiet = ctx.quiet_loopback and network.isLoopbackPeer(ctx.stream.socket.handle);
-
-    var peer_buf: [64]u8 = undefined;
-    const peer = network.formatPeer(ctx.stream.socket.handle, &peer_buf);
-    if (!ctx.quiet) ctx.log.debug("connection from {s} accepted", .{peer});
+    ctx.peer = network.formatPeer(ctx.stream.socket.handle, &ctx.peer_buf);
+    if (!ctx.quiet) ctx.log.debug("connection from {s} accepted", .{ctx.peer});
 
     const now_unix = cli_helper.nowUnix(ctx.io);
 
@@ -410,6 +418,7 @@ fn serveClientThread(ctx: *ClientContext) void {
         .on_event = logProtocolEvent,
         .event_context = ctx,
         .secondary_address = ctx.port_str,
+        .rpc_assoc_group = ctx.rpc_assoc_group,
         .use_ndr64 = ctx.use_ndr64,
         .use_btfn = ctx.use_btfn,
         .disconnect_per_request = ctx.disconnect_per_request,
@@ -423,17 +432,20 @@ fn serveClientThread(ctx: *ClientContext) void {
         } },
     }) catch |e| switch (e) {
         error.EndOfStream => {
-            if (!ctx.quiet) ctx.log.debug("connection from {s} closed", .{peer});
+            if (!ctx.quiet) ctx.log.debug("connection from {s} closed", .{ctx.peer});
         },
         error.Timeout => {
-            if (!ctx.quiet) ctx.log.debug("connection from {s} timed out", .{peer});
+            if (!ctx.quiet) ctx.log.debug("connection from {s} timed out", .{ctx.peer});
+        },
+        error.UnsupportedPacketType => {
+            if (!ctx.quiet) ctx.log.debug("connection from {s} closed: unsupported RPC packet type", .{ctx.peer});
         },
         error.Canceled => {
             // The read wait is a backend cancelation point, so a cancelation
             // request (shutdown) ends it directly: a clean exit, not a failure.
-            if (!ctx.quiet) ctx.log.debug("connection from {s} closed at shutdown", .{peer});
+            if (!ctx.quiet) ctx.log.debug("connection from {s} closed at shutdown", .{ctx.peer});
         },
-        else => ctx.log.warn("connection from {s} error: {s}", .{ peer, @errorName(e) }),
+        else => ctx.log.warn("connection from {s} error: {s}", .{ ctx.peer, @errorName(e) }),
     };
 }
 
@@ -538,6 +550,8 @@ const ServerContext = struct {
     conn_group: *Io.Group,
     port_str: []const u8,
     prng: std.Random,
+    /// Next association group id; seeded non-zero (C `RpcAssocGroup = rand32()`).
+    assoc_group: u32,
 
     /// Poll the listen sockets and the shutdown pipe, accepting and
     /// dispatching clients until SIGINT/SIGTERM arrives.
@@ -646,10 +660,14 @@ const ServerContext = struct {
             .use_btfn = self.opts.btfn,
             .disconnect_per_request = self.opts.disconnect_per_request,
             .timeout_seconds = @intCast(self.opts.timeout_seconds),
+            .rpc_assoc_group = self.assoc_group,
             .in_flight = &self.in_flight,
             .log = self.log,
             .quiet_loopback = self.opts.quiet_loopback,
         };
+        // One association group per connection, always non-zero
+        // (C `RpcAssocGroup++` in `runServer`).
+        self.assoc_group +%= 1;
 
         self.conn_group.concurrent(self.io, serveClientThread, .{ctx}) catch |e| {
             ctx.stream.close(self.io);
@@ -875,6 +893,7 @@ pub fn main(init: std.process.Init) !void {
         .conn_group = &conn_group,
         .port_str = port_str,
         .prng = rng,
+        .assoc_group = rng.int(u32) | 1,
     };
     try server.run();
 }

@@ -181,7 +181,10 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 - `network.zig` is byte-stream I/O (`std.Io` replacing `sendrecv`): `serveRpc` (server loop),
   `clientBind` / `clientSendRequest` (client), socket glue (`connect`/`listen`).
 - **BIND negotiation**: context item 44B / result 24B; secondary address length includes NUL, 4-byte aligned
-  (`results_offset = (10 + port_size + 3) & ~3`); NACK NDR32 whenever NDR64 is available (Microsoft behavior);
+  (`results_offset = (10 + port_size + 3) & ~3`); the local port string is written **only** into a BIND
+  response — an ALTER-CONTEXT response carries no secondary address (`rpcBind` sets `SecondaryAddressLength = 0`
+  for `RPC_PT_ALTERCONTEXT_REQ`, so `NumResults` sits at offset 12); `AssocGroup` is a non-zero per-client value
+  (`rand32()` then `++` in `runServer`); NACK NDR32 whenever NDR64 is available (Microsoft behavior);
   BTFN feature mask = `transfer_syntax[8..10] & 0x3`.
 - **Request dispatch** (`dispatchKmsRequest`, mirroring C `checkRpcRequestSize` + `rpcRequest`):
   - context mismatch → **FAULT** `nca_unk_if` (`AllocHint=32`, `Error.Code@8`, `CallId=2`).
