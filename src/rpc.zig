@@ -3,8 +3,8 @@
 //!
 //! This module implements the byte-level framing: RPC headers, BIND/ALTER-CONTEXT
 //! negotiation, and NDR32/NDR64 request/response wrapping. It does not open
-//! sockets itself; the socket layer (Phase 5) feeds bytes in and out through
-//! these pure functions.
+//! sockets itself; the socket layer feeds bytes in and out through these pure
+//! functions.
 //!
 //! Wire layout follows the C packed structs byte-for-byte (verified below);
 //! variable-length parts (context items, NDR payloads) are read/written with

@@ -1,4 +1,4 @@
-//! `vlmzsd` — the KMS server binary (Phase 6).
+//! `vlmzsd` — the KMS server binary.
 //!
 //! Implements the `vlmzsd` CLI surface from `docs/cli.md`: no config file,
 //! three-tier precedence (default < `VLMZSD_*` env var < CLI flag), fixed-format
