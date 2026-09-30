@@ -314,10 +314,18 @@ pub const Logger = struct {
     done: Io.Event = .unset,
     /// Guards the degraded synchronous path only.
     direct_mutex: Io.Mutex = .init,
-    /// Lines refused because the queue was full or already closed.
+    /// Lines refused because the queue was full or already closed, and not yet
+    /// reported: the writer clears these when it reports them, so every report
+    /// covers exactly the loss since the previous one.
     dropped: std.atomic.Value(u64) = .init(0),
-    /// Lines shortened to fit a slot (see `emit`).
+    /// Lines shortened to fit a slot (see `emit`). Reported and cleared the same
+    /// way as `dropped`.
     truncated: std.atomic.Value(u64) = .init(0),
+    /// Totals for the whole run, accumulated by the writer as it clears the two
+    /// counters above. Plain fields because only the consumer touches them; a
+    /// producer never needs to know a total.
+    total_dropped: u64 = 0,
+    total_truncated: u64 = 0,
 
     /// Slots the writer copies out per lock acquisition.
     const batch_size = 16;
@@ -429,6 +437,11 @@ pub const Logger = struct {
             self.queue.event.reset();
             if (self.drainOnce(out_writer, err_writer, &batch) > 0) continue;
             if (self.queue.isClosed()) break;
+            // Idle: everything accepted so far has reached the sink and the
+            // queue is empty. Tell the operator what was lost while the writer
+            // was behind — the delta for this period; the final drain reports
+            // the run's total.
+            self.reportCounters(err_writer, .idle);
             // `error.Canceled` means shutdown is stopping the writer; the final
             // drain below still flushes every accepted line.
             self.queue.waitForWork(self.io) catch break;
@@ -439,7 +452,9 @@ pub const Logger = struct {
         const previous = self.io.swapCancelProtection(.blocked);
         defer _ = self.io.swapCancelProtection(previous);
         while (self.drainOnce(out_writer, err_writer, &batch) > 0) {}
-        self.writeCounters(err_writer);
+        // Final report: the run's totals, written even when the idle reports
+        // already covered them, so the last word on the log is the tally.
+        self.reportCounters(err_writer, .final);
         out_writer.flush() catch {};
         err_writer.flush() catch {};
         self.done.set(self.io);
@@ -466,16 +481,39 @@ pub const Logger = struct {
         return count;
     }
 
-    /// Report lines that never made it into the log. Written by the consumer
-    /// itself: the queue is already closed, so these must not be enqueued.
-    fn writeCounters(self: *Logger, err_writer: *std.Io.Writer) void {
-        const dropped = self.dropped.load(.monotonic);
-        const truncated = self.truncated.load(.monotonic);
-        if (dropped == 0 and truncated == 0) return;
-        writeTimestamp(err_writer, self.io);
-        err_writer.writeAll(levelLabel(.warn)) catch {};
-        err_writer.print("logging: dropped {d} line(s), truncated {d} line(s)\n", .{ dropped, truncated }) catch {};
-        err_writer.flush() catch {};
+    /// Which shape of loss report to write. The two are deliberately different
+    /// text, so a reader can tell a running notice from the final tally without
+    /// doing arithmetic on the numbers.
+    const CounterReport = enum {
+        /// The delta since the last report, from when the writer caught up.
+        idle,
+        /// The totals for the whole run, from the final drain.
+        final,
+    };
+
+    /// Report lines that never made it into the log, then clear the counters so
+    /// the next report covers only new loss. Written by the consumer itself: the
+    /// queue may already be closed, so these must not be enqueued.
+    ///
+    /// `swap` — not load-then-store — is what makes the clear safe: a producer
+    /// adding a line concurrently is counted by this report or by the next one,
+    /// never by neither. The idle shape stays silent when this period lost
+    /// nothing; the final shape stays silent when the run lost nothing.
+    fn reportCounters(self: *Logger, err_writer: *std.Io.Writer, kind: CounterReport) void {
+        const period_dropped = self.dropped.swap(0, .acq_rel);
+        const period_truncated = self.truncated.swap(0, .acq_rel);
+        self.total_dropped += period_dropped;
+        self.total_truncated += period_truncated;
+        switch (kind) {
+            .idle => {
+                if (period_dropped == 0 and period_truncated == 0) return;
+                writeCounterLine(err_writer, self.io, period_dropped, period_truncated, "since the last report");
+            },
+            .final => {
+                if (self.total_dropped == 0 and self.total_truncated == 0) return;
+                writeCounterLine(err_writer, self.io, self.total_dropped, self.total_truncated, "in total");
+            },
+        }
     }
 
     /// Stop accepting lines and block until the writer task has drained and
@@ -495,6 +533,15 @@ fn levelLabel(level: Level) []const u8 {
         .warn => "warning: ",
         .err => "error: ",
     };
+}
+
+/// One loss report: `<timestamp> warning: logging: dropped N line(s), truncated
+/// M line(s) <scope>`, where the scope names the period the numbers cover.
+fn writeCounterLine(w: *std.Io.Writer, io: Io, dropped: u64, truncated: u64, scope: []const u8) void {
+    writeTimestamp(w, io);
+    w.writeAll(levelLabel(.warn)) catch {};
+    w.print("logging: dropped {d} line(s), truncated {d} line(s) {s}\n", .{ dropped, truncated, scope }) catch {};
+    w.flush() catch {};
 }
 
 /// Write a UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp followed by a space.
@@ -844,4 +891,51 @@ test "direct mode writes synchronously and bypasses the queue" {
     try std.testing.expect(std.mem.indexOf(u8, sink_writer.buffered(), "direct 1") != null);
     var batch: [4]line_queue.Slot = undefined;
     try std.testing.expectEqual(@as(usize, 0), log.queue.popBatch(io, &batch));
+}
+
+// The loss report has two shapes: the delta since the writer's last report when
+// it catches up (an idle period), and the totals for the whole run from the
+// final drain. Reporting clears what it reported, so the producers' counters
+// always hold exactly the unreported loss. Pinned here without running the loop.
+test "loss is reported as an idle delta and as a final total" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out_buffer: [4096]u8 = undefined;
+    var err_buffer: [4096]u8 = undefined;
+    var log = try Logger.init(gpa, io, &out_buffer, &err_buffer);
+    defer log.deinit(gpa);
+
+    var sink: [2048]u8 = undefined;
+    var err_writer: std.Io.Writer = .fixed(&sink);
+
+    // Nothing lost: the idle report is silent, and so is the final one.
+    log.reportCounters(&err_writer, .idle);
+    log.reportCounters(&err_writer, .final);
+    try std.testing.expectEqual(@as(usize, 0), err_writer.buffered().len);
+
+    // An idle period reports the loss it covers, as a delta, and clears the
+    // counters it just reported.
+    _ = log.dropped.fetchAdd(3, .monotonic);
+    log.reportCounters(&err_writer, .idle);
+    try std.testing.expect(std.mem.indexOf(u8, err_writer.buffered(), "dropped 3 line(s), truncated 0 line(s) since the last report") != null);
+    try std.testing.expectEqual(@as(u64, 0), log.dropped.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 3), log.total_dropped);
+
+    // Nothing new since: silent, not a repeat of the same numbers.
+    const after_first = err_writer.buffered().len;
+    log.reportCounters(&err_writer, .idle);
+    try std.testing.expectEqual(after_first, err_writer.buffered().len);
+
+    // A second episode reports only its own loss...
+    _ = log.truncated.fetchAdd(2, .monotonic);
+    log.reportCounters(&err_writer, .idle);
+    try std.testing.expect(std.mem.indexOf(u8, err_writer.buffered(), "dropped 0 line(s), truncated 2 line(s) since the last report") != null);
+
+    // ...while the final report gives the totals for the whole run, including
+    // the periods the idle reports already covered.
+    log.reportCounters(&err_writer, .final);
+    try std.testing.expect(std.mem.indexOf(u8, err_writer.buffered(), "dropped 3 line(s), truncated 2 line(s) in total") != null);
+    try std.testing.expectEqual(@as(u64, 3), log.total_dropped);
+    try std.testing.expectEqual(@as(u64, 2), log.total_truncated);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, err_writer.buffered(), "since the last report"));
 }

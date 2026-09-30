@@ -187,9 +187,11 @@ never blocks a worker. Lines can be lost:
 - the sink write fails → ignored, so a broken stdout cannot take the server down;
 - the exit is forced (second signal, see Signals above) → the drain is skipped.
 
-Drops and truncations are counted and reported once, at shutdown, as one
-`warning: logging: dropped N line(s), truncated M line(s)` line on stderr —
-absent when both counters are zero.
+Drops and truncations are reported on stderr as `warning: logging: dropped N
+line(s), truncated M line(s) <scope>`, in two shapes: when the writer has caught
+up and is about to wait it reports what that period lost (`since the last
+report`), and the final drain reports the run's totals (`in total`). Nothing is
+printed while nothing has been lost.
 
 ## 6. Client (`vlmzs`) options
 
