@@ -431,20 +431,18 @@ pub const Logger = struct {
         var batch: [batch_size]line_queue.Slot = undefined;
 
         while (true) {
-            // Reset *before* testing for work: a `set` that lands after this
-            // point is either observed by the pop below or stays latched (the
-            // event is sticky), so no wakeup can be lost.
-            self.queue.event.reset();
             if (self.drainOnce(out_writer, err_writer, &batch) > 0) continue;
+            // Nothing queued. Either the run is over, or report the idle loss and
+            // park: `awaitWork` owns the arm/test/park order that makes the wait
+            // race-free.
             if (self.queue.isClosed()) break;
-            // Idle: everything accepted so far has reached the sink and the
-            // queue is empty. Tell the operator what was lost while the writer
-            // was behind — the delta for this period; the final drain reports
-            // the run's total.
+            // Tell the operator what was lost while the writer was behind — the
+            // delta for this period; the final drain reports the run's total.
             self.reportCounters(err_writer, .idle);
             // `error.Canceled` means shutdown is stopping the writer; the final
             // drain below still flushes every accepted line.
-            self.queue.waitForWork(self.io) catch break;
+            const wake = self.queue.awaitWork(self.io) catch break;
+            if (wake == .closed) break;
         }
 
         // Final drain: every line the queue accepted must reach the sink, and a
