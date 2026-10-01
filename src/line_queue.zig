@@ -12,8 +12,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const Io = std.Io;
 
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 /// Maximum line length in bytes, including the trailing newline.
