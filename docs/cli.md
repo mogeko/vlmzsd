@@ -1,20 +1,18 @@
 # vlmzsd CLI specification
 
-This document is the authoritative CLI design for the `vlmzsd` (KMS server) and
-`vlmzs` (activation client) binaries, replacing the C `vlmcsd` / `vlmcs`
-getopt + INI surface. Implementation lives in `src/main.zig` and `src/vlmzs.zig`; 
-this file is the spec they must follow.
+This document is the authoritative CLI reference for `vlmzsd` (a KMS server: an
+emulator of Microsoft's Key Management Service) and `vlmzs` (an activation
+client for it).
 
 ## 1. Goals and principles
 
-- **Two binaries, one job each.** `vlmzsd` is the KMS server; `vlmzs` is the
-  activation client (mirroring the C `vlmcsd` / `vlmcs` split).
+- **Two binaries, one job each.** `vlmzsd` is the server; `vlmzs` is the client.
 - **No config file.** Configuration comes exclusively from CLI arguments and
-  environment variables. There is no INI/TOML/YAML config surface.
+  environment variables.
 - **Three-tier precedence, fixed:** built-in default < environment variable <
   CLI argument (see [§3](#3-configuration-precedence)).
 - **Discoverable.** `--help` is complete and grouped by concern; every default
-  value is shown. No single-letter getopt soup.
+  value is shown.
 - **Human-friendly types.** Durations and GUIDs are written in readable form,
   not magic numbers.
 
@@ -27,15 +25,16 @@ vlmzs [HOST[:PORT]] [OPTIONS]    # activation client
 
 Each binary supports `--help` / `-h` and `--version` / `-V`.
 
-`vlmzsd` runs the KMS server in the foreground. `vlmzs` sends one activation
-request to an existing KMS server. When `HOST` is omitted, `vlmzs` targets
-`127.0.0.1` (`::1` with `--address-family 6`).
+`vlmzsd` runs the KMS server in the foreground. `vlmzs` sends activation
+requests (one by default, `--count` for more) to an existing KMS server. When
+`HOST` is omitted, `vlmzs` targets `127.0.0.1` (`::1` with `--address-family 6`).
 
 ## 3. Configuration precedence
 
-Every `vlmzsd` option is settable via CLI and via an environment variable. The
-client is interactive and is configured entirely through CLI arguments
-(environment variables are not defined for `vlmzs`).
+Every `vlmzsd` option that configures server behaviour has both a CLI flag and an
+environment variable (see the tables in [§5](#5-server-vlmzsd-options)). The client is interactive and is
+configured entirely through CLI arguments; there are no environment variables
+for `vlmzs`.
 
 Precedence, highest to lowest:
 
@@ -57,8 +56,9 @@ Precedence, highest to lowest:
 ### Duration
 
 `<n><unit>` with unit `s`/`m`/`h`/`d`/`w` (seconds, minutes, hours, days,
-weeks). Examples: `30s`, `2h`, `7d`, `90m`. Internally converted to minutes for
-the KMS protocol (the protocol's native unit); `0` disables where applicable.
+weeks). Examples: `30s`, `2h`, `7d`, `90m`. The two policy intervals
+(`--activation-interval`, `--renewal-interval`) are stored in whole minutes, so
+sub-minute values are rounded down; `0` disables where applicable.
 
 ### GUID
 
@@ -75,6 +75,13 @@ Repeatable; comma-separated in the environment variable.
 
 Grouped by concern (help is rendered in these groups).
 
+### General
+
+| Option | Short | Default | Env var | Notes |
+|---|---|---|---|---|
+| `--help` | `-h` | | — | print the grouped option list and exit |
+| `--version` | `-V` | | — | print version, commit, and build date, then exit |
+
 ### Network
 
 | Option | Short | Default | Env var | Notes |
@@ -85,22 +92,21 @@ Grouped by concern (help is rendered in these groups).
 | `--max-clients <n>` | `-m` | `1024` | `VLMZSD_MAX_CLIENTS` | concurrent client cap; `0` = unlimited |
 
 `--max-clients` bounds the number of concurrent client connections, and with it the server's worker
-threads (`std.Io.Threaded` never reclaims a thread). While the cap is reached the listener stops
-accepting: further connections wait in the kernel backlog (TCP backpressure) instead of occupying a
-worker, and one warning is logged per saturation period. `0` restores the unbounded behaviour and is
-reported as a warning at startup. The thread count is therefore at most
-`min(peak concurrent clients, --max-clients) + 2` (the accept loop and the log writer).
+threads: the pool never reclaims an idle thread, so the count settles at
+`min(peak concurrent clients, --max-clients) + 2` (the accept loop and the log writer). While the cap
+is reached the listener stops accepting: further connections wait in the kernel backlog (TCP
+backpressure) instead of taking a worker, and one warning is logged per saturation period. `0`
+removes the cap and is reported as a warning at startup.
 
 `--timeout` bounds how long a read waits for its peer; `0` disables the idle timeout, so a silent
-peer is kept until it disconnects. A read wait is a cancelable `Io` operation, so SIGINT/SIGTERM ends
-every parked read immediately (even with `--timeout 0`) and the server exits without waiting out live
-connections.
+peer is kept until it disconnects. It never delays shutdown: `SIGINT`/`SIGTERM` ends an idle
+connection immediately even with `--timeout 0`, so stopping the server never waits out live clients.
 
 ### Data
 
 | Option | Short | Default | Env var | Notes |
 |---|---|---|---|---|
-| `--data <file>` | | embedded | `VLMZSD_DATA` | external `.kmd` file; default is the `@embedFile`d data |
+| `--data <file>` | | embedded | `VLMZSD_DATA` | external `.kmd` file; default is the built-in data |
 
 When `--data` is not given, both binaries search the FHS/XDG data directories
 for a `.kmd` file, highest priority first:
@@ -112,8 +118,9 @@ for a `.kmd` file, highest priority first:
 5. `/usr/share/vlmzsd/*.kmd` (distribution-packaged)
 
 Within a directory, the alphabetically greatest `*.kmd` name wins. If no
-`.kmd` file is found anywhere, the embedded default is used — or, when built
-with `-Dno-embedded-data`, startup fails with an error.
+`.kmd` file is found anywhere, the built-in data is used. Builds that ship
+without it fail to start instead, and tell you to point `--data` at a `.kmd`
+file.
 
 ### ePID
 
@@ -140,8 +147,8 @@ with `-Dno-embedded-data`, startup fails with an error.
 
 | Option | Short | Default | Env var | Notes |
 |---|---|---|---|---|
-| `--no-ndr64` | | on | `VLMZSD_NDR64` | disable NDR64 transfer syntax |
-| `--no-btfn` | | on | `VLMZSD_BTFN` | disable bind-time feature negotiation |
+| `--no-ndr64` | | off | `VLMZSD_NDR64` | disable NDR64 transfer syntax (on by default) |
+| `--no-btfn` | | off | `VLMZSD_BTFN` | disable bind-time feature negotiation (on by default) |
 | `--disconnect-per-request` | | off | `VLMZSD_DISCONNECT_PER_REQUEST` | disconnect after each request |
 
 ### Process
@@ -153,30 +160,38 @@ with `-Dno-embedded-data`, startup fails with an error.
 | `--quiet` | `-q` | off | `VLMZSD_QUIET` | drop `info` logging |
 | `--quiet-loopback` | | off | `VLMZSD_QUIET_LOOPBACK` | suppress debug logs from loopback (localhost) clients |
 
-Signals: the first `SIGINT`/`SIGTERM` shuts the server down gracefully — the listener stops
-accepting, the client tasks are canceled (a parked read is a cancelable `Io` operation), and the log
-queue is drained before the process exits with status `0`. A **second** signal (and any later one)
-exits immediately with status `128 + signum` (`130` for `SIGINT`, `143` for `SIGTERM`) without
-draining. It exists for a supervisor whose log sink is blocked, and it deliberately prints nothing —
-a `write` would block on that same sink, so the exit code is the only channel still reliable.
-`SIGKILL` cannot be caught.
+Signals: the first `SIGINT`/`SIGTERM` shuts the server down gracefully — it stops accepting, closes
+the live connections, and drains the log before exiting with status `0`. A **second** signal (and any
+later one) exits immediately with status `128 + signum` (`130` for `SIGINT`, `143` for `SIGTERM`)
+without draining. It is there for the case where the log sink itself is blocked: it prints nothing,
+because a write to that sink would block the same way, so the status is the only report. `SIGKILL`
+cannot be caught.
 
 ### Logging
 
-Logging has **no CLI surface**. Output is a **fixed format** prefixed with a
-UTC ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`); the timestamp is always on and
-cannot be configured. `debug`/`info` messages go to **stdout**, `warn`/`err`
-messages go to **stderr** (Unix convention). `--verbose` enables `debug`;
-`--quiet` drops `info`. Redirecting/persisting logs is the job of the
-supervisor (systemd/journald, Docker). This is a deliberate simplification of
-the C `-l`/`-T`/`-e` options.
+One line per event: a UTC ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`), a level
+prefix, and the message. `debug`/`info` go to **stdout**, `warn`/`err` to
+**stderr** (Unix convention); `--verbose` adds `debug` lines, `--quiet` drops
+`info` lines. `warn`/`err` are never suppressed.
 
-Delivery is asynchronous (a bounded queue plus one writer task), and the queue
-is **lossy by design**: when it is full the line is dropped, so that a slow
-consumer can never block a worker. Dropped and truncated lines are counted and
-reported once, at shutdown, as a single
-`warning: logging: dropped N line(s), truncated M line(s)` line on stderr — it
-is absent when both counters are zero. The queue size is not configurable.
+This is also the whole feature: output goes to the inherited stdout/stderr and
+nothing else happens. No log file, no rotation, no format or level options —
+redirecting, persisting, and shipping the output is the supervisor's job
+(systemd/journald, Docker).
+
+Delivery is asynchronous (a bounded queue, one writer task), so a slow consumer
+never blocks a worker. Lines can be lost:
+
+- the queue is full → the line is dropped instead of blocking the producer;
+- the line is too long → truncated to the queue's slot size;
+- the sink write fails → ignored, so a broken stdout cannot take the server down;
+- the exit is forced (second signal, see Signals above) → the drain is skipped.
+
+Drops and truncations are reported on stderr as `warning: logging: dropped N
+line(s), truncated M line(s) <scope>`, in two shapes: when the writer has caught
+up and is about to wait it reports what that period lost (`since the last
+report`), and the final drain reports the run's totals (`in total`). Nothing is
+printed while nothing has been lost.
 
 ## 6. Client (`vlmzs`) options
 
@@ -200,9 +215,9 @@ is absent when both counters are zero. The queue size is not configurable.
 | `--list-products` | `-x` | — | print available products and exit |
 | `--license-status <0..6>` | `-t` | `1` | LicenseStatus field |
 | `--reconnect-per-request` | `-T` | off | force a new connection per request (default reuses one) |
-| `--no-multiplexed` | | on | disable multiplexed RPC |
-| `--no-ndr64` | | on | disable NDR64 transfer syntax |
-| `--no-btfn` | | on | disable bind-time feature negotiation |
+| `--no-multiplexed` | | off | disable multiplexed RPC (on by default) |
+| `--no-ndr64` | | off | disable NDR64 transfer syntax (on by default) |
+| `--no-btfn` | | off | disable bind-time feature negotiation (on by default) |
 | `--timeout <dur>` | | `30s` | idle timeout; `0` disables |
 | `--verbose` | `-v` | off | verbosity |
 

@@ -12,8 +12,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const Io = std.Io;
 
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 /// Maximum line length in bytes, including the trailing newline.
@@ -36,13 +36,22 @@ pub const Slot = struct {
     bytes: [slot_size]u8,
 };
 
+/// Why `LineQueue.awaitWork` returned.
+pub const Wake = enum {
+    /// At least one line is queued; drain it.
+    work,
+    /// The queue is closed *and* drained; the consumer is done.
+    closed,
+};
+
 pub const LineQueue = struct {
     slots: []Slot,
     /// Guards `slots`, `head` and `len`. Only ever held across a memory copy,
     /// never across a syscall — that is what keeps the producer path cheap.
     mutex: Io.Mutex = .init,
-    /// Latched after a push; reset by the consumer before it re-tests for work.
-    /// See the `reset` ordering note in `Logger.runWriter`.
+    /// Latched by a successful `tryPush` and by `close`; re-armed and re-tested
+    /// inside `awaitWork`, which owns that ordering (arming after the emptiness
+    /// test would drop a wakeup).
     event: Io.Event = .unset,
     /// Set by `close`. Producers stop pushing; the consumer drains then exits.
     closed: std.atomic.Value(bool) = .init(false),
@@ -104,11 +113,38 @@ pub const LineQueue = struct {
         return count;
     }
 
-    /// Park until a line arrives. Returns immediately when one is already
-    /// queued or the queue is closed. Cancelable so shutdown can stop the
-    /// consumer.
-    pub fn waitForWork(self: *LineQueue, io: Io) Io.Cancelable!void {
-        return self.event.wait(io);
+    /// Wait until there is work to drain, or until the queue is closed and
+    /// empty — whichever comes first. Never parks when it can answer
+    /// immediately.
+    ///
+    /// This owns the arm/test/park order, which is the only reason it exists:
+    /// the event must be re-armed *before* the emptiness test, or a push that
+    /// lands between the test and the park clears the latch and the consumer
+    /// sleeps with work queued. Inside the queue a caller cannot get that order
+    /// wrong.
+    ///
+    /// Still a cancelation point: `error.Canceled` means the *wait* was
+    /// cancelled, not that the queue closed — whether to drain and stop is the
+    /// caller's decision (the logger drains).
+    pub fn awaitWork(self: *LineQueue, io: Io) Io.Cancelable!Wake {
+        while (true) {
+            self.event.reset();
+            if (self.hasWork(io)) return .work;
+            if (self.isClosed()) return .closed;
+            // A stale or spurious wakeup loops back to re-test, so it cannot be
+            // reported as work that is not there.
+            try self.event.wait(io);
+        }
+    }
+
+    /// True when at least one line is queued. Under the mutex because `len` is
+    /// guarded by it: a plain load would be a data race, and making `len`
+    /// atomic just for this peek would give a field that already has one
+    /// synchronization mechanism a second one.
+    fn hasWork(self: *LineQueue, io: Io) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.len > 0;
     }
 
     /// Refuse further pushes and wake the consumer so it can drain and exit.
@@ -132,8 +168,8 @@ const lines_per_producer = 200;
 
 // The queue's contract is pinned here in isolation from the logger: arrival
 // order (FIFO), the lossy full-queue path, close/drain semantics, and the
-// `reset`-before-emptiness-check order that prevents a lost wakeup. All but
-// the last case drive the queue directly on the test thread.
+// wakeup path (`awaitWork` owns the arm/test/park order that prevents a lost
+// wakeup). All but the last case drive the queue directly on the test thread.
 test "push and pop preserve arrival order" {
     const alloc = testing.allocator;
     const io = testing.io;
@@ -174,39 +210,100 @@ test "a full queue refuses pushes instead of blocking" {
     try testing.expectEqualStrings("y\n", queue.slots[(queue.head + queue.len - 1) & (capacity - 1)].bytes[0..2]);
 }
 
-test "close stops pushes and makes waitForWork return" {
+test "awaitWork reports closed only once the queue is drained" {
     const alloc = testing.allocator;
     const io = testing.io;
     var queue = try LineQueue.init(alloc);
     defer queue.deinit(alloc);
 
     var batch: [4]Slot = undefined;
+    try testing.expect(queue.tryPush(io, "last\n", false));
     queue.close(io);
     try testing.expect(queue.isClosed());
     try testing.expect(!queue.tryPush(io, "late\n", false));
-    // The event is latched by `close`, so the consumer must not park.
-    try queue.waitForWork(io);
+
+    // Work wins over closed, so a consumer always drains before it stops. Both
+    // branches return without parking, which is what keeps this case
+    // deterministic: a regression can only fail an assertion, never hang.
+    try testing.expectEqual(Wake.work, try queue.awaitWork(io));
+    try testing.expectEqual(@as(usize, 1), queue.popBatch(io, &batch));
+    try testing.expectEqual(Wake.closed, try queue.awaitWork(io));
     try testing.expectEqual(@as(usize, 0), queue.popBatch(io, &batch));
 }
 
-test "a push after reset keeps the event latched" {
-    // Guards the `reset` -> pop -> wait order used by the writer loop: if the
-    // consumer reset the event *after* finding the queue empty, this push would
-    // be cleared and the consumer would park with work still queued.
+test "a parked consumer is woken by a push and by close" {
+    // The wakeup path: the consumer parks in `awaitWork` instead of polling, so
+    // every line has to arrive through a real wakeup and `close` has to wake it
+    // one last time. Push (`Event.set` after the copy) and close both race the
+    // consumer's arm/test/park, which is what `awaitWork` exists to make safe.
+    if (builtin.single_threaded) return error.SkipZigTest;
     const alloc = testing.allocator;
-    const io = testing.io;
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     var queue = try LineQueue.init(alloc);
     defer queue.deinit(alloc);
 
-    var batch: [4]Slot = undefined;
-    queue.event.reset();
-    try testing.expectEqual(@as(usize, 0), queue.popBatch(io, &batch));
-    try testing.expect(!queue.event.isSet());
+    const Consumer = struct {
+        queue: *LineQueue,
+        io: Io,
+        /// Written by the consumer task, read after the group join.
+        seen: usize = 0,
 
-    try testing.expect(queue.tryPush(io, "late\n", false));
-    try testing.expect(queue.event.isSet());
-    try queue.waitForWork(io); // Must not park: the event is still latched.
-    try testing.expectEqual(@as(usize, 1), queue.popBatch(io, &batch));
+        fn run(self: *@This()) void {
+            var batch: [16]Slot = undefined;
+            while (true) {
+                // Nothing cancels this wait: the test stops the consumer with
+                // `close`, which is the `.closed` branch below.
+                const wake = self.queue.awaitWork(self.io) catch return;
+                if (wake == .closed) return;
+                var count = self.queue.popBatch(self.io, &batch);
+                while (count > 0) {
+                    self.seen += count;
+                    count = self.queue.popBatch(self.io, &batch);
+                }
+            }
+        }
+    };
+
+    const Producer = struct {
+        queue: *LineQueue,
+        io: Io,
+        id: u8,
+
+        fn run(self: *@This()) void {
+            var line: [slot_size]u8 = undefined;
+            var i: usize = 0;
+            while (i < lines_per_producer) : (i += 1) {
+                const bytes = std.fmt.bufPrint(&line, "{d}:{d}\n", .{ self.id, i }) catch unreachable;
+                // Retry instead of dropping: the producers together stay under
+                // `capacity`, so this terminates even if the consumer never
+                // runs while they do.
+                while (!self.queue.tryPush(self.io, bytes, false)) std.atomic.spinLoopHint();
+            }
+        }
+    };
+
+    // Separate groups: the producers must finish first, and only then does the
+    // main thread close the queue — otherwise `prod_group.await` would wait for
+    // a consumer that is still parked.
+    var prod_group: Io.Group = .init;
+    var cons_group: Io.Group = .init;
+    var consumer: Consumer = .{ .queue = &queue, .io = io };
+    try cons_group.concurrent(io, Consumer.run, .{&consumer});
+    var contexts: [producers]Producer = undefined;
+    for (&contexts, 0..) |*context, id| {
+        context.* = .{ .queue = &queue, .io = io, .id = @intCast(id) };
+        try prod_group.concurrent(io, Producer.run, .{context});
+    }
+
+    try prod_group.await(io);
+    queue.close(io);
+    try cons_group.await(io);
+
+    try testing.expectEqual(@as(usize, producers * lines_per_producer), consumer.seen);
 }
 
 test "concurrent producers keep per-producer order" {

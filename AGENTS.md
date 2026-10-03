@@ -66,7 +66,8 @@ source linked above).
 - Logging: fixed format with a UTC timestamp; `debug`/`info` → stdout, `warn`/`err` → stderr.
   `--verbose` enables `debug`, `--quiet` drops `info` (see `docs/cli.md`). Lines are handed to a
   bounded, **lossy** queue (`src/line_queue.zig`) and written by a dedicated writer task; a full
-  queue drops the line (counted, reported at shutdown) instead of blocking a worker. Shutdown order
+  queue drops the line (counted, and reported on stderr as a per-period delta when the writer goes
+  idle and as the run's total at shutdown) instead of blocking a worker. Shutdown order
   is `conn_group.cancel` → `log.shutdown` → `log_group.cancel` → `log.deinit`, so lines logged while
   connections stop are still flushed. A second `SIGINT`/`SIGTERM` skips that drain and `_exit`s with
   `128 + signum`, so a blocked log sink cannot wedge a stop (see `docs/cli.md`). On a fatal startup
