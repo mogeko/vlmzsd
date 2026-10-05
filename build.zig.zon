@@ -1,6 +1,6 @@
 .{
     .name = .vlmzsd,
-    .version = "0.4.3",
+    .version = "0.5.0",
     .fingerprint = 0xee9c981fd0f67155,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
