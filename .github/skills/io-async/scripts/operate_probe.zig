@@ -248,8 +248,8 @@ test "a cancelation request ends the wait without any wake fd" {
 }
 
 // P5: the write path is an operation too. `net_send` addresses a message list,
-// so it can express a send that `net_receive` alone could not (0.16 had no way
-// to name this operation at all).
+// so it expresses a send no other operation does; `Stream.Writer` reaches the
+// same path through `net_write` (P6).
 test "operateTimeout(.net_send) delivers over Threaded" {
     const gpa = std.testing.allocator;
     var threaded: Io.Threaded = .init(gpa, .{});

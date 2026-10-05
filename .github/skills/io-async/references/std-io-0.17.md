@@ -3,14 +3,16 @@
 Evidence layer for [SKILL.md](../SKILL.md). Everything below was checked against the **installed**
 0.17.0 stdlib (`std/Io.zig`, `std/Io/Threaded.zig`, `std/Io/Semaphore.zig`) — not against upstream
 `master` or tutorials, which differ in places. `std.Io` is WIP: re-verify against your own toolchain
-before relying on a detail, and pin behavior with tests.
+before relying on a detail, and pin behavior with tests. What earlier releases had, and what 0.17
+changed (including what it broke), is kept separate, in
+[std-io-deltas.md](./std-io-deltas.md).
 
 ## Backends
 
 | Type | Status |
 |---|---|
 | `Io.Threaded` | The thread-pool backend; what `std.process.Init` hands you. Intended for this use. |
-| `Io.Evented` / `Io.Dispatch` / `Io.Kqueue` / `Io.Uring` | Experimental; APIs still moving. Do not build on them yet. |
+| `Io.Evented` (`Io.Uring` / `Io.Kqueue` / `Io.Dispatch`) | WIP, and **does not compile** in 0.17.0 — see [below](#ioevented-in-0170). `Threaded` is the only usable backend. |
 | `Io.failing` | Test double that returns fixed failures; its `checkCancel`, `cancel`, … are `unreachable`. |
 
 `Threaded`'s vtable implements: `async`, `concurrent`, `await`, `cancel`, `groupAsync`,
@@ -18,6 +20,78 @@ before relying on a detail, and pin behavior with tests.
 `futexWait`/`futexWaitUncancelable`/`futexWake`, `operate`, `now`, `sleep`, `random`, `randomSecure`,
 plus the file/dir/net operations. It does **not** implement any `select`: `Io.Select` is a
 task-level combinator built on `Queue` + a `Group` (see below), not a backend operation.
+
+### `Io.Evented` in 0.17.0
+
+`Io.Evented` is not a backend of its own but an alias resolved by arch and OS (`std/Io.zig:31`):
+
+```zig
+pub const Evented = if (fiber.supported) switch (builtin.os.tag) {
+    .linux => Uring,
+    .dragonfly, .freebsd, .netbsd, .openbsd => Kqueue,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => Dispatch,
+    else => void,
+} else void; // context-switching code not implemented yet
+```
+
+`fiber.supported` is true only for `aarch64`, `riscv64`, `x86_64` (`Io/fiber.zig:1`), so on any other
+arch (x86, arm32, wasm, …) the name is `void`.
+
+**All three fail to *compile* in 0.17.0**, which is as far as an availability check gets — there is
+nothing to measure at runtime, because each backend's `io()` vtable literal still names entries that
+`Io.VTable` does not have.
+
+| Backend | Platform | Compile error from `var ev: Io.Evented = undefined; try ev.init(gpa, .{});` |
+|---|---|---|
+| `Io.Dispatch` | macOS / iOS | `Io/Dispatch.zig:439: error: no field named 'processReplacePath' in struct 'Io.VTable'` |
+| `Io.Uring` | Linux | `Io/Uring.zig:759: error: no field named 'processReplacePath' in struct 'Io.VTable'` |
+| `Io.Kqueue` | BSDs | `Io/Kqueue.zig:637: error: no field named 'fileWriteStreaming' in struct 'Io.VTable'` |
+
+Reproduce without running anything (no code beyond those three lines):
+
+```
+zig build-exe -fno-emit-bin -target aarch64-linux-gnu t.zig   # Uring, from any host
+zig build-exe -fno-emit-bin t.zig                             # Dispatch, on macOS
+```
+
+The deltas are specific, and two of the three backends are a few lines from compiling:
+
+| Backend | vtable entries | named but absent from `Io.VTable` | in `Io.VTable` but not wired |
+|---|---|---|---|
+| `Dispatch` | 106 | `processReplacePath`, `processSpawnPath` | `inheritParentDir`, `inheritParentFile` |
+| `Uring` | 106 | same two | same two |
+| `Kqueue` | 41 | `fileWriteStreaming`, `fileReadStreaming`, `netRead`, `netSend`, `netReceive` | 70 of 106 |
+
+The names in the middle column are the give-away: a backend that still passes a path-taking process
+entry (`processReplacePath` / `processSpawnPath`) has not followed the API, where the path/handle
+distinction now lives inside `ReplaceOptions.exe` / `SpawnOptions.exe` and parent-handle inheritance is
+explicit (`inheritParentDir` / `inheritParentFile`). Which release reshaped what, and the rest of the
+migration history, is in
+[std-io-deltas.md](./std-io-deltas.md#evented-backends-were-left-behind).
+
+**Sockets are stubbed regardless**, so repairing the vtable would not make `Evented` usable:
+
+| Backend | socket setup (`netListenIp`, `netAccept`, `netConnectIp`, `netLookup`, `netSocketCreatePair`, …) | `operate(.{ .net_* })` | batched (`operateTimeout`, `batchAwait*`) |
+|---|---|---|---|
+| `Dispatch` | every entry an `…Unavailable` stub returning `error.NetworkDown` | `@panic("TODO implement net_receive/net_send/net_read/net_write operation")` — 1713-1716 | `@panic("TODO implement batched net_*")` — 2137-2140, 2199-2202 |
+| `Uring` | same stubs, except `netBindIp`, `netClose`, `netShutdown` | `net_receive` / `net_send` / `net_read` implemented, `net_write` `@panic` — 2120 | `@panic` for all four — 2406-2418, 2520-2523 |
+| `Kqueue` | `netListenIp` / `netAccept` / `netConnectIp` / … are wired, but their bodies are `@panic("TODO")` (42 `@panic`s in the file) | — | — |
+
+No `netListen*` / `netAccept` / `netConnect*` entry works, so on `Dispatch` and `Uring` there is no
+way to *obtain* a socket; and on `Uring` — the platform where this project's read path
+(`io.operateTimeout(.{ .net_receive = … })`) would run — the write operation panics. What is
+implemented on `Dispatch` / `Uring` is the non-socket half: `now`, `sleep`, `random`,
+`randomSecure`, the dir/file operations, and the task half (`async`, `concurrent`, `await`, `cancel`,
+groups, `futex*`).
+
+Two accessory signals, both checked: `std.start.zig:814` builds `std.Io.Threaded` unconditionally, so
+no std API can hand out an evented backend by accident (only naming `Io.Evented` yourself reaches it);
+and the 0.17.0 release notes never mention `Evented`, `fiber`, `Dispatch`, `Kqueue`, `Uring` or
+`io_uring` — zero hits — while `std/Io/test.zig` is an empty (0-byte) file, so no conformance suite
+pins any of it.
+
+**Verdict: `Threaded` is the only usable backend in 0.17.0.** For the next release, re-run the compile
+line above; sockets are the part that would have to change, not just the vtable.
 
 ## Threads and limits
 
@@ -133,7 +207,7 @@ hand-rolled wait needs both hand-rolled — a deadline, plus a wake fd it polls 
 | Primitive | API | Notes |
 |---|---|---|
 | `Io.Mutex` | `init`, `tryLock() bool`, `lock(io) Cancelable!void`, `lockUncancelable(io) void`, `unlock(io) void` | futex-based; use when the critical section can block |
-| `std.atomic.Mutex` | `tryLock() bool`, `unlock()` | spins; short, `io`-free sections (`std.Thread.Mutex` was removed in 0.16) |
+| `std.atomic.Mutex` | `tryLock() bool`, `unlock()` | spins; short, `io`-free sections (there is no `std.Thread.Mutex`) |
 | `Io.RwLock` | `lock*` / `unlock*` variants | |
 | `Io.Semaphore` | `{ .permits = n }`, `wait(io)`, `waitTimeout(io, timeout)`, `waitUncancelable(io)`, `post(io)` | counting gate; **no** `tryWait`/`available`, `permits` is mutex-guarded — you cannot peek at it. `waitTimeout` is new in 0.17; its error set is `Cancelable \|\| error{Timeout}` |
 | `Io.Condition` | `wait(io, mutex)`, `waitTimeout(io, mutex, timeout)`, `waitUncancelable(io, mutex)`, `signal(io)`, `broadcast(io)` | `waitTimeout` is new in 0.17 (same error set as the semaphore's) |
@@ -226,12 +300,12 @@ aarch64):
   `.ip4` / `.ip6`, and `socketpair(2)` implements neither on Linux or Darwin, so every call dies in
   `unexpectedErrno`: **errno 95** on Linux, **errno 102** on macOS, for `.ip4` and `.ip6` alike. The
   probes build a connected TCP pair instead.
-- **The write path is no longer a separate API.** 0.16 had `netSend`/`netRead`/`netWrite` *vtable*
-  entries; 0.17 deleted them and re-expressed them as the `net_send`/`net_read`/`net_write`
-  operations. `Io.net.Stream`'s `Writer`/`Reader` are now implemented on top of `net_write`/`net_read`
-  (`std/Io/net.zig`), so a buffered write *is* that operation — there is nothing left that
-  `Operation` cannot express on a socket. (`netWriteFile`, `sendFile`'s backing vtable entry, is the
-  exception: it is `error.Unimplemented` on `Threaded`.)
+- **The write path is an operation, exactly like the read path.** `net_send` / `net_read` /
+  `net_write` are `Operation` tags, and `Io.net.Stream`'s `Writer` / `Reader` are implemented on top of
+  `net_write` / `net_read` (`std/Io/net.zig`) — a buffered write *is* that operation, so there is
+  nothing left that `Operation` cannot express on a socket, and no reason to hand-roll `poll` for a
+  write. (`netWriteFile` — `sendFile`'s backing vtable entry — is the exception: `error.Unimplemented`
+  on `Threaded`.)
 - **On the send side the deadline is not a bound — only a floor.** The poll loop re-runs the
   operation **blocking** once `poll` reports the fd ready (`Io/Threaded.zig`, the
   `poll_entry.revents != 0` arm → `operate`), and `POLLOUT` only promises that *some* bytes fit —
@@ -254,24 +328,6 @@ aarch64):
 | No `std.Thread.Mutex` | Use `Io.Mutex` (cancelable futex) or `std.atomic.Mutex` (short, spinning). |
 | Pool not configurable via `std.process.Init` | `InitOptions` only when you construct `Threaded` yourself. |
 
-## What moved since 0.16.0
-
-This file was first verified against 0.16.0, so it was re-checked claim by claim: `diff` of
-`Io.zig`, `Io/Threaded.zig`, `Io/Semaphore.zig`, `Io/RwLock.zig` and `Io/net.zig` between the two
-releases, plus a re-run of both probes. These are the *only* deltas that touch anything stated here:
-
-| Change | Detail |
-|---|---|
-| Socket writes became operations | `net_send` / `net_read` / `net_write` joined `Operation`; the matching `netSend` / `netRead` / `netWrite` **vtable entries were deleted**, and `Stream.Reader` / `Stream.Writer` were re-pointed at the operations. This is what invalidated the old "no send variant" note. |
-| `netWriteFile` stopped panicking | `Threaded`'s `sendFile` backing entry now returns `error.Unimplemented` instead of `@panic("TODO implement")`. |
-| Two `waitTimeout`s added | `Io.Semaphore.waitTimeout` and `Io.Condition.waitTimeout`, both `Cancelable \|\| error{Timeout}`. |
-| `RwLock` internal fixes | `tryLock` and the cancelation path of `lockShared` no longer race; the public API is unchanged. |
-| Everything else unchanged | `Select`, `Queue`, `Mutex`, `Event`, `RwLock`, the futex wrappers, `Clock` / `Timeout` / `Timestamp.durationTo`, `Future` / `Group`, `checkCancel` / `recancel` / `CancelProtection`, `Limit`, the vtable's task half, `Threaded.InitOptions` and `setAsyncLimit`. The only additions seen were small helpers (`Limit.toInt64`, `Timestamp.compare`). |
-
-Consequently the 0.16 probe cases needed no changes at all: re-running
-[select_probe.zig](../scripts/select_probe.zig) and [operate_probe.zig](../scripts/operate_probe.zig)
-on 0.17.0 reproduced every 0.16 measurement (timings within a millisecond or two).
-
 ## How these claims were checked
 
 `grep`/read of the installed sources (`std/Io.zig`, `std/Io/Threaded.zig`, `std/Io/Semaphore.zig`) for
@@ -280,10 +336,18 @@ tracking peak concurrent tasks and never falling, `ConcurrencyUnavailable` past 
 `concurrent_limit`, prompt `error.Canceled` only where a wait polls a wake fd, and `--timeout`-style
 deadlines firing as configured. Prefer repeating such a measurement over trusting this file.
 
-For the 0.17.0 revision specifically: the 0.16 cases in both probe scripts were re-run as-is on
-macOS *and* on Linux (aarch64, Zig 0.17.0 in a container), and four claims that only a runtime could
-settle were measured directly — `createPair` failing on both families on both platforms, `SO_RCVTIMEO`
-panicking the blocking `operate` path, and the send path ignoring its deadline (macOS: still blocked
-after 40 s, which needed `sample` on the stuck process to identify and a kill to end; Linux: a short
-count instead — do not put either in a probe). `operate_probe.zig` gained two cases (P5, P6) for the
-newly-expressible send path.
+For the 0.17.0 revision specifically: both probe scripts were run on macOS *and* on Linux (aarch64,
+Zig 0.17.0 in a container), and four claims that only a runtime could settle were measured directly —
+`createPair` failing on both families on both platforms, `SO_RCVTIMEO` panicking the blocking
+`operate` path, and the send path ignoring its deadline (macOS: still blocked after 40 s, which needed
+`sample` on the stuck process to identify and a kill to end; Linux: a short count instead — do not put
+either in a probe). `operate_probe.zig` carries the send path as cases P5/P6.
+
+The evented-backend status is a *compile-time* claim, so it was checked by compiling rather than
+running: a three-line program naming `Io.Evented` on macOS (fails in `Dispatch.zig`) and the same
+program cross-compiled `-fno-emit-bin` to `aarch64-linux-gnu` (fails in `Uring.zig`); the stale/absent
+vtable entries and the `@panic` sites were then read off the installed sources at the line numbers
+quoted.
+
+Version-to-version deltas — what a release changed, and what it broke — are in
+[std-io-deltas.md](./std-io-deltas.md).

@@ -27,7 +27,8 @@ Two properties drive every decision below:
   checks for it, or at a check you placed yourself.
 
 Signatures, semantics, and the evidence behind every claim below live in
-[references/std-io-0.17.md](./references/std-io-0.17.md).
+[references/std-io-0.17.md](./references/std-io-0.17.md); what earlier releases had and what 0.17
+changed is kept apart, in [references/std-io-deltas.md](./references/std-io-deltas.md).
 
 ## When to Use
 
@@ -69,7 +70,7 @@ Signatures, semantics, and the evidence behind every claim below live in
 | **No connect deadline.** | `IpAddress.ConnectOptions.timeout` panics (`TODO implement`); an unreachable host is bounded only by the kernel's SYN timeout. |
 | **A *send* deadline is not a bound.** | `operateTimeout(.net_send)` / `(.net_write)` re-run the **blocking** operation once `poll` reports `POLLOUT`, which only promises that *some* bytes fit. A message larger than the send window can block in `sendmsg` past any deadline — macOS did, indefinitely (8 MiB to a peer that never reads, 200 ms deadline, still stuck at 40 s); Linux returned a partial count instead. Chunk sends and own the deadline loop. The read side has no such gap. |
 | **No `std.time.sleep`, no `SO_RCVTIMEO`.** | Sleep with `Io.sleep`. An `SO_RCVTIMEO` expiry surfaces as `EAGAIN`, which `std.Io` calls a bug on every path (`errnoBug` on the streaming ones, `unreachable` in the blocking `operate`), panicking in debug builds. Use a deadline. |
-| **Evented backends are not ready.** | `Io.Kqueue` / `Io.Uring` / `Io.Dispatch` / `fiber` are WIP; `Threaded` is the supported model here. |
+| **Evented backends do not compile in 0.17.0.** | `Io.Evented` is an alias (`Io.Uring` on Linux, `Io.Kqueue` on the BSDs, `Io.Dispatch` on Darwin; `void` off aarch64/riscv64/x86_64) whose `io()` vtable no longer matches `Io.VTable` — naming it is a compile error — and its socket surface is `error.NetworkDown` stubs plus `@panic("TODO")` operation arms. `Threaded` is the supported model here. |
 
 ## Choosing (in order)
 
