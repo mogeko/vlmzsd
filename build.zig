@@ -11,9 +11,11 @@ fn gitCommitHash(b: *std.Build) []const u8 {
     if (b.option([]const u8, "git-sha", description)) |given| {
         if (shortCommitHash(given)) |hash| return hash;
     }
-    var code: u8 = undefined;
-    const out = b.runAllowFail(&.{ "git", "rev-parse", "--short", "HEAD" }, &code, .ignore) catch return "unknown";
-    return std.mem.trim(u8, out, " \t\r\n");
+    const result = b.runFallible(&.{ "git", "rev-parse", "--short", "HEAD" }, .{ .stderr_behavior = .ignore });
+    return switch (result) {
+        .success => |out| std.mem.trim(u8, out, " \t\r\n"),
+        .spawn_failed, .bad_exit_code, .crashed => "unknown",
+    };
 }
 
 /// Trim a supplied hash to 7 characters, so `-Dgit-sha=$GITHUB_SHA` (40 hex
@@ -39,12 +41,19 @@ fn buildDate(b: *std.Build) []const u8 {
     const mad = yad.calculateMonthDay();
     return b.fmt("{d:0>4}-{d:0>2}-{d:0>2}", .{
         @as(u32, yad.year),
-        @as(u32, @intFromEnum(mad.month)),
+        @as(u32, @backingInt(mad.month)),
         @as(u32, mad.day_index) + 1,
     });
 }
 
 pub fn build(b: *std.Build) void {
+    // The configure logic reads state the build cache cannot track — the git
+    // checkout (`git rev-parse`, below) and the wall clock (`buildDate`) — so
+    // the configuration must not be reused between invocations: 0.17 would
+    // otherwise embed the previous run's hash and date after a new commit or on
+    // a later day. `Graph.poisonCache` is the declaration for exactly this.
+    b.graph.poisonCache();
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const git_hash = gitCommitHash(b);
@@ -129,9 +138,7 @@ pub fn build(b: *std.Build) void {
 
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const mod_tests = b.addTest(.{
         .root_module = mod,

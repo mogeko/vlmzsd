@@ -225,6 +225,6 @@ printed while nothing has been lost.
 read waits through a cancelable `Io` operation whose deadline the backend owns,
 so the client fails with `error.Timeout` rather than blocking forever on a peer
 that accepted the connection and then went silent. It does **not** bound
-`connect` — Zig 0.16's `std.Io.Threaded` backend still panics on
+`connect` — Zig 0.17's `std.Io.Threaded` backend still panics on
 `ConnectOptions.timeout` ("TODO implement"), so an unreachable host is bounded
 only by the kernel's own SYN timeout.

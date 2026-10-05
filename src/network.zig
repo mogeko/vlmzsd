@@ -314,7 +314,7 @@ pub const ClientOptions = struct {
     use_btfn: bool = false,
     multiplexed: bool = false,
     /// Read source and deadline for the BIND reply and for every RESPONSE read.
-    /// The client has no *connect* deadline: `std.Io.Threaded` (0.16) still
+    /// The client has no *connect* deadline: `std.Io.Threaded` (0.17) still
     /// panics on `ConnectOptions.timeout` ("TODO implement"), so a blackholed
     /// host is bounded only by the kernel's own SYN timeout.
     idle: ReadOptions = .{},

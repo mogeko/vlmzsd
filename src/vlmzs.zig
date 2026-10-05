@@ -224,7 +224,7 @@ fn formatUtc(unix: i64, buf: []u8) []const u8 {
     const day_secs: u64 = secs % 86400;
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
         @as(u32, yad.year),
-        @as(u32, @intFromEnum(mad.month)) + 1,
+        @as(u32, @backingInt(mad.month)) + 1,
         @as(u32, mad.day_index) + 1,
         @as(u32, @intCast(day_secs / 3600)),
         @as(u32, @intCast((day_secs % 3600) / 60)),

@@ -1,7 +1,7 @@
-# `std.Io` in Zig 0.16.0 — signatures and verified behavior
+# `std.Io` in Zig 0.17.0 — signatures and verified behavior
 
 Evidence layer for [SKILL.md](../SKILL.md). Everything below was checked against the **installed**
-0.16.0 stdlib (`std/Io.zig`, `std/Io/Threaded.zig`, `std/Io/Semaphore.zig`) — not against upstream
+0.17.0 stdlib (`std/Io.zig`, `std/Io/Threaded.zig`, `std/Io/Semaphore.zig`) — not against upstream
 `master` or tutorials, which differ in places. `std.Io` is WIP: re-verify against your own toolchain
 before relying on a detail, and pin behavior with tests.
 
@@ -121,7 +121,7 @@ react to a shutdown signal, a wake fd it polls alongside (`std.posix.poll` on a 
 | Primitive | API | Notes |
 |---|---|---|
 | `Io.Mutex` | `init`, `tryLock() bool`, `lock(io) Cancelable!void`, `lockUncancelable(io) void`, `unlock(io) void` | futex-based; use when the critical section can block |
-| `std.atomic.Mutex` | `tryLock() bool`, `unlock()` | spins; short, `io`-free sections (`std.Thread.Mutex` is gone in 0.16) |
+| `std.atomic.Mutex` | `tryLock() bool`, `unlock()` | spins; short, `io`-free sections (`std.Thread.Mutex` was removed in 0.16) |
 | `Io.RwLock` | `lock*` / `unlock*` variants | |
 | `Io.Semaphore` | `{ .permits = n }`, `wait(io)`, `waitUncancelable(io)`, `post(io)` | counting gate; **no** `tryWait`/`available`, `permits` is mutex-guarded — you cannot peek at it |
 | `Io.Condition` | `wait(io, mutex)`, `waitUncancelable(io, mutex)`, `signal(io)`, `broadcast(io)` | |
@@ -147,7 +147,7 @@ Each task's result is tagged into the union `U`; `await`/`cancel` must be called
 deinitialized. This is a *task* combinator — it cannot wait on a set of file descriptors.
 
 **It is usable on `Threaded`** (verified by running [select_probe.zig](../scripts/select_probe.zig),
-5/5 green, Zig 0.16.0 on macOS; re-run it on your toolchain — one command, self-contained):
+5/5 green, Zig 0.17.0 on macOS; re-run it on your toolchain — one command, self-contained):
 
 | Observation | Measured |
 |---|---|
@@ -186,7 +186,7 @@ concurrency. `net_receive`'s result is `struct { ?net.Socket.ReceiveError, usize
 `operateTimeout(io, op, timeout)` is `Batch` + `awaitConcurrent`, and on `Threaded`
 (`batchAwaitConcurrent`) that means: try the operation non-blocking, and on `WouldBlock` poll the
 operation's fds **inline on the calling thread** until the deadline. Verified by running
-[operate_probe.zig](../scripts/operate_probe.zig) — 5/5 green, Zig 0.16.0 on macOS:
+[operate_probe.zig](../scripts/operate_probe.zig) — 5/5 green, Zig 0.17.0 on macOS:
 
 | Property | Measured |
 |---|---|
@@ -205,7 +205,7 @@ what a reactor backend would need to stop parking a thread, and which removes th
 - `Operation` has **no send variant** (`net_receive` only), so the *write* path cannot be expressed
   as an operation today; it stays on `Io.Writer` → `netWrite`.
 
-## Known gaps in 0.16.0
+## Known gaps in 0.17.0
 
 | Gap | Detail |
 |---|---|

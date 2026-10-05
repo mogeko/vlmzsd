@@ -1,16 +1,16 @@
 ---
 name: io-async
-description: 'How to write async and concurrent I/O in Zig 0.16 with std.Io: the task/Group/Future/Select/Operation model, what the Threaded backend can and cannot do, cooperative cancelation and shutdown, bounding parallel work, and the pitfalls that make tasks hang, leak, or outlive the process. Use when adding or changing server/client concurrency, spawning parallel work, waiting on sockets with deadlines, capping parallel work, or debugging a task that never stops, never starts, or ignores shutdown. Keywords: std.Io, std.Io.Threaded, async, concurrent, Future, Group, Select, Operation, net_receive, Timeout, cancelation, cancelation point, checkCancel, Semaphore, Mutex, thread pool, shutdown, wake fd, thread-per-connection.'
+description: 'How to write async and concurrent I/O in Zig 0.17 with std.Io: the task/Group/Future/Select/Operation model, what the Threaded backend can and cannot do, cooperative cancelation and shutdown, bounding parallel work, and the pitfalls that make tasks hang, leak, or outlive the process. Use when adding or changing server/client concurrency, spawning parallel work, waiting on sockets with deadlines, capping parallel work, or debugging a task that never stops, never starts, or ignores shutdown. Keywords: std.Io, std.Io.Threaded, async, concurrent, Future, Group, Select, Operation, net_receive, Timeout, cancelation, cancelation point, checkCancel, Semaphore, Mutex, thread pool, shutdown, wake fd, thread-per-connection.'
 argument-hint: '<what you are changing: accept loop | client request | shutdown | limits>'
 ---
 
-# Async I/O with `std.Io` (Zig 0.16)
+# Async I/O with `std.Io` (Zig 0.17)
 
 ## The model
 
 `std.Io` is Zig's interface for everything that can block: sockets, files, the clock, sleeping. Code
 does not call `read(2)`/`nanosleep` directly; it goes through an `Io` handle, and the **backend**
-behind that handle decides how to block. In Zig 0.16 that handle arrives once at startup (from
+behind that handle decides how to block. In Zig 0.17 that handle arrives once at startup (from
 `std.process.Init`) and is then passed around explicitly: one handle, one backend. The backend this
 skill assumes is `std.Io.Threaded` — a **thread pool**.
 
@@ -27,7 +27,7 @@ Two properties drive every decision below:
   checks for it, or at a check you placed yourself.
 
 Signatures, semantics, and the evidence behind every claim below live in
-[references/std-io-0.16.md](./references/std-io-0.16.md).
+[references/std-io-0.17.md](./references/std-io-0.17.md).
 
 ## When to Use
 
@@ -98,7 +98,7 @@ Signatures, semantics, and the evidence behind every claim below live in
    never answers, a client that stops reading. "It exits eventually" is a bug report.
 6. **Keep mutable state task-local, or lock it.** Per-task buffers and RNGs by default; `Io.Mutex`
    when the critical section can block, `std.atomic.Mutex` when it cannot.
-7. **Verify against the installed stdlib.** `std.Io` is WIP in 0.16 and moves between builds: read the
+7. **Verify against the installed stdlib.** `std.Io` is WIP in 0.17 and moves between builds: read the
    local `Io.zig` / `Io/Threaded.zig`, and pin behavior with tests rather than trusting tutorials.
 
 ## Anti-patterns

@@ -253,7 +253,7 @@ fn aesDecrypt(comptime nk: usize, block: Block, rk: []const u8) Block {
 /// the next block boundary (a full padding block when already aligned).
 pub fn aesCmacV4(message: []const u8, out: *Block) void {
     const rk = expandKey(5, &aes_key_v4, false);
-    var mac: Block = [_]u8{0} ** 16;
+    var mac: Block = @splat(0);
 
     // Absorb every full 16-byte block.
     var offset: usize = 0;
@@ -265,7 +265,7 @@ pub fn aesCmacV4(message: []const u8, out: *Block) void {
     }
 
     // Final block: remaining bytes, 0x80, then zeros (ISO 9797-1 method 2).
-    var pad: Block = [_]u8{0} ** 16;
+    var pad: Block = @splat(0);
     const remaining = message.len - offset;
     @memcpy(pad[0..remaining], message[offset..]);
     pad[remaining] = 0x80;
@@ -401,8 +401,8 @@ pub fn sha256(data: []const u8, out: *[32]u8) void {
 test "v4 CMAC reference vectors" {
     const alloc = std.testing.allocator;
 
-    var msg32 = [_]u8{0} ** 32;
-    var msg64 = [_]u8{0} ** 64;
+    var msg32: [32]u8 = @splat(0);
+    var msg64: [64]u8 = @splat(0);
     var mac: Block = undefined;
 
     aesCmacV4(&msg32, &mac);
@@ -428,7 +428,7 @@ test "v4 CMAC reference vectors" {
 
 test "v6 AES reference vector" {
     const alloc = std.testing.allocator;
-    const zero = [_]u8{0} ** 16;
+    const zero: [16]u8 = @splat(0);
     const enc = aesV6EncryptBlock(&zero);
     const hex = try testutil.hexDump(alloc, &enc);
     defer alloc.free(hex);
@@ -454,8 +454,8 @@ test "v6 key schedule XOR" {
 
 test "HMAC-SHA256 reference vector" {
     const alloc = std.testing.allocator;
-    const key = [_]u8{0} ** 16;
-    const data = [_]u8{0} ** 32;
+    const key: [16]u8 = @splat(0);
+    const data: [32]u8 = @splat(0);
     var out: [32]u8 = undefined;
     hmacSha256(&key, &data, &out);
     const hex = try testutil.hexDump(alloc, &out);
@@ -465,7 +465,7 @@ test "HMAC-SHA256 reference vector" {
 
 test "v5 AES reference vector" {
     const alloc = std.testing.allocator;
-    const zero = [_]u8{0} ** 16;
+    const zero: [16]u8 = @splat(0);
     const enc = aesEncryptBlock(&aes_key_v5, false, zero);
     const hex = try testutil.hexDump(alloc, &enc);
     defer alloc.free(hex);
@@ -474,7 +474,7 @@ test "v5 AES reference vector" {
 
 test "v6 AES decrypt reference vector" {
     const alloc = std.testing.allocator;
-    const zero = [_]u8{0} ** 16;
+    const zero: [16]u8 = @splat(0);
     const enc = aesEncryptBlock(&aes_key_v6, true, zero);
     const dec = aesDecryptBlock(&aes_key_v6, true, enc);
     const hex = try testutil.hexDump(alloc, &dec);
@@ -485,8 +485,8 @@ test "v6 AES decrypt reference vector" {
 test "v6 CBC reference vectors" {
     const alloc = std.testing.allocator;
 
-    var data: [64]u8 = [_]u8{0} ** 64;
-    const iv = [_]u8{0} ** 16;
+    var data: [64]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     const new_len = aesCbcEncrypt(&aes_key_v6, true, &iv, data[0..], 32);
     try std.testing.expectEqual(@as(usize, 48), new_len);
@@ -504,7 +504,7 @@ test "v6 CBC reference vectors" {
 test "AesCmacV4 leaves input unchanged" {
     // Zig uses a separate pad buffer; the C reference wrote the 0x80 padding
     // byte into the input buffer — docs/migration.md §5.
-    var msg = [_]u8{0xAB} ** 34;
+    var msg: [34]u8 = @splat(0xAB);
     const original = msg;
     var mac: Block = undefined;
     aesCmacV4(&msg, &mac);

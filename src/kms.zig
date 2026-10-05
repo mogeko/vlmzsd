@@ -264,7 +264,7 @@ pub fn guidEqual(a: *const Guid, b: *const Guid) bool {
 }
 
 pub fn zeroGuid() Guid {
-    return [_]u8{0} ** 16;
+    return @splat(0);
 }
 
 pub fn fileTimeToU64(ft: FileTime) u64 {
@@ -1114,7 +1114,7 @@ test "client list insert and lookup" {
     const rng = prng.random();
 
     // A brand-new CMID increments the count.
-    base.cmid = [_]u8{1} ** 16;
+    base.cmid = @splat(1);
     try std.testing.expectEqual(@as(i32, 0), createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
     try std.testing.expectEqual(@as(u32, 1), resp.count);
 
@@ -1123,7 +1123,7 @@ test "client list insert and lookup" {
     try std.testing.expectEqual(@as(u32, 1), resp.count);
 
     // A different CMID increments again.
-    base.cmid = [_]u8{2} ** 16;
+    base.cmid = @splat(2);
     try std.testing.expectEqual(@as(i32, 0), createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
     try std.testing.expectEqual(@as(u32, 2), resp.count);
 }
@@ -1186,9 +1186,9 @@ fn makeVariantData(allocator: std.mem.Allocator, release_date: i64) !kmsdata.Kms
     };
 
     const items = try allocator.alloc(kmsdata.VlmcsdData, 3);
-    items[0] = .{ .guid = [_]u8{1} ** 16, .name = "app", .app_index = 0, .kms_index = 0, .protocol_version = 0, .n_count_policy = 25, .is_retail = 0, .is_preview = 0, .epid_index = 0 };
-    items[1] = .{ .guid = [_]u8{2} ** 16, .name = "kms", .app_index = 0, .kms_index = 0, .protocol_version = 0, .n_count_policy = 25, .is_retail = 0, .is_preview = 0, .epid_index = 0 };
-    items[2] = .{ .guid = [_]u8{3} ** 16, .name = "sku", .app_index = 0, .kms_index = 0, .protocol_version = 6, .n_count_policy = 25, .is_retail = 0, .is_preview = 0, .epid_index = 0 };
+    items[0] = .{ .guid = @splat(1), .name = "app", .app_index = 0, .kms_index = 0, .protocol_version = 0, .n_count_policy = 25, .is_retail = 0, .is_preview = 0, .epid_index = 0 };
+    items[1] = .{ .guid = @splat(2), .name = "kms", .app_index = 0, .kms_index = 0, .protocol_version = 0, .n_count_policy = 25, .is_retail = 0, .is_preview = 0, .epid_index = 0 };
+    items[2] = .{ .guid = @splat(3), .name = "sku", .app_index = 0, .kms_index = 0, .protocol_version = 6, .n_count_policy = 25, .is_retail = 0, .is_preview = 0, .epid_index = 0 };
 
     const host_builds = try allocator.alloc(kmsdata.HostBuild, 1);
     host_builds[0] = .{ .display_name = "test", .release_date = release_date, .build_number = 17763, .platform_id = 3612, .flags = 7 };
@@ -1241,7 +1241,7 @@ test "whitelist rejects unknown product" {
 
     var cfg = ServerConfig{ .data = &td.data, .whitelisting_level = 1 };
     var base = makeBase(&td.data, 6 << 16);
-    base.kms_id = [_]u8{0xFF} ** 16; // not in the .kmd — docs/migration.md §5
+    base.kms_id = @splat(0xFF); // not in the .kmd — docs/migration.md §5
 
     var prng: std.Random.DefaultPrng = .init(0);
     var resp: Response = undefined;
@@ -1265,7 +1265,7 @@ test "client list full rejected" {
 
     var cfg = ServerConfig{ .data = &td.data, .maintain_clients = true, .client_lists = &lists };
     var base = makeBase(&td.data, 6 << 16);
-    base.cmid = [_]u8{1} ** 16; // new CMID — docs/migration.md §5
+    base.cmid = @splat(1); // new CMID — docs/migration.md §5
 
     var resp: Response = undefined;
     try std.testing.expectEqual(hresult.too_many_clients, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));

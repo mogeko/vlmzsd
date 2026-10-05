@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ARG TARGETARCH
 ARG MINISIGN_PUBKEY="RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
-ARG ZIG_VERSION="0.16.0"
+ARG ZIG_VERSION="0.17.0"
 
 WORKDIR /tmp/
 

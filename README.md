@@ -28,7 +28,7 @@ The server runs in the foreground and logs to stdout.
 
 ## Build from source
 
-Requires [Zig](https://ziglang.org/download) `>= 0.16.0`.
+Requires [Zig](https://ziglang.org/download) `>= 0.17.0`.
 
 ```sh
 git clone https://github.com/mogeko/vlmzsd.git

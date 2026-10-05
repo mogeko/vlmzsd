@@ -1,4 +1,4 @@
-//! Probe: is `Io.Select(U)` usable in Zig 0.16.0 on the Threaded backend?
+//! Probe: is `Io.Select(U)` usable in Zig 0.17.0 on the Threaded backend?
 //!
 //! Run standalone (human mode, no `--listen=-` harness):
 //!     zig test .github/skills/io-async/scripts/select_probe.zig
@@ -268,7 +268,7 @@ const Raw = union(enum) { polled: u32 };
 /// A TCP connection whose ends are both owned by the test: sending from the
 /// client end makes the accepted end readable. Used instead of a pipe because
 /// this file must stay libc-free (`std.c.pipe` needs `-lc`, and `std.posix`
-/// exposes no `pipe` in 0.16), so it compiles wherever `zig test` runs.
+/// exposes no `pipe` in 0.17), so it compiles wherever `zig test` runs.
 const Pair = struct {
     server: Io.net.Server,
     accepted: Io.net.Stream,

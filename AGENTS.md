@@ -12,7 +12,7 @@ The upstream C project [vlmcsd](https://github.com/Wind4/vlmcsd/tree/svn1113) is
 reference only (the Zig code was originally migrated from it); it is no longer vendored in this
 repo. See `docs/migration.md` for the protocol byte layouts and algorithm constants extracted from it.
 
-- **Toolchain**: Zig `>= 0.16.0` (see `build.zig.zon`). The code uses the WIP `std.process.Init` /
+- **Toolchain**: Zig `>= 0.17.0` (see `build.zig.zon`). The code uses the WIP `std.process.Init` /
   `std.Io` APIs — do not regress to the older `std.process.argsAlloc` style.
 - **Package**: module `vlmzsd` (root `src/root.zig`), executables `src/main.zig` (`vlmzsd` server)
   and `src/vlmzs.zig` (`vlmzs` client).
@@ -102,10 +102,15 @@ source linked above).
 
 ## Pitfalls
 
-- `std.Io` / `std.process.Init` are WIP in 0.16 — consult current stdlib source, not older tutorials.
+- `std.Io` / `std.process.Init` are WIP in 0.17 — consult current stdlib source, not older tutorials.
   - `std.fs.cwd` is gone; file I/O goes through an `Io` instance: `std.Io.Threaded.init(alloc, .{})` → `.io()`.
   - `@embedFile` only reaches files inside the module's package path (`src/`).
-- `minimum_zig_version` is `0.16.0`; keep `build.zig` in line with that version.
+- `minimum_zig_version` is `0.17.0`; keep `build.zig` in line with that version.
+- **`build.zig` must stay 0.17-shaped.** `b.args` is gone — `run_cmd.addPassthruArgs()` passes the
+  `zig build run -- …` tail through. And because 0.17 now caches the configure phase (and can skip
+  `build.zig` altogether), a build script that reads state the cache cannot see must declare it:
+  `build.zig` embeds the git hash and the build date, so it calls `b.graph.poisonCache()`. Remove
+  that call and `--version` silently reports the previous run's hash and date.
 - **Container builds must use `-Dcpu=baseline`.** `zig build` defaults to the *native* CPU model;
   a CI ARM runner (e.g. Graviton) then emits SVE instructions that crash with SIGILL on CPUs
   without SVE (e.g. Apple Silicon). The `Dockerfile` pins `-Dcpu=baseline` for portability.
