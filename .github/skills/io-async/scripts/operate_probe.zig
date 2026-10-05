@@ -5,17 +5,25 @@
 //!
 //! Source reading says `Threaded.batchAwaitConcurrent` performs a non-blocking
 //! `recv` first and, on `WouldBlock`, polls the socket fd inline on the *calling*
-//! thread until the deadline. These five checks test that in behaviour — they are
-//! what decides whether the read path should be rewritten on `Operation`:
+//! thread until the deadline. These checks test that in behaviour — they are what
+//! decides whether the read path should be rewritten on `Operation`:
 //!   P1  a silent peer produces `error.Timeout` at the requested deadline
 //!   P2  a cancelation request ends a parked wait by itself (no wake fd needed)
 //!   P3  no extra thread is consumed (works with a pool of zero workers)
 //!   P4  arriving bytes come back as one message over the caller's buffer
 //!   P4b what EOF looks like
 //!
-//! Note: `Io.net.Socket.createPair` is *not* usable on macOS (its default
-//! `family = .ip4` socketpair is Linux-only, and it panics with
-//! `unexpectedErrno`), so the probe builds a connected TCP pair instead.
+//! 0.17 moved the socket *write* path onto `Operation` too (`net_send`, and
+//! `net_write` which now backs `Io.Writer`), so P5/P6 check the send side as
+//! well. Note the asymmetry found there: the deadline is only honoured while
+//! *nothing* can be sent — see P6's comment and the reference file.
+//!   P5  `net_send` delivers and reports the message count
+//!   P6  `net_write` (header + data + splat) delivers, backing `Io.Writer`
+//!
+//! Note: `Io.net.Socket.createPair` is *not* usable on either platform — its
+//! only families are `.ip4`/`.ip6`, which `socketpair(2)` does not implement
+//! (errno 95 on Linux, 102 on macOS, for both families) — so the probe builds a
+//! connected TCP pair instead.
 
 const std = @import("std");
 const Io = std.Io;
@@ -235,4 +243,93 @@ test "a cancelation request ends the wait without any wake fd" {
     std.debug.print("[P2] cancel ended a parked net_receive in {d} ms; task saw Canceled = {}\n", .{ dt, canceled });
     try std.testing.expect(dt < 500);
     try std.testing.expectError(error.Canceled, outcome.?);
+}
+
+// P5: the write path is an operation too. `net_send` addresses a message list,
+// so it can express a send that `net_receive` alone could not (0.16 had no way
+// to name this operation at all).
+test "operateTimeout(.net_send) delivers over Threaded" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try TcpPair.init(io);
+    defer pair.deinit(io);
+
+    // `OutgoingMessage` needs a valid address pointer even on a connected
+    // socket, where the kernel ignores it (verified on Linux and macOS).
+    const peer = pair.accepted.socket.address;
+    var outgoing: [1]Io.net.OutgoingMessage = .{.{
+        .address = &peer,
+        .data_ptr = "hello".ptr,
+        .data_len = "hello".len,
+    }};
+
+    const t0 = Io.Timestamp.now(io, .awake);
+    const sent = try io.operateTimeout(.{ .net_send = .{
+        .socket_handle = pair.client.socket.handle,
+        .messages = &outgoing,
+        .flags = .{},
+    } }, durationMs(500));
+    const dt = elapsedMs(t0, io);
+    std.debug.print("[P5] net_send -> err={any} messages={d} bytes={d} after {d} ms\n", .{
+        sent.net_send[0], sent.net_send[1], outgoing[0].data_len, dt,
+    });
+
+    // `sent` is a *message* count; per-message progress is `data_len`, which the
+    // backend rewrites to the bytes actually accepted (partial sends are legal).
+    try std.testing.expect(sent.net_send[0] == null);
+    try std.testing.expectEqual(@as(usize, 1), sent.net_send[1]);
+    try std.testing.expectEqualStrings("hello", outgoing[0].data_ptr[0..outgoing[0].data_len]);
+
+    var messages: [1]Io.net.IncomingMessage = undefined;
+    initMessages(&messages);
+    var buffer: [64]u8 = undefined;
+    const got = try receive(io, pair.accepted.socket, &messages, &buffer, durationMs(500));
+    try std.testing.expectEqual(@as(usize, 1), got[1]);
+    try std.testing.expectEqualStrings("hello", messages[0].data);
+}
+
+// P6: `Io.net.Stream.Writer` flushes through this exact operation (0.17 gained
+// `io.operate(.{ .net_write = ... })` inside `net.zig`), so the shape checked
+// here is the one every buffered write on a stream socket takes.
+//
+// Only the *unblocked* case is asserted. The blocked case is a trap this probe
+// must not enter: `batchAwaitConcurrent` re-runs the operation **blocking** once
+// `poll` reports the fd ready (`Io/Threaded.zig` poll loop), and `POLLOUT` only
+// promises that *some* bytes fit — never that the whole message does. Measured by
+// hand: 8 MiB to a peer that never reads, 200 ms deadline. macOS blocked in
+// `sendmsg` for 40 s and counting (`sample`: batchAwaitConcurrent -> netSendPosix
+// -> __sendmsg); Linux returned after 0 ms with a partial count instead. The
+// post-poll blocking retry is the shared mechanism, so chunk your sends on both.
+test "operateTimeout(.net_write) delivers header + data over Threaded" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try TcpPair.init(io);
+    defer pair.deinit(io);
+
+    const t0 = Io.Timestamp.now(io, .awake);
+    const wrote = try io.operateTimeout(.{ .net_write = .{
+        .socket_handle = pair.client.socket.handle,
+        .header = "H:",
+        .data = &.{"body"},
+        .splat = 1,
+        .control = &.{},
+    } }, durationMs(500));
+    const n = try wrote.net_write;
+    const dt = elapsedMs(t0, io);
+    std.debug.print("[P6] net_write -> {d} bytes after {d} ms\n", .{ n, dt });
+
+    try std.testing.expectEqual(@as(usize, "H:body".len), n);
+
+    var messages: [1]Io.net.IncomingMessage = undefined;
+    initMessages(&messages);
+    var buffer: [64]u8 = undefined;
+    const got = try receive(io, pair.accepted.socket, &messages, &buffer, durationMs(500));
+    std.debug.print("[P6] peer received '{s}' ({d} msg)\n", .{ messages[0].data, got[1] });
+    try std.testing.expectEqualStrings("H:body", messages[0].data);
 }

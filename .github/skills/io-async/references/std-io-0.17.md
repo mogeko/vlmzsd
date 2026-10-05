@@ -123,8 +123,8 @@ react to a shutdown signal, a wake fd it polls alongside (`std.posix.poll` on a 
 | `Io.Mutex` | `init`, `tryLock() bool`, `lock(io) Cancelable!void`, `lockUncancelable(io) void`, `unlock(io) void` | futex-based; use when the critical section can block |
 | `std.atomic.Mutex` | `tryLock() bool`, `unlock()` | spins; short, `io`-free sections (`std.Thread.Mutex` was removed in 0.16) |
 | `Io.RwLock` | `lock*` / `unlock*` variants | |
-| `Io.Semaphore` | `{ .permits = n }`, `wait(io)`, `waitUncancelable(io)`, `post(io)` | counting gate; **no** `tryWait`/`available`, `permits` is mutex-guarded — you cannot peek at it |
-| `Io.Condition` | `wait(io, mutex)`, `waitUncancelable(io, mutex)`, `signal(io)`, `broadcast(io)` | |
+| `Io.Semaphore` | `{ .permits = n }`, `wait(io)`, `waitTimeout(io, timeout)`, `waitUncancelable(io)`, `post(io)` | counting gate; **no** `tryWait`/`available`, `permits` is mutex-guarded — you cannot peek at it. `waitTimeout` is new in 0.17; its error set is `Cancelable \|\| error{Timeout}` |
+| `Io.Condition` | `wait(io, mutex)`, `waitTimeout(io, mutex, timeout)`, `waitUncancelable(io, mutex)`, `signal(io)`, `broadcast(io)` | `waitTimeout` is new in 0.17 (same error set as the semaphore's) |
 | `Io.Event` | `isSet()`, `wait(io)`, `waitUncancelable(io)`, `waitTimeout(io, timeout)`, `set(io)`, `reset()` | sticky; `reset` requires no pending waiter |
 | `Io.Queue(T)` | `init(buffer)`, `put/putAll/putUncancelable/putOne/putOneUncancelable`, `get/getUncancelable/getOne/getOneUncancelable`, `close(io)`, `capacity()` | fixed buffer supplied at init; `error.Closed` after close |
 | `Io.futexWait / futexWaitTimeout / futexWaitUncancelable / futexWake` | | building block for your own primitives |
@@ -147,7 +147,8 @@ Each task's result is tagged into the union `U`; `await`/`cancel` must be called
 deinitialized. This is a *task* combinator — it cannot wait on a set of file descriptors.
 
 **It is usable on `Threaded`** (verified by running [select_probe.zig](../scripts/select_probe.zig),
-5/5 green, Zig 0.17.0 on macOS; re-run it on your toolchain — one command, self-contained):
+5/5 green on macOS and Linux (aarch64), Zig 0.17.0; re-run it on your toolchain — one command,
+self-contained):
 
 | Observation | Measured |
 |---|---|
@@ -174,19 +175,24 @@ Two sharp edges the probe pins down:
 
 ```zig
 pub const Operation = union(enum) {
-    file_read_streaming, file_write_streaming, device_io_control, net_receive,
+    file_read_streaming, file_write_streaming, device_io_control,
+    net_receive, net_send, net_read, net_write,
 };
 pub fn operate(io: Io, operation: Operation) Cancelable!Operation.Result;
 ```
 
 `Threaded` implements `operate` **synchronously on the calling thread** (with cancelation handling):
 it buys portability across backends plus uniform cancelation/timeout semantics, *not* extra
-concurrency. `net_receive`'s result is `struct { ?net.Socket.ReceiveError, usize }`.
+concurrency. `net_receive`'s result is `struct {?net.Socket.ReceiveError, usize}`; the send side
+(`net_send`) returns `struct {?net.Socket.SendError, usize}`, and in both the trailing `usize` counts
+*messages* — per-message byte progress is the mutated `OutgoingMessage.data_len` /
+`IncomingMessage.data.len`, so a partial send is reported as success plus a short count.
 
 `operateTimeout(io, op, timeout)` is `Batch` + `awaitConcurrent`, and on `Threaded`
 (`batchAwaitConcurrent`) that means: try the operation non-blocking, and on `WouldBlock` poll the
 operation's fds **inline on the calling thread** until the deadline. Verified by running
-[operate_probe.zig](../scripts/operate_probe.zig) — 5/5 green, Zig 0.17.0 on macOS:
+[operate_probe.zig](../scripts/operate_probe.zig) — 7/7 green on macOS and Linux (aarch64),
+Zig 0.17.0:
 
 | Property | Measured |
 |---|---|
@@ -195,15 +201,35 @@ operation's fds **inline on the calling thread** until the deadline. Verified by
 | No thread is dispatched to wait: it works with a **pool of zero workers** (`concurrent_limit = .nothing`) | `error.Timeout` after **199 ms** (never `error.ConcurrencyUnavailable`) |
 | Bytes arrive over the caller's own buffer (no read-ahead copy) | 1 message, `data = "abc"` |
 | EOF is explicit: a closed peer yields **one message with `data.len == 0`** | returned in **0 ms** |
+| The send path is an operation too — `net_send` carries the message list, delivers, and reports the message count | err `null`, 1 message, **5 bytes** in **0 ms** (peer received `hello`) |
+| `Io.Writer`'s own path — `net_write` with `header` + `data` + `splat` — is usable the same way | **6 bytes** in **0 ms** (peer received `H:body`) |
 
 So on `Threaded` this is the thread-parks-anyway situation — but expressed in `Io` terms, which is
 what a reactor backend would need to stop parking a thread, and which removes the need to hand-roll
-`poll` + wake-fd + cancelation plumbing. Two caveats found by the probe:
+`poll` + wake-fd + cancelation plumbing. Three caveats, all confirmed on 0.17.0 (macOS and Linux
+aarch64):
 
-- **`Io.net.Socket.createPair` is not usable on macOS**: its default `family = .ip4` socketpair is
-  Linux-only, and it aborts with `unexpectedErrno` (the probe builds a connected TCP pair instead).
-- `Operation` has **no send variant** (`net_receive` only), so the *write* path cannot be expressed
-  as an operation today; it stays on `Io.Writer` → `netWrite`.
+- **`Io.net.Socket.createPair` is unusable everywhere, on either family.** Its options offer only
+  `.ip4` / `.ip6`, and `socketpair(2)` implements neither on Linux or Darwin, so every call dies in
+  `unexpectedErrno`: **errno 95** on Linux, **errno 102** on macOS, for `.ip4` and `.ip6` alike. The
+  probes build a connected TCP pair instead.
+- **The write path is no longer a separate API.** 0.16 had `netSend`/`netRead`/`netWrite` *vtable*
+  entries; 0.17 deleted them and re-expressed them as the `net_send`/`net_read`/`net_write`
+  operations. `Io.net.Stream`'s `Writer`/`Reader` are now implemented on top of `net_write`/`net_read`
+  (`std/Io/net.zig`), so a buffered write *is* that operation — there is nothing left that
+  `Operation` cannot express on a socket. (`netWriteFile`, `sendFile`'s backing vtable entry, is the
+  exception: it is `error.Unimplemented` on `Threaded`.)
+- **On the send side the deadline is not a bound — only a floor.** The poll loop re-runs the
+  operation **blocking** once `poll` reports the fd ready (`Io/Threaded.zig`, the
+  `poll_entry.revents != 0` arm → `operate`), and `POLLOUT` only promises that *some* bytes fit —
+  never that the whole message does. A message larger than the socket's send window can therefore
+  block in `sendmsg` past any deadline. macOS reached that: `operateTimeout(.net_send)` and
+  `.net_write`, 8 MiB to a peer that never reads, a 200 ms deadline — still blocked after 40 s
+  (`sample` stack: `batchAwaitConcurrent` → `netSendPosix` → `netSendOnePosix` → `__sendmsg`). Linux
+  did not, for the same call: its non-blocking `sendmsg` accepted a partial 2.6 MB and the operation
+  returned in 0 ms with a short count. The mechanism is platform-independent either way, so send
+  *chunks* smaller than the window and keep the deadline loop in your own code; the read side has no
+  such gap (a readable socket returns as soon as any bytes arrive).
 
 ## Known gaps in 0.17.0
 
@@ -211,14 +237,40 @@ what a reactor backend would need to stop parking a thread, and which removes th
 |---|---|
 | No connect deadline | `IpAddress.ConnectOptions.timeout` exists but `netConnectIpPosix/Windows` `@panic("TODO implement … with timeout")`. An unreachable host is bounded by the kernel's SYN timeout only. |
 | No `std.time.sleep` / `std.posix.nanosleep` | Sleep through `Io.sleep`. |
-| `SO_RCVTIMEO` is unusable | A socket read timeout surfaces as `EAGAIN`, which `std.Io` treats as an internal bug (`errnoBug`) and panics on in debug builds. Express deadlines with `Timeout`/`poll` instead. |
+| `SO_RCVTIMEO` is unusable | A socket timeout surfaces as `EAGAIN`, and `std.Io` calls that a bug whichever path you take: the streaming one (`netReadPosix` / `netWritePosix`, i.e. `Stream.Reader` / `Stream.Writer`) feeds it to `errnoBug`, while the blocking `operate` path maps it to `error.WouldBlock` — an error its own `net_receive` arm declares `unreachable`. Both panic in debug builds. Verified: `SO_RCVTIMEO = 200 ms` + `io.operate(.net_receive)` on a silent peer → `attempt to unwrap error: WouldBlock`. Express deadlines with `Timeout`/`poll` instead. |
 | No `std.Thread.Mutex` | Use `Io.Mutex` (cancelable futex) or `std.atomic.Mutex` (short, spinning). |
 | Pool not configurable via `std.process.Init` | `InitOptions` only when you construct `Threaded` yourself. |
+
+## What moved since 0.16.0
+
+This file was first verified against 0.16.0, so it was re-checked claim by claim: `diff` of
+`Io.zig`, `Io/Threaded.zig`, `Io/Semaphore.zig`, `Io/RwLock.zig` and `Io/net.zig` between the two
+releases, plus a re-run of both probes. These are the *only* deltas that touch anything stated here:
+
+| Change | Detail |
+|---|---|
+| Socket writes became operations | `net_send` / `net_read` / `net_write` joined `Operation`; the matching `netSend` / `netRead` / `netWrite` **vtable entries were deleted**, and `Stream.Reader` / `Stream.Writer` were re-pointed at the operations. This is what invalidated the old "no send variant" note. |
+| `netWriteFile` stopped panicking | `Threaded`'s `sendFile` backing entry now returns `error.Unimplemented` instead of `@panic("TODO implement")`. |
+| Two `waitTimeout`s added | `Io.Semaphore.waitTimeout` and `Io.Condition.waitTimeout`, both `Cancelable \|\| error{Timeout}`. |
+| `RwLock` internal fixes | `tryLock` and the cancelation path of `lockShared` no longer race; the public API is unchanged. |
+| Everything else unchanged | `Select`, `Queue`, `Mutex`, `Event`, `RwLock`, the futex wrappers, `Clock` / `Timeout` / `Timestamp.durationTo`, `Future` / `Group`, `checkCancel` / `recancel` / `CancelProtection`, `Limit`, the vtable's task half, `Threaded.InitOptions` and `setAsyncLimit`. The only additions seen were small helpers (`Limit.toInt64`, `Timestamp.compare`). |
+
+Consequently the 0.16 probe cases needed no changes at all: re-running
+[select_probe.zig](../scripts/select_probe.zig) and [operate_probe.zig](../scripts/operate_probe.zig)
+on 0.17.0 reproduced every 0.16 measurement (timings within a millisecond or two).
 
 ## How these claims were checked
 
 `grep`/read of the installed sources (`std/Io.zig`, `std/Io/Threaded.zig`, `std/Io/Semaphore.zig`) for
-every signature above, plus runtime observation of the Threaded backend on macOS: thread count
+every signature above, plus runtime observation of the Threaded backend on macOS and Linux: thread count
 tracking peak concurrent tasks and never falling, `ConcurrencyUnavailable` past a low
 `concurrent_limit`, prompt `error.Canceled` only where a wait polls a wake fd, and `--timeout`-style
 deadlines firing as configured. Prefer repeating such a measurement over trusting this file.
+
+For the 0.17.0 revision specifically: the 0.16 cases in both probe scripts were re-run as-is on
+macOS *and* on Linux (aarch64, Zig 0.17.0 in a container), and four claims that only a runtime could
+settle were measured directly — `createPair` failing on both families on both platforms, `SO_RCVTIMEO`
+panicking the blocking `operate` path, and the send path ignoring its deadline (macOS: still blocked
+after 40 s, which needed `sample` on the stuck process to identify and a kill to end; Linux: a short
+count instead — do not put either in a probe). `operate_probe.zig` gained two cases (P5, P6) for the
+newly-expressible send path.

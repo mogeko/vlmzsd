@@ -1,6 +1,6 @@
 ---
 name: io-async
-description: 'How to write async and concurrent I/O in Zig 0.17 with std.Io: the task/Group/Future/Select/Operation model, what the Threaded backend can and cannot do, cooperative cancelation and shutdown, bounding parallel work, and the pitfalls that make tasks hang, leak, or outlive the process. Use when adding or changing server/client concurrency, spawning parallel work, waiting on sockets with deadlines, capping parallel work, or debugging a task that never stops, never starts, or ignores shutdown. Keywords: std.Io, std.Io.Threaded, async, concurrent, Future, Group, Select, Operation, net_receive, Timeout, cancelation, cancelation point, checkCancel, Semaphore, Mutex, thread pool, shutdown, wake fd, thread-per-connection.'
+description: 'How to write async and concurrent I/O in Zig 0.17 with std.Io: the task/Group/Future/Select/Operation model, what the Threaded backend can and cannot do, cooperative cancelation and shutdown, bounding parallel work, and the pitfalls that make tasks hang, leak, or outlive the process. Use when adding or changing server/client concurrency, spawning parallel work, waiting on sockets with deadlines, capping parallel work, or debugging a task that never stops, never starts, or ignores shutdown. Keywords: std.Io, std.Io.Threaded, async, concurrent, Future, Group, Select, Operation, net_receive, net_send, Timeout, cancelation, cancelation point, checkCancel, Semaphore, Mutex, thread pool, shutdown, wake fd, thread-per-connection.'
 argument-hint: '<what you are changing: accept loop | client request | shutdown | limits>'
 ---
 
@@ -49,7 +49,7 @@ Signatures, semantics, and the evidence behind every claim below live in
 | Ask "was I canceled?" | `Io.checkCancel(io)` → `error.Canceled` | Meaningful only inside a task |
 | Shield a critical region from cancelation | `Io.swapCancelProtection(io, .blocked/.unblocked)` | Restore the previous value when done |
 | Bound how long a blocking call may take | `Io.Timeout` (`.none`/`.duration`/`.deadline`) with `operateTimeout`, or `Clock.Duration.sleep` | `Timeout` is the standard way to express a deadline |
-| Issue a typed I/O operation with cancelation/timeout semantics | `Io.Operation` (`net_receive`, `file_read_streaming`, `file_write_streaming`, `device_io_control`) via `Io.operate` / `operateTimeout` | Portable across backends; on `Threaded` the op still blocks *this* thread |
+| Issue a typed I/O operation with cancelation/timeout semantics | `Io.Operation` (`net_receive`, `net_send`, `net_read`, `net_write`, `file_read_streaming`, `file_write_streaming`, `device_io_control`) via `Io.operate` / `operateTimeout` | Portable across backends; on `Threaded` the op still blocks *this* thread. 0.17 moved socket **writes** here too — `Stream.Writer` itself flushes through `net_write` — so "the write path is not an operation" is no longer a reason to hand-roll `poll` |
 | Sleep | `Io.sleep(io, .{ .nanoseconds = n }, clock)` | `Clock` = `.real`, `.awake`, `.boot`, `.cpu_process`, `.cpu_thread` (**no `.monotonic`**) |
 | Deadline a wait you own | `Io.futexWaitTimeout`, `Io.Event`, `Io.Condition` | For synchronization you hand-roll |
 | Synchronize | `Io.Mutex` (held across I/O), `std.atomic.Mutex` (short, io-free), `Io.RwLock`, `Io.Semaphore`, `Io.Event`, `Io.Queue(T)` | Prefer `Io` primitives inside tasks |
@@ -67,7 +67,8 @@ Signatures, semantics, and the evidence behind every claim below live in
 | **Cancelation is not preemption.** | A loop that never blocks, or a wait parked in raw `std.posix.poll`/`read`/`Semaphore.waitUncancelable`, will not stop. If you hand-roll a wait, hand-roll the wakeup too. |
 | **`std.posix.poll` swallows `EINTR` and retries.** | The signal that announces cancelation does not end a `poll`; only a deadline or a second fd does. |
 | **No connect deadline.** | `IpAddress.ConnectOptions.timeout` panics (`TODO implement`); an unreachable host is bounded only by the kernel's SYN timeout. |
-| **No `std.time.sleep`, no `SO_RCVTIMEO`.** | Sleep with `Io.sleep`; a socket timeout surfaces as `EAGAIN`, which `std.Io` treats as a bug and panics on in debug builds. Use a deadline. |
+| **A *send* deadline is not a bound.** | `operateTimeout(.net_send)` / `(.net_write)` re-run the **blocking** operation once `poll` reports `POLLOUT`, which only promises that *some* bytes fit. A message larger than the send window can block in `sendmsg` past any deadline — macOS did, indefinitely (8 MiB to a peer that never reads, 200 ms deadline, still stuck at 40 s); Linux returned a partial count instead. Chunk sends and own the deadline loop. The read side has no such gap. |
+| **No `std.time.sleep`, no `SO_RCVTIMEO`.** | Sleep with `Io.sleep`. An `SO_RCVTIMEO` expiry surfaces as `EAGAIN`, which `std.Io` calls a bug on every path (`errnoBug` on the streaming ones, `unreachable` in the blocking `operate`), panicking in debug builds. Use a deadline. |
 | **Evented backends are not ready.** | `Io.Kqueue` / `Io.Uring` / `Io.Dispatch` / `fiber` are WIP; `Threaded` is the supported model here. |
 
 ## Choosing (in order)
@@ -76,9 +77,11 @@ Signatures, semantics, and the evidence behind every claim below live in
 2. **Parallel, all must finish** → `Group` + `await`. **Parallel, first one wins** → `Io.Select`.
 3. **Must outlive the caller** → long-lived `Group`, canceled on shutdown; otherwise `await` immediately.
 4. **Waiting on a socket** → express it as an `Io` operation
-   (`io.operateTimeout(.{ .net_receive = … })`): it brings its own deadline *and* cancelation point,
-   and the backend decides whether a thread is parked. Hand-roll `poll` only when no operation fits —
-   and then you own the deadline, the `EINTR` retry, and the wakeup as well.
+   (`io.operateTimeout(.{ .net_receive = … })`, or `net_send`/`net_write` in the other direction): it
+   brings its own deadline *and* cancelation point, and the backend decides whether a thread is
+   parked. On the send side, hand it no more than the window will take at once — a bigger message
+   turns the deadline into a floor. Hand-roll `poll` only when no operation fits — and then you own
+   the deadline, the `EINTR` retry, and the wakeup as well.
 5. **Capping** → decide in the accept path (refuse and let the kernel queue, or drop), never in the
    pool.
 
@@ -127,8 +130,9 @@ usually miss:
 
 The shipped probes re-check the contracts these rules rest on: `./scripts/select_probe.zig` (5 cases,
 `Io.Select` completion order, `cancel`/drain, the buffer-size trap) and `./scripts/operate_probe.zig`
-(5 cases, `operateTimeout(.net_receive)`: deadline, cancelation with **no** wake fd, no extra thread,
-EOF as a zero-length message). Point them at your own toolchain before relying on any of it.
+(7 cases, `operateTimeout`: deadline, cancelation with **no** wake fd, no extra thread, EOF as a
+zero-length message, and the `net_send`/`net_write` write path). Point them at your own toolchain
+before relying on any of it.
 
 ## Checklist
 
