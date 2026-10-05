@@ -104,17 +104,29 @@ pub fn Clock.now(clock: Clock, io: Io) Io.Timestamp;                     // .nan
 pub fn Io.Timestamp.durationTo(from: Timestamp, to: Timestamp) Duration; // to - from
 ```
 
-A **cancelation point** is a call into `Io` that can return `error.Canceled`. These are *not* points,
-so a task parked on them ignores a cancelation request no matter how long it waits:
+A **cancelation point** is a call into `Io` that can return `error.Canceled`. Two independent things
+end a parked wait — a *deadline* (`Timeout`) and *cancelation* — and `Timeout.none` removes only the
+first, never the second. Cancelation reaches further down than it looks:
+
+- **A backend operation is cancelable even with no deadline.** A blocking `io.operate(.net_write)` —
+  what `Io.Writer.flush` calls — parks in `sendmsg`, and `Group.cancel` still ends it: `Threaded`
+  installs a `SIGIO` handler and `pthread_kill`s the parked thread, the syscall returns `EINTR`, and
+  the operation's own `Syscall.checkCancel` turns that into `error.Canceled`.
+- **A raw syscall in *your* code is not.** `std.posix.read` / `write` / `poll` / `accept` retry
+  `EINTR` internally, so the same signal is swallowed and nothing ends the wait — no deadline, no
+  cancelation. Re-expressing a backend operation as a hand-rolled syscall silently gives up both.
+
+These waits, by contrast, are deliberately *not* points, so a task parked on them ignores a
+cancelation request no matter how long it waits:
 
 | Not a cancelation point | Consequence |
 |---|---|
-| raw `std.posix.read` / `write` / `poll` / `accept` | `poll` also swallows `EINTR` and retries, so the cancelation signal cannot end it — a deadline or a second fd must |
 | `Semaphore.waitUncancelable`, `Mutex.lockUncancelable`, `Condition.waitUncancelable`, `Event.waitUncancelable`, `Io.futexWaitUncancelable` | deliberate: these are for critical sections, not for waiting out a shutdown |
-| `Timeout.none` waits | nothing will end them |
+| raw `std.posix.*`, as above | only a deadline or a second fd ends it |
 
-Practical rule: every hand-rolled wait needs an independent way out — a deadline *and*, if it must
-react to a shutdown signal, a wake fd it polls alongside (`std.posix.poll` on a self-pipe).
+Practical rule: prefer the `Io` form, which brings a deadline *and* a cancelation point for free; a
+hand-rolled wait needs both hand-rolled — a deadline, plus a wake fd it polls alongside
+(`std.posix.poll` on a self-pipe) if it must react to a shutdown signal.
 
 ## Synchronization
 
@@ -191,7 +203,7 @@ concurrency. `net_receive`'s result is `struct {?net.Socket.ReceiveError, usize}
 `operateTimeout(io, op, timeout)` is `Batch` + `awaitConcurrent`, and on `Threaded`
 (`batchAwaitConcurrent`) that means: try the operation non-blocking, and on `WouldBlock` poll the
 operation's fds **inline on the calling thread** until the deadline. Verified by running
-[operate_probe.zig](../scripts/operate_probe.zig) — 7/7 green on macOS and Linux (aarch64),
+[operate_probe.zig](../scripts/operate_probe.zig) — 8/8 green on macOS and Linux (aarch64),
 Zig 0.17.0:
 
 | Property | Measured |
@@ -203,6 +215,7 @@ Zig 0.17.0:
 | EOF is explicit: a closed peer yields **one message with `data.len == 0`** | returned in **0 ms** |
 | The send path is an operation too — `net_send` carries the message list, delivers, and reports the message count | err `null`, 1 message, **5 bytes** in **0 ms** (peer received `hello`) |
 | `Io.Writer`'s own path — `net_write` with `header` + `data` + `splat` — is usable the same way | **6 bytes** in **0 ms** (peer received `H:body`) |
+| A write parked in `sendmsg` with *no* deadline still ends on cancelation | 8 MiB to a peer that never reads: `Group.cancel` returned in **0 ms**, write unfinished |
 
 So on `Threaded` this is the thread-parks-anyway situation — but expressed in `Io` terms, which is
 what a reactor backend would need to stop parking a thread, and which removes the need to hand-roll

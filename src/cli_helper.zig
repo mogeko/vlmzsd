@@ -569,11 +569,18 @@ pub fn nowUnix(io: Io) i64 {
 }
 
 /// A non-cryptographic seed mixing the realtime clock with stack (ASLR) entropy.
+/// PRNG seed for a process, drawn from the backend's entropy source.
+///
+/// `Io.random` is the right level here rather than `randomSecure`: it is
+/// thread-safe, stateful, needs no error handling, and is seeded by
+/// `randomSecure` where the platform has an entropy source — with its own
+/// fallback where it does not. Deriving the seed from the clock and a stack
+/// address (`@intFromPtr(&now)`) instead would make it predictable and
+/// repeatable across processes started in the same nanosecond.
 pub fn makeSeed(io: Io) u64 {
-    const now = Io.Clock.now(.real, io);
-    const nanos: u128 = @intCast(now.nanoseconds);
-    const ptr_entropy: u64 = @truncate(@as(u128, @intCast(@intFromPtr(&now))));
-    return @as(u64, @truncate(nanos)) ^ ptr_entropy;
+    var bytes: [8]u8 = undefined;
+    io.random(&bytes);
+    return std.mem.readInt(u64, &bytes, .little);
 }
 
 /// FHS/XDG system search directories for external `.kmd` data files, highest

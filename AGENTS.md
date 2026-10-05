@@ -84,6 +84,12 @@ source linked above).
   cancelation point — so SIGINT/SIGTERM ends a parked read with `error.Canceled` at once, with no
   self-pipe. Per-connection state (PRNG, 4 KiB read/write buffers) stays
   task-local; shared mutable state uses `Io.Mutex` (logger) or `std.atomic.Mutex` (client lists).
+  The `vlmzs` client bounds its own pool use the same way: `--reconnect-per-request` dispatches each
+  request as a task behind an `Io.Semaphore` window of one per logical CPU, so `--count` cannot set
+  the thread count. The one hand-rolled wait left is the accept loop's `std.posix.poll` — there is no
+  accept *operation* to express it with — and it owns all three of the things the skill says such a
+  wait must: a wake fd (the shutdown pipe), a deadline while saturated, and `std.posix.poll`'s own
+  `EINTR` retry.
 
 ## CLI implementation decisions
 

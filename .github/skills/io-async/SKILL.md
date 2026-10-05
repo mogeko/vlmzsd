@@ -130,9 +130,9 @@ usually miss:
 
 The shipped probes re-check the contracts these rules rest on: `./scripts/select_probe.zig` (5 cases,
 `Io.Select` completion order, `cancel`/drain, the buffer-size trap) and `./scripts/operate_probe.zig`
-(7 cases, `operateTimeout`: deadline, cancelation with **no** wake fd, no extra thread, EOF as a
-zero-length message, and the `net_send`/`net_write` write path). Point them at your own toolchain
-before relying on any of it.
+(8 cases, `operateTimeout`: deadline, cancelation with **no** wake fd — including a write parked in
+`sendmsg` with no deadline — no extra thread, EOF as a zero-length message, and the
+`net_send`/`net_write` write path). Point them at your own toolchain before relying on any of it.
 
 ## Checklist
 

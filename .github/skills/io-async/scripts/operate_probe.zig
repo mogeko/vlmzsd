@@ -19,6 +19,8 @@
 //! *nothing* can be sent — see P6's comment and the reference file.
 //!   P5  `net_send` delivers and reports the message count
 //!   P6  `net_write` (header + data + splat) delivers, backing `Io.Writer`
+//!   P7  a write parked with no deadline still ends on cancelation (the
+//!       backend interrupts the syscall; a raw `std.posix.write` would not)
 //!
 //! Note: `Io.net.Socket.createPair` is *not* usable on either platform — its
 //! only families are `.ip4`/`.ip6`, which `socketpair(2)` does not implement
@@ -332,4 +334,65 @@ test "operateTimeout(.net_write) delivers header + data over Threaded" {
     const got = try receive(io, pair.accepted.socket, &messages, &buffer, durationMs(500));
     std.debug.print("[P6] peer received '{s}' ({d} msg)\n", .{ messages[0].data, got[1] });
     try std.testing.expectEqualStrings("H:body", messages[0].data);
+}
+
+/// A task that parks in a blocking stream write — `Io.Writer.flush` reaches the
+/// same `net_write` operation the server's responses use.
+const BigWriter = struct {
+    io: Io,
+    stream: Io.net.Stream,
+    payload: []const u8,
+    /// Set only if the write completed, which it cannot while the peer holds
+    /// the connection open and never reads.
+    finished: *bool,
+
+    fn run(self: BigWriter) Io.Cancelable!void {
+        var buffer: [4096]u8 = undefined;
+        var writer = self.stream.writer(self.io, &buffer);
+        // `Io.Writer.Error` is only `error.WriteFailed`; the cause it records is
+        // `error.Canceled` when the wait is what failed.
+        writer.interface.writeAll(self.payload) catch return error.Canceled;
+        writer.interface.flush() catch return error.Canceled;
+        self.finished.* = true;
+    }
+};
+
+// P7: cancelation reaches a parked *write* even with no deadline — which is
+// what makes the "peer stops reading" shutdown case survivable. `Threaded`
+// interrupts the syscall with `SIGIO` and the operation's own `EINTR` handling
+// reports `error.Canceled`; a hand-rolled `std.posix.write` would retry that
+// same interrupt away and never return.
+test "a writer parked in sendmsg ends on cancelation" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try TcpPair.init(io);
+    defer pair.deinit(io);
+
+    const payload = try gpa.alloc(u8, 8 * 1024 * 1024);
+    defer gpa.free(payload);
+    @memset(payload, 0xAB);
+
+    var finished = false;
+    var group: Io.Group = .init;
+    try group.concurrent(io, BigWriter.run, .{BigWriter{
+        .io = io,
+        .stream = pair.client,
+        .payload = payload,
+        .finished = &finished,
+    }});
+
+    // The peer never reads, so the task must still be parked in `sendmsg`.
+    try io.sleep(.{ .nanoseconds = 300 * ms }, .awake);
+    try std.testing.expect(!finished);
+
+    const t0 = Io.Timestamp.now(io, .awake);
+    group.cancel(io);
+    const dt = elapsedMs(t0, io);
+    std.debug.print("[P7] cancel ended a blocked 8 MiB net_write in {d} ms (write completed = {})\n", .{ dt, finished });
+
+    try std.testing.expect(!finished);
+    try std.testing.expect(dt < 2_000);
 }
