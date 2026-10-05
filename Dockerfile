@@ -47,7 +47,7 @@ COPY ./README.md /opt/app/README.md
 # or `$(git rev-parse HEAD)`, since `build.zig` trims it to 7 characters.
 ARG VLMZSD_GIT_SHA
 
-RUN zig build vlmzsd vlmzs -Dcpu=baseline -Doptimize=ReleaseSafe \
+RUN zig build vlmzsd vlmzs -Dcpu=baseline -Doptimize=safe \
         -Dgit-sha="${VLMZSD_GIT_SHA}" -Dno-embedded-data
 
 FROM gcr.io/distroless/base-nossl-debian13:latest
