@@ -27,13 +27,6 @@ test "embedded .kmd data pipeline" {
     try std.testing.expectEqual(@as(usize, 19371), kmd.len);
 }
 
-/// Compare `actual` against an expected lowercase-hex string.
-fn expectHex(allocator: std.mem.Allocator, actual: []const u8, expected_hex: []const u8) !void {
-    const hex = try testutil.hexDump(allocator, actual);
-    defer allocator.free(hex);
-    try testutil.expectBytes(hex, expected_hex);
-}
-
 test "@splat fills wire buffers with the repeated byte" {
     const alloc = std.testing.allocator;
 
@@ -43,19 +36,19 @@ test "@splat fills wire buffers with the repeated byte" {
     // spelling. 16-byte GUID/CMID fields: docs/migration.md §3.1.
     const guid = kms.zeroGuid();
     try std.testing.expectEqual(@as(usize, 16), guid.len);
-    try expectHex(alloc, &guid, "00000000000000000000000000000000");
+    try testutil.expectHex(alloc, &guid, "00000000000000000000000000000000");
 
     // The value must be *written*, not assumed: `**` built a fresh array,
     // whereas `@splat` also assigns over a buffer that already holds data.
     var reused: [16]u8 = @splat(0xFF);
     reused = @splat(0);
-    try expectHex(alloc, &reused, "00000000000000000000000000000000");
+    try testutil.expectHex(alloc, &reused, "00000000000000000000000000000000");
 
     // The non-zero fills the wire tests seed CMIDs, KMS IDs and payloads with.
     var cmid: [16]u8 = @splat(1);
-    try expectHex(alloc, &cmid, "01010101010101010101010101010101");
+    try testutil.expectHex(alloc, &cmid, "01010101010101010101010101010101");
     var kms_id: [16]u8 = @splat(0xFF);
-    try expectHex(alloc, &kms_id, "ffffffffffffffffffffffffffffffff");
+    try testutil.expectHex(alloc, &kms_id, "ffffffffffffffffffffffffffffffff");
 
     // The remaining widths the wire layer fills this way, from the 8-byte
     // dispatch buffer to the 64-byte block. `allEqual` only checks values, so
@@ -72,10 +65,10 @@ test "@splat fills wire buffers with the repeated byte" {
     // AllocHint(32) + ServerFault(0) + Error.Code + Result(0), the three zeros
     // coming from `@splat(0)` — docs/migration.md §3.3.
     const fault = rpc.buildFault(rpc.nca_unk_if);
-    try expectHex(alloc, fault[0..4], "20000000"); // AllocHint = 32
-    try expectHex(alloc, fault[4..8], "00000000"); // ServerFault, from @splat(0)
-    try expectHex(alloc, fault[8..12], "0300011c"); // Error.Code = nca_unk_if, LE
-    try expectHex(alloc, fault[12..16], "00000000"); // Result
+    try testutil.expectHex(alloc, fault[0..4], "20000000"); // AllocHint = 32
+    try testutil.expectHex(alloc, fault[4..8], "00000000"); // ServerFault, from @splat(0)
+    try testutil.expectHex(alloc, fault[8..12], "0300011c"); // Error.Code = nca_unk_if, LE
+    try testutil.expectHex(alloc, fault[12..16], "00000000"); // Result
 }
 
 test {

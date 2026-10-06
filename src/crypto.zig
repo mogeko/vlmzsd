@@ -406,33 +406,23 @@ test "v4 CMAC reference vectors" {
     var mac: Block = undefined;
 
     aesCmacV4(&msg32, &mac);
-    const hex = try testutil.hexDump(alloc, &mac);
-    defer alloc.free(hex);
-    try testutil.expectBytes(hex, "1c3cb37a2a7283b1f2158220eb321c46"); // from upstream C dump_vectors
+    try testutil.expectHex(alloc, &mac, "1c3cb37a2a7283b1f2158220eb321c46"); // from upstream C dump_vectors
 
     aesCmacV4(msg32[0..16], &mac);
-    const hex16 = try testutil.hexDump(alloc, &mac);
-    defer alloc.free(hex16);
-    try testutil.expectBytes(hex16, "2a090d7c1155251ab86445447d060335"); // from upstream C dump_vectors
+    try testutil.expectHex(alloc, &mac, "2a090d7c1155251ab86445447d060335"); // from upstream C dump_vectors
 
     aesCmacV4(msg64[0..20], &mac);
-    const hex20 = try testutil.hexDump(alloc, &mac);
-    defer alloc.free(hex20);
-    try testutil.expectBytes(hex20, "268a68935873a958f7d05c7f3699fb82"); // from upstream C dump_vectors
+    try testutil.expectHex(alloc, &mac, "268a68935873a958f7d05c7f3699fb82"); // from upstream C dump_vectors
 
     aesCmacV4(msg64[0..34], &mac);
-    const hex34 = try testutil.hexDump(alloc, &mac);
-    defer alloc.free(hex34);
-    try testutil.expectBytes(hex34, "ba177194ba0223ab1f4441bfe8a3d782"); // from upstream C dump_vectors
+    try testutil.expectHex(alloc, &mac, "ba177194ba0223ab1f4441bfe8a3d782"); // from upstream C dump_vectors
 }
 
 test "v6 AES reference vector" {
     const alloc = std.testing.allocator;
     const zero: [16]u8 = @splat(0);
     const enc = aesV6EncryptBlock(&zero);
-    const hex = try testutil.hexDump(alloc, &enc);
-    defer alloc.free(hex);
-    try testutil.expectBytes(hex, "8ca59de0c483c04aa7026a22d6dd208e"); // from upstream C dump_vectors
+    try testutil.expectHex(alloc, &enc, "8ca59de0c483c04aa7026a22d6dd208e"); // from upstream C dump_vectors
 }
 
 test "v6 key schedule XOR" {
@@ -458,18 +448,14 @@ test "HMAC-SHA256 reference vector" {
     const data: [32]u8 = @splat(0);
     var out: [32]u8 = undefined;
     hmacSha256(&key, &data, &out);
-    const hex = try testutil.hexDump(alloc, &out);
-    defer alloc.free(hex);
-    try testutil.expectBytes(hex, "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"); // from upstream C dump_vectors
+    try testutil.expectHex(alloc, &out, "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"); // from upstream C dump_vectors
 }
 
 test "v5 AES reference vector" {
     const alloc = std.testing.allocator;
     const zero: [16]u8 = @splat(0);
     const enc = aesEncryptBlock(&aes_key_v5, false, zero);
-    const hex = try testutil.hexDump(alloc, &enc);
-    defer alloc.free(hex);
-    try testutil.expectBytes(hex, "ec7c7e75b1923978eac4b2d2260235d5"); // from upstream C dump_vectors
+    try testutil.expectHex(alloc, &enc, "ec7c7e75b1923978eac4b2d2260235d5"); // from upstream C dump_vectors
 }
 
 test "v6 AES decrypt reference vector" {
@@ -477,9 +463,7 @@ test "v6 AES decrypt reference vector" {
     const zero: [16]u8 = @splat(0);
     const enc = aesEncryptBlock(&aes_key_v6, true, zero);
     const dec = aesDecryptBlock(&aes_key_v6, true, enc);
-    const hex = try testutil.hexDump(alloc, &dec);
-    defer alloc.free(hex);
-    try testutil.expectBytes(hex, "00000000000000000000000000000000"); // round-trip, not a wire vector
+    try testutil.expectHex(alloc, &dec, "00000000000000000000000000000000"); // round-trip, not a wire vector
 }
 
 test "v6 CBC reference vectors" {
@@ -491,14 +475,10 @@ test "v6 CBC reference vectors" {
     const new_len = aesCbcEncrypt(&aes_key_v6, true, &iv, data[0..], 32);
     try std.testing.expectEqual(@as(usize, 48), new_len);
 
-    const enc_hex = try testutil.hexDump(alloc, data[0..48]);
-    defer alloc.free(enc_hex);
-    try testutil.expectBytes(enc_hex, "8ca59de0c483c04aa7026a22d6dd208e43abf3a9a6b76d992a2c6b1732e80c8ca39d3d0e063cefedecf8cc6e09d14eac"); // from upstream C dump_vectors
+    try testutil.expectHex(alloc, data[0..48], "8ca59de0c483c04aa7026a22d6dd208e43abf3a9a6b76d992a2c6b1732e80c8ca39d3d0e063cefedecf8cc6e09d14eac"); // from upstream C dump_vectors
 
     aesCbcDecrypt(&aes_key_v6, true, &iv, data[0..48], 48);
-    const dec_hex = try testutil.hexDump(alloc, data[0..48]);
-    defer alloc.free(dec_hex);
-    try testutil.expectBytes(dec_hex, "000000000000000000000000000000000000000000000000000000000000000010101010101010101010101010101010"); // from upstream C dump_vectors
+    try testutil.expectHex(alloc, data[0..48], "000000000000000000000000000000000000000000000000000000000000000010101010101010101010101010101010"); // from upstream C dump_vectors
 }
 
 test "AesCmacV4 leaves input unchanged" {

@@ -24,6 +24,21 @@ pub fn hexDump(allocator: Allocator, bytes: []const u8) Allocator.Error![]u8 {
     return out;
 }
 
+/// Compare `actual` against the golden lowercase-hex `expected_hex`.
+///
+/// The wrapper for the `hexDump` → `expectBytes` pair the golden-vector tests
+/// use: the expectation stays readable as hex, and a mismatch reports every
+/// differing position (counted in hex characters) with both byte values.
+pub fn expectHex(
+    allocator: Allocator,
+    actual: []const u8,
+    expected_hex: []const u8,
+) (Allocator.Error || error{TestExpectedEqual})!void {
+    const hex = try hexDump(allocator, actual);
+    defer allocator.free(hex);
+    try expectBytes(hex, expected_hex);
+}
+
 fn printDiff(actual: []const u8, expected: []const u8) void {
     std.debug.print("byte mismatch: expected {d} bytes, got {d} bytes\n", .{
         expected.len, actual.len,
@@ -60,4 +75,10 @@ test "hexDump" {
     const hex = try hexDump(alloc, "\xde\xad\xbe\xef");
     defer alloc.free(hex);
     try expectBytes(hex, "deadbeef");
+}
+
+test "expectHex" {
+    const alloc = std.testing.allocator;
+    const bytes = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+    try expectHex(alloc, &bytes, "deadbeef");
 }
