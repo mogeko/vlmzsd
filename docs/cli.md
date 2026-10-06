@@ -225,6 +225,15 @@ printed while nothing has been lost.
 read waits through a cancelable `Io` operation whose deadline the backend owns,
 so the client fails with `error.Timeout` rather than blocking forever on a peer
 that accepted the connection and then went silent. It does **not** bound
-`connect` — Zig 0.16's `std.Io.Threaded` backend still panics on
+`connect` — Zig 0.17's `std.Io.Threaded` backend still panics on
 `ConnectOptions.timeout` ("TODO implement"), so an unreachable host is bounded
 only by the kernel's own SYN timeout.
+
+With `--reconnect-per-request`, each request runs as its own task on the
+`Io.Threaded` pool under a window of **one request per logical CPU** (8 when the
+platform cannot report a count). The window is a thread bound, not a tuning
+knob: a request parked in a read owns a pool thread, and the pool never reclaims
+one, so `--count` must not decide the thread count — `-n 600` against a silent
+peer settles at `min(600, cores) + 1` threads and completes in waves, rather
+than as 600 threads. Without `--reconnect-per-request` all requests share one
+keep-alive connection and are sent sequentially, so there is nothing to window.

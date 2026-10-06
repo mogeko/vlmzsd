@@ -344,7 +344,7 @@ test "concurrent producers keep per-producer order" {
 
     // Each producer's lines must be observed in increasing sequence order;
     // that is what pins FIFO arrival order under contention.
-    var next: [producers]usize = [_]usize{0} ** producers;
+    var next: [producers]usize = @splat(0);
     var batch: [16]Slot = undefined;
     var total: usize = 0;
     while (true) {

@@ -503,7 +503,7 @@ fn handleShutdown(sig: std.posix.SIG) callconv(.c) void {
         // a second signal usually exists because the log sink is blocked, and a
         // `write` would block on that same sink — the exit code (`128 + signum`)
         // is the only channel still guaranteed to work.
-        std.c._exit(128 + @as(c_int, @intCast(@intFromEnum(sig))));
+        std.c._exit(128 + @as(c_int, @intCast(@backingInt(sig))));
     }
     // Wake the accept loop: write one byte. A flag alone would not work —
     // std.posix.poll swallows EINTR and keeps blocking.

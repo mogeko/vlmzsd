@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ARG TARGETARCH
 ARG MINISIGN_PUBKEY="RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
-ARG ZIG_VERSION="0.16.0"
+ARG ZIG_VERSION="0.17.0"
 
 WORKDIR /tmp/
 
@@ -47,7 +47,7 @@ COPY ./README.md /opt/app/README.md
 # or `$(git rev-parse HEAD)`, since `build.zig` trims it to 7 characters.
 ARG VLMZSD_GIT_SHA
 
-RUN zig build vlmzsd vlmzs -Dcpu=baseline -Doptimize=ReleaseSafe \
+RUN zig build vlmzsd vlmzs -Dcpu=baseline -Doptimize=safe \
         -Dgit-sha="${VLMZSD_GIT_SHA}" -Dno-embedded-data
 
 FROM gcr.io/distroless/base-nossl-debian13:latest

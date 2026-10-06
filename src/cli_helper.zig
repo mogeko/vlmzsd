@@ -346,7 +346,7 @@ pub const Logger = struct {
     }
 
     fn emit(self: *Logger, level: Level, comptime fmt: []const u8, args: anytype) void {
-        if (@intFromEnum(level) < @intFromEnum(self.min_level)) return;
+        if (@backingInt(level) < @backingInt(self.min_level)) return;
 
         // Format on the calling thread so the queue's critical section only has
         // to copy. The timestamp is taken here, at call time: it records when
@@ -552,7 +552,7 @@ fn writeTimestamp(w: *std.Io.Writer, io: Io) void {
     var buf: [20]u8 = undefined;
     const ts = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         @as(u32, yad.year),
-        @as(u32, @intFromEnum(mad.month)),
+        @as(u32, @backingInt(mad.month)),
         @as(u32, mad.day_index) + 1,
         @as(u32, @intCast(day_secs / 3600)),
         @as(u32, @intCast((day_secs % 3600) / 60)),
@@ -569,11 +569,18 @@ pub fn nowUnix(io: Io) i64 {
 }
 
 /// A non-cryptographic seed mixing the realtime clock with stack (ASLR) entropy.
+/// PRNG seed for a process, drawn from the backend's entropy source.
+///
+/// `Io.random` is the right level here rather than `randomSecure`: it is
+/// thread-safe, stateful, needs no error handling, and is seeded by
+/// `randomSecure` where the platform has an entropy source — with its own
+/// fallback where it does not. Deriving the seed from the clock and a stack
+/// address (`@intFromPtr(&now)`) instead would make it predictable and
+/// repeatable across processes started in the same nanosecond.
 pub fn makeSeed(io: Io) u64 {
-    const now = Io.Clock.now(.real, io);
-    const nanos: u128 = @intCast(now.nanoseconds);
-    const ptr_entropy: u64 = @truncate(@as(u128, @intCast(@intFromPtr(&now))));
-    return @as(u64, @truncate(nanos)) ^ ptr_entropy;
+    var bytes: [8]u8 = undefined;
+    io.random(&bytes);
+    return std.mem.readInt(u64, &bytes, .little);
 }
 
 /// FHS/XDG system search directories for external `.kmd` data files, highest
@@ -602,7 +609,7 @@ pub const FhsKmd = struct {
 pub fn loadFhsKmd(io: Io, gpa: Allocator, environ: std.process.Environ) !?FhsKmd {
     // 1. User-level: $HOME/.local/share/vlmzsd
     if (std.process.Environ.getPosix(environ, "HOME")) |home| {
-        const dir = try std.fmt.allocPrint(gpa, "{s}/.local/share/vlmzsd", .{home});
+        const dir = try gpa.print("{s}/.local/share/vlmzsd", .{home});
         defer gpa.free(dir);
         if (try findLastKmd(io, gpa, dir)) |name| {
             defer gpa.free(name);
@@ -644,7 +651,7 @@ fn findLastKmd(io: Io, gpa: Allocator, dir_path: []const u8) !?[]u8 {
 
 /// Load the `.kmd` file at `dir_path/name`.
 fn loadKmdFrom(io: Io, gpa: Allocator, dir_path: []const u8, name: []const u8) !FhsKmd {
-    const full_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_path, name });
+    const full_path = try gpa.print("{s}/{s}", .{ dir_path, name });
     errdefer gpa.free(full_path);
     const data = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, full_path, gpa, .unlimited);
     return .{ .path = full_path, .data = data };

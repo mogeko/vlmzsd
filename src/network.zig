@@ -314,7 +314,7 @@ pub const ClientOptions = struct {
     use_btfn: bool = false,
     multiplexed: bool = false,
     /// Read source and deadline for the BIND reply and for every RESPONSE read.
-    /// The client has no *connect* deadline: `std.Io.Threaded` (0.16) still
+    /// The client has no *connect* deadline: `std.Io.Threaded` (0.17) still
     /// panics on `ConnectOptions.timeout` ("TODO implement"), so a blackholed
     /// host is bounded only by the kernel's own SYN timeout.
     idle: ReadOptions = .{},
@@ -1097,9 +1097,10 @@ test "client bind handshake" {
 
 /// Test helper: a TCP connection whose ends are both owned by the test, so
 /// sending from the client end makes the accepted end readable. (Not
-/// `Io.net.Socket.createPair`: its default `family = .ip4` socketpair is
-/// Linux-only and aborts on macOS.) This module is built without libc — a
-/// `std.c` reference fails to compile on Linux — so no pipe either.
+/// `Io.net.Socket.createPair`: its only families are `.ip4`/`.ip6`, and
+/// `socketpair(2)` implements neither — errno 95 on Linux, 102 on macOS.) This
+/// module is built without libc — a `std.c` reference fails to compile on Linux —
+/// so no pipe either.
 const StreamPair = struct {
     server: Io.net.Server,
     /// The end the test reads from.

@@ -49,7 +49,7 @@ fn errOut(io: Io, comptime fmt: []const u8, args: anytype) void {
 fn deriveOutputPath(gpa: Allocator, input: []const u8, reverse: bool) ![]u8 {
     const ext = if (reverse) ".json" else ".kmd";
     const stem = std.fs.path.stem(input);
-    return std.fmt.allocPrint(gpa, "{s}{s}", .{ stem, ext });
+    return gpa.print("{s}{s}", .{ stem, ext });
 }
 
 fn readStdin(io: Io, gpa: Allocator) ![]u8 {

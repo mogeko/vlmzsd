@@ -28,7 +28,7 @@ The server runs in the foreground and logs to stdout.
 
 ## Build from source
 
-Requires [Zig](https://ziglang.org/download) `>= 0.16.0`.
+Requires [Zig](https://ziglang.org/download) `>= 0.17.0`.
 
 ```sh
 git clone https://github.com/mogeko/vlmzsd.git
@@ -51,7 +51,7 @@ library module — no `std.Io`, no libc. Full details in
 [docs/library.md](./docs/library.md).
 
 ```sh
-zig fetch --save git+https://github.com/mogeko/vlmzsd.git#v0.4.3
+zig fetch --save git+https://github.com/mogeko/vlmzsd.git#v0.5.0
 ```
 
 ## Documentation

@@ -247,7 +247,7 @@ pub fn buildBindResponse(
 
         var ack_result: u16 = bind_nack;
         var ack_reason: u16 = if (is_interface) syntax_unsupported else abstract_syntax_unsupported;
-        var result_syntax: Guid = [_]u8{0} ** 16;
+        var result_syntax: Guid = @splat(0);
         var syntax_version: u32 = 0;
 
         if (is_interface and !ndr64_possible and std.mem.eql(u8, transfer_syntax, &transfer_syntax_ndr32)) {
@@ -305,7 +305,7 @@ pub const DispatchResult = struct {
 /// Build the 16-byte FAULT response body for an NCA error. The caller pairs it
 /// with a FAULT header whose `FragLength` is `header_size + 16 = 32`.
 pub fn buildFault(nca_error: u32) [16]u8 {
-    var buf = [_]u8{0} ** 16;
+    var buf: [16]u8 = @splat(0);
     writeLe(u32, &buf, 0, 32); // AllocHint
     writeLe(u32, &buf, 8, nca_error); // Error.Code
     return buf;
@@ -667,7 +667,7 @@ test "bind NDR32-only negotiation" {
 test "kms request wrap (NDR32)" {
     const alloc = std.testing.allocator;
 
-    var payload = [_]u8{0xAB} ** 32;
+    var payload: [32]u8 = @splat(0xAB);
     const wrapped = try wrapKmsRequest(alloc, &payload, false, 2);
     defer alloc.free(wrapped);
 
@@ -686,7 +686,7 @@ test "kms request wrap (NDR32)" {
 test "kms request wrap (NDR64)" {
     const alloc = std.testing.allocator;
 
-    var payload = [_]u8{0xCD} ** 40;
+    var payload: [40]u8 = @splat(0xCD);
     const wrapped = try wrapKmsRequest(alloc, &payload, true, 3);
     defer alloc.free(wrapped);
 
@@ -891,7 +891,7 @@ test "too-short request disconnects" {
     // Body shorter than request32_fixed_size (16) → disconnect — docs/migration.md §5.
     try std.testing.expectError(error.InvalidRequest, dispatchKmsRequest(
         alloc,
-        &[_]u8{0} ** 8,
+        &@as([8]u8, @splat(0)),
         &negotiation,
         &cfg,
         prng.random(),
@@ -909,7 +909,7 @@ test "unknown context returns FAULT" {
     var prng: std.Random.DefaultPrng = .init(0);
 
     // context_id matches neither negotiated id — docs/migration.md §5.
-    var body: [16]u8 = [_]u8{0} ** 16;
+    var body: [16]u8 = @splat(0);
     std.mem.writeInt(u16, body[4..6], 0xEEEE, .little);
     const dispatch = try dispatchKmsRequest(alloc, &body, &negotiation, &cfg, prng.random(), 1_700_000_000);
     switch (dispatch.kind) {

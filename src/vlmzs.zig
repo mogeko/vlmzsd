@@ -224,7 +224,7 @@ fn formatUtc(unix: i64, buf: []u8) []const u8 {
     const day_secs: u64 = secs % 86400;
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
         @as(u32, yad.year),
-        @as(u32, @intFromEnum(mad.month)) + 1,
+        @as(u32, @backingInt(mad.month)) + 1,
         @as(u32, mad.day_index) + 1,
         @as(u32, @intCast(day_secs / 3600)),
         @as(u32, @intCast((day_secs % 3600) / 60)),
@@ -681,9 +681,22 @@ fn sendRequestOn(
     }
 }
 
+/// A dispatch failure is fatal for a one-shot client, but the requests already
+/// in flight are joined before exiting: `Group.cancel` asks them to stop — every
+/// wait inside `sendRequest` (connect, BIND, response) is a cancelation point —
+/// and waits for them, so the process never leaves a task mid-write. Never
+/// returns.
+fn dispatchFailed(out: *Output, io: Io, group: *Io.Group, err: anyerror) noreturn {
+    group.cancel(io);
+    out.eprint("failed to dispatch request: {s}\n", .{@errorName(err)});
+    std.process.exit(1);
+}
+
 /// One activation request dispatched as a pooled task (via `Group.concurrent`).
 /// Derives its own PRNG from `seed` so concurrent requests never share PRNG
-/// state; failures are reported here rather than propagated.
+/// state; failures are reported here rather than propagated. `permits` is the
+/// dispatcher's window: the slot is returned on *every* exit path, so a task
+/// that fails or is dropped cannot starve later dispatches.
 fn sendRequestTask(
     gpa: Allocator,
     io: Io,
@@ -692,12 +705,35 @@ fn sendRequestTask(
     seed: u64,
     out: *Output,
     data: *const kmsdata.KmsData,
+    permits: *Io.Semaphore,
 ) void {
+    defer permits.post(io);
     var prng: std.Random.DefaultPrng = .init(seed);
-    sendRequest(gpa, io, opts, base, prng.random(), out, data) catch |e| {
-        out.eprint("request failed: {s}\n", .{@errorName(e)});
+    sendRequest(gpa, io, opts, base, prng.random(), out, data) catch |e| switch (e) {
+        // Aborted, not failed: this is `dispatchFailed`'s cancel, and the
+        // dispatch error it is already reporting says why.
+        error.Canceled => {},
+        else => out.eprint("request failed: {s}\n", .{@errorName(e)}),
     };
 }
+
+/// How many `--reconnect-per-request` requests may be in flight at once.
+///
+/// One request parked in a read owns one pooled thread and the pool never
+/// reclaims a worker, so this is a thread bound, not a tuning knob: thread count
+/// settles at `min(--count, parallelism()) + 1`, and a larger `--count`
+/// completes in waves instead of one thread per request. The rule is the one
+/// `Io.Threaded` uses to size its own `async_limit` (the logical CPU count) —
+/// `std.process.Init` does not expose that option, so the bound has to be ours.
+fn parallelism() usize {
+    const count = std.Thread.getCpuCount() catch fallback_parallelism;
+    // A zero here would park the dispatcher on a semaphore nothing can post.
+    std.debug.assert(count >= 1);
+    return count;
+}
+
+/// Window used when the platform cannot report a CPU count.
+const fallback_parallelism: usize = 8;
 
 /// Send `--count` requests over a single reused connection (keep-alive).
 /// Requests are sequential because one connection carries one in-flight RPC.
@@ -854,17 +890,28 @@ pub fn main(init: std.process.Init) !void {
         // Each request gets its own connection; dispatch them in parallel onto
         // the Io.Threaded pool. Each request builds its base and derives its own
         // PRNG before submission, so concurrent tasks never share PRNG state.
+        //
+        // `--count` must not decide the thread count: a request parked in a
+        // read owns one pool thread, the pool never reclaims one, and
+        // `std.process.Init` does not expose `concurrent_limit` — so `-T -n 600`
+        // against a silent peer would be 600 threads. `permits` is the window
+        // (one slot per core, the same rule the backend uses for its own
+        // `async_limit`); the dispatcher blocks on it, so the bound is ours.
         var group: Io.Group = .init;
+        var permits: Io.Semaphore = .{ .permits = parallelism() };
         var i: usize = 0;
         while (i < opts.count) : (i += 1) {
             const seed = prng.random().int(u64);
             var req_prng: std.Random.DefaultPrng = .init(seed);
             const base = buildRequestBase(&opts, &data, sku_index, req_prng.random(), init.io);
+            permits.wait(init.io) catch |e| {
+                dispatchFailed(&out, init.io, &group, e);
+            };
             group.concurrent(init.io, sendRequestTask, .{
-                init.gpa, init.io, &opts, base, seed, &out, &data,
+                init.gpa, init.io, &opts, base, seed, &out, &data, &permits,
             }) catch |e| {
-                out.eprint("failed to dispatch request: {s}\n", .{@errorName(e)});
-                std.process.exit(1);
+                permits.post(init.io);
+                dispatchFailed(&out, init.io, &group, e);
             };
         }
         group.await(init.io) catch |e| {
