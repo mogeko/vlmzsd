@@ -823,11 +823,11 @@ pub fn main(init: std.process.Init) !void {
     };
     defer opts.deinit(init.gpa);
 
-    // Emit the deprecation notices while `min_level` is still its `.info`
-    // default, so they are not dropped by a quiet resolved level.
+    log.min_level = opts.log_level;
+    // Deprecation notices are ordinary `warn` lines and obey the resolved
+    // level: `-q` (warn) shows them, `-qq` (err) silences them.
     if (opts.legacy_verbose_present) log.warn("VLMZSD_VERBOSE is deprecated; use VLMZSD_LOG_LEVEL instead", .{});
     if (opts.legacy_quiet_present) log.warn("VLMZSD_QUIET is deprecated; use VLMZSD_LOG_LEVEL instead", .{});
-    log.min_level = opts.log_level;
 
     // Load the KMS data: explicit path (--data / VLMZSD_DATA) → FHS/XDG search
     // → embedded default.
