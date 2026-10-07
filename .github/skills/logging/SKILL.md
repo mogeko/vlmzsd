@@ -1,6 +1,6 @@
 ---
 name: logging
-description: 'Design and review log statements in the vlmzsd codebase using community best practices and the project Logger contract (Level enum, UTC ISO-8601 timestamp, stdout/stderr split, min_level filtering). Use when adding, changing, or reviewing log calls, choosing a log level, deciding what context to include, or auditing log noise. Keywords: logging, log level, best practice, Logger, debug, info, warn, err, timestamp, stdout, stderr, log message, structured logging.'
+description: 'Design and review log statements in the vlmzsd codebase using community best practices and the project Logger contract (Level enum, UTC ISO-8601 timestamp, stdout/stderr split, min_level filtering). Use when adding, changing, or reviewing log calls, choosing a log level, deciding what context to include, or auditing log noise. Keywords: logging, log level, best practice, Logger, trace, debug, info, warn, err, timestamp, stdout, stderr, log message, structured logging.'
 argument-hint: '<scope: main|vlmzs|network|kms|rpc|all>'
 ---
 
@@ -11,12 +11,14 @@ Logger contract with widely-agreed logging best practices.
 
 ## The Logger Contract (source of truth: `src/cli_helper.zig`, `docs/cli.md`)
 
-- **Levels** (most→least verbose): `debug` < `info` < `warn` < `err`. No `trace` — do not add one
-  unless a concrete need appears.
-- **Destination**: `debug`/`info` → stdout; `warn`/`err` → stderr (Unix convention).
+- **Levels** (most→least verbose): `trace` < `debug` < `info` < `warn` < `err`. `trace` is for
+  detail that is only meaningful while chasing a specific problem; most diagnostics are `debug`.
+- **Destination**: `trace`/`debug`/`info` → stdout; `warn`/`err` → stderr (Unix convention).
 - **Format**: every line is prefixed with a UTC ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`); the
   format is fixed and has no CLI surface.
-- **Filtering**: `min_level`; `--verbose` → `.debug`, `--quiet` → `.warn`, default `.info`.
+- **Filtering**: `min_level`, default `.info`. The level comes from the repeatable `-v`/`-q` flags
+  (`-v` `.debug`, `-vv`+ `.trace`; `-q` `.warn`, `-qq`+ `.err`; any `-q` wins over `-v`), from
+  `VLMZSD_LOG_LEVEL`, or — deprecated — from `VLMZSD_VERBOSE`/`VLMZSD_QUIET`.
 - **Delivery**: asynchronous. A log call formats the line on the calling thread and hands it to a
   bounded, **lossy** FIFO (`src/line_queue.zig`); a dedicated writer task owns the blocking
   `write`/`flush`.
@@ -47,6 +49,7 @@ Logger contract with widely-agreed logging best practices.
 
 | Level | Use for | Example |
 |---|---|---|
+| `trace` | Verbose detail meaningful only while chasing a specific problem; off by default | per-packet field dumps |
 | `debug` | Diagnostic detail useful when troubleshooting; off by default | per-connection accept/reject, negotiation detail |
 | `info` | Normal, notable runtime events | "listening on port", activation result |
 | `warn` | Recoverable anomaly that does not stop the service | failed accept, malformed config entry, client error |

@@ -63,8 +63,10 @@ source linked above).
 - No global state: pass context / allocator / RNG explicitly.
 - CLI: two binaries, no config file — `docs/cli.md` is the authoritative spec. Three-tier
   precedence `default < VLMZSD_*/env < CLI`.
-- Logging: fixed format with a UTC timestamp; `debug`/`info` → stdout, `warn`/`err` → stderr.
-  `--verbose` enables `debug`, `--quiet` drops `info` (see `docs/cli.md`). Lines are handed to a
+- Logging: fixed format with a UTC timestamp; `trace`/`debug`/`info` → stdout, `warn`/`err` → stderr.
+  `--verbose`/`--quiet` are repeatable (`-v` `debug`, `-vv` `trace`; `-q` `warn`, `-qq` `err`; any
+  `-q` wins over `-v`); `VLMZSD_LOG_LEVEL` selects the level directly, and the deprecated
+  `VLMZSD_VERBOSE`/`VLMZSD_QUIET` warn when present (see `docs/cli.md`). Lines are handed to a
   bounded, **lossy** queue (`src/line_queue.zig`) and written by a dedicated writer task; a full
   queue drops the line (counted, and reported on stderr as a per-period delta when the writer goes
   idle and as the run's total at shutdown) instead of blocking a worker. Shutdown order

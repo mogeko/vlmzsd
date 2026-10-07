@@ -50,6 +50,11 @@ Precedence, highest to lowest:
   (case-insensitive).
 - Repeatable options (`--listen`, `--epid`) are comma-separated in their
   environment variable (e.g. `VLMZSD_LISTEN="0.0.0.0,::"`).
+- `VLMZSD_LOG_LEVEL` is the one environment variable with no matching CLI flag:
+  it selects the log level (`trace`/`debug`/`info`/`warn`/`err`,
+  case-insensitive) directly. The legacy boolean `VLMZSD_VERBOSE`/`VLMZSD_QUIET`
+  are still accepted but deprecated — the server warns on stderr when either is
+  present — and `VLMZSD_LOG_LEVEL` takes precedence over them.
 
 ## 4. Value syntax
 
@@ -156,9 +161,15 @@ file.
 | Option | Short | Default | Env var | Notes |
 |---|---|---|---|---|
 | `--pid-file <file>` | | — | `VLMZSD_PID_FILE` | write PID to file |
-| `--verbose` | `-v` | off | `VLMZSD_VERBOSE` | enable `debug` logging |
-| `--quiet` | `-q` | off | `VLMZSD_QUIET` | drop `info` logging |
+| `--verbose` | `-v` | off | — | increase verbosity; repeatable — `-v` `debug`, `-vv`+ `trace` |
+| `--quiet` | `-q` | off | — | decrease verbosity; repeatable — `-q` `warn`, `-qq`+ `err` |
 | `--quiet-loopback` | | off | `VLMZSD_QUIET_LOOPBACK` | suppress debug logs from loopback (localhost) clients |
+
+The log level is set by `VLMZSD_LOG_LEVEL` (`trace`/`debug`/`info`/`warn`/`err`,
+case-insensitive, default `info`) or by the repeatable `-v`/`-q` flags. The
+three-tier precedence is `-v`/`-q` flags > `VLMZSD_LOG_LEVEL` > deprecated
+`VLMZSD_VERBOSE`/`VLMZSD_QUIET` > default; any `-q` wins over `-v`. An
+unrecognized `VLMZSD_LOG_LEVEL` is a fatal configuration error.
 
 Signals: the first `SIGINT`/`SIGTERM` shuts the server down gracefully — it stops accepting, closes
 the live connections, and drains the log before exiting with status `0`. A **second** signal (and any
@@ -170,9 +181,14 @@ cannot be caught.
 ### Logging
 
 One line per event: a UTC ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`), a level
-prefix, and the message. `debug`/`info` go to **stdout**, `warn`/`err` to
-**stderr** (Unix convention); `--verbose` adds `debug` lines, `--quiet` drops
-`info` lines. `warn`/`err` are never suppressed.
+prefix, and the message. Levels, most to least verbose: `trace`, `debug`,
+`info` (default), `warn`, `err`. `trace`/`debug`/`info` go to **stdout**,
+`warn`/`err` to **stderr** (Unix convention). The level is chosen by the
+repeatable `-v`/`-q` flags (`-v` `debug`, `-vv`+ `trace`; `-q` `warn`, `-qq`+
+`err`; any `-q` wins over `-v`), by `VLMZSD_LOG_LEVEL`, or — deprecated — by
+`VLMZSD_VERBOSE`/`VLMZSD_QUIET` (see the Process table above). Lines below the
+chosen level are dropped before formatting. `err` is never suppressed; `warn`
+is dropped when the level is `err` (`-qq`).
 
 This is also the whole feature: output goes to the inherited stdout/stderr and
 nothing else happens. No log file, no rotation, no format or level options —

@@ -70,8 +70,8 @@ const vlmzsd_opts = [_]cli_helper.Opt{
     .{ .name = "no-btfn", .group = "Protocol", .desc = "Disable bind-time feature negotiation (default on)" },
     .{ .name = "disconnect-per-request", .group = "Protocol", .desc = "Disconnect after each request" },
     .{ .name = "pid-file", .kind = .str, .hint = "file", .group = "Process", .desc = "Write PID to file" },
-    .{ .name = "verbose", .short = 'v', .group = "Process", .desc = "Verbose logging" },
-    .{ .name = "quiet", .short = 'q', .group = "Process", .desc = "Quiet logging (warnings/errors only)" },
+    .{ .name = "verbose", .short = 'v', .group = "Process", .desc = "Increase log verbosity, repeatable (-v debug, -vv trace)", .repeatable = true },
+    .{ .name = "quiet", .short = 'q', .group = "Process", .desc = "Decrease log verbosity, repeatable (-q warn, -qq err)", .repeatable = true },
     .{ .name = "quiet-loopback", .group = "Process", .desc = "Suppress debug logs for loopback (localhost) clients" },
 };
 
@@ -97,8 +97,12 @@ const ServerOptions = struct {
     btfn: bool = true,
     disconnect_per_request: bool = false,
     pid_file: ?[]const u8 = null,
-    verbose: bool = false,
-    quiet: bool = false,
+    log_level: cli_helper.Level = .info,
+    /// Set when the deprecated `VLMZSD_VERBOSE`/`VLMZSD_QUIET` is present in
+    /// the environment, so `main` can warn even when a higher-priority source
+    /// overrides it.
+    legacy_verbose_present: bool = false,
+    legacy_quiet_present: bool = false,
     quiet_loopback: bool = false,
 
     /// gpa-allocated backing for `listen`/`epids` (only when split from env).
@@ -126,6 +130,35 @@ fn resolveFlag(
     if (cli_flag) return !default;
     if (envGet(env, env_name)) |s| return cli_helper.parseBool(s);
     return default;
+}
+
+/// Resolve the log level across the three-tier sources. Repeatable `-v`/`-q`
+/// are the CLI surface; `VLMZSD_LOG_LEVEL` replaces the deprecated
+/// `VLMZSD_VERBOSE`/`VLMZSD_QUIET`, which remain as a lower-priority fallback.
+/// Any `-q` wins over `-v`: `-q` → warn, `-qq`+ → err; `-v` → debug, `-vv`+ →
+/// trace.
+fn resolveLogLevel(
+    res: *const cli_helper.Result,
+    env: *const EnvironMap,
+    legacy_verbose_present: *bool,
+    legacy_quiet_present: *bool,
+) !cli_helper.Level {
+    legacy_verbose_present.* = envGet(env, "VLMZSD_VERBOSE") != null;
+    legacy_quiet_present.* = envGet(env, "VLMZSD_QUIET") != null;
+
+    const quiet_count = res.flagCount("quiet");
+    if (quiet_count > 0) return if (quiet_count == 1) .warn else .err;
+    const verbose_count = res.flagCount("verbose");
+    if (verbose_count > 0) return if (verbose_count == 1) .debug else .trace;
+
+    if (envGet(env, "VLMZSD_LOG_LEVEL")) |s| return cli_helper.parseLevel(s);
+
+    // Deprecated variables keep their historical quiet-beats-verbose rule.
+    const quiet = if (envGet(env, "VLMZSD_QUIET")) |s| try cli_helper.parseBool(s) else false;
+    if (quiet) return .warn;
+    const verbose = if (envGet(env, "VLMZSD_VERBOSE")) |s| try cli_helper.parseBool(s) else false;
+    if (verbose) return .debug;
+    return .info;
 }
 
 fn resolveInt(
@@ -231,8 +264,7 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, res: *const cli_helper
     opts.disconnect_per_request = try resolveFlag(res.hasFlag("disconnect-per-request"), env, "VLMZSD_DISCONNECT_PER_REQUEST", false);
 
     opts.pid_file = resolveStr(res.get("pid-file"), env, "VLMZSD_PID_FILE", null);
-    opts.verbose = try resolveFlag(res.hasFlag("verbose"), env, "VLMZSD_VERBOSE", false);
-    opts.quiet = try resolveFlag(res.hasFlag("quiet"), env, "VLMZSD_QUIET", false);
+    opts.log_level = try resolveLogLevel(res, env, &opts.legacy_verbose_present, &opts.legacy_quiet_present);
     opts.quiet_loopback = try resolveFlag(res.hasFlag("quiet-loopback"), env, "VLMZSD_QUIET_LOOPBACK", false);
 
     return opts;
@@ -790,7 +822,12 @@ pub fn main(init: std.process.Init) !void {
         fatal(&log, init.io, "invalid configuration: {s}", .{@errorName(e)});
     };
     defer opts.deinit(init.gpa);
-    log.min_level = if (opts.quiet) .warn else if (opts.verbose) .debug else .info;
+
+    // Emit the deprecation notices while `min_level` is still its `.info`
+    // default, so they are not dropped by a quiet resolved level.
+    if (opts.legacy_verbose_present) log.warn("VLMZSD_VERBOSE is deprecated; use VLMZSD_LOG_LEVEL instead", .{});
+    if (opts.legacy_quiet_present) log.warn("VLMZSD_QUIET is deprecated; use VLMZSD_LOG_LEVEL instead", .{});
+    log.min_level = opts.log_level;
 
     // Load the KMS data: explicit path (--data / VLMZSD_DATA) → FHS/XDG search
     // → embedded default.

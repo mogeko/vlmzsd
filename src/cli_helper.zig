@@ -42,7 +42,9 @@ pub const ParseError = error{
 /// with its own semantic parsers (duration / GUID / integer width).
 pub const Result = struct {
     allocator: Allocator,
-    flags: std.StringHashMap(void),
+    /// Flag occurrences, not just presence, so a repeatable flag (`-vv`) can
+    /// select a level. `hasFlag` is `count > 0`.
+    flags: std.StringHashMap(u32),
     values: std.StringHashMap([][]const u8),
     positionals: std.ArrayList([]const u8),
 
@@ -56,6 +58,12 @@ pub const Result = struct {
 
     pub fn hasFlag(self: *const Result, name: []const u8) bool {
         return self.flags.contains(name);
+    }
+
+    /// Occurrence count for a flag (0 when absent). Repeatable flags use this
+    /// to translate repetition into a level.
+    pub fn flagCount(self: *const Result, name: []const u8) u32 {
+        return self.flags.get(name) orelse 0;
     }
 
     /// Last value for a single-value option (repeated specs: last wins).
@@ -94,12 +102,19 @@ fn appendValue(res: *Result, opt: *const Opt, value: []const u8) ParseError!void
     gop.value_ptr.* = new;
 }
 
+/// Record one occurrence of a flag. Saturating, so a pathological `-vvvv…`
+/// cannot wrap the count.
+fn bumpFlag(res: *Result, name: []const u8) ParseError!void {
+    const gop = try res.flags.getOrPut(name);
+    gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* +| 1 else 1;
+}
+
 /// Parse `args` against `opts`. Supports `--long`, `--long=value`,
 /// `--long value`, `-s`, `-svalue`, `--` terminator, and positionals.
 pub fn parse(allocator: Allocator, opts: []const Opt, args: []const []const u8) ParseError!Result {
     var res = Result{
         .allocator = allocator,
-        .flags = std.StringHashMap(void).init(allocator),
+        .flags = std.StringHashMap(u32).init(allocator),
         .values = std.StringHashMap([][]const u8).init(allocator),
         .positionals = std.ArrayList([]const u8).empty,
     };
@@ -124,7 +139,7 @@ pub fn parse(allocator: Allocator, opts: []const Opt, args: []const []const u8) 
             } else {
                 const opt = findLong(opts, body) orelse return error.UnknownOption;
                 if (opt.kind == .flag) {
-                    try res.flags.put(opt.name, {});
+                    try bumpFlag(&res, opt.name);
                 } else {
                     i += 1;
                     if (i >= args.len) return error.MissingValue;
@@ -132,15 +147,24 @@ pub fn parse(allocator: Allocator, opts: []const Opt, args: []const []const u8) 
                 }
             }
         } else if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
-            const opt = findShort(opts, arg[1]) orelse return error.UnknownOption;
-            if (opt.kind == .flag) {
-                try res.flags.put(opt.name, {});
-            } else if (arg.len > 2) {
-                try appendValue(&res, opt, arg[2..]);
-            } else {
-                i += 1;
-                if (i >= args.len) return error.MissingValue;
-                try appendValue(&res, opt, args[i]);
+            // Short flags may be clustered (`-vv`, `-vq`), so count every flag
+            // in the cluster. A value option ends it, taking the rest of the arg
+            // (`-n3`) or, when the cluster ends there, the next argument.
+            var j: usize = 1;
+            while (j < arg.len) : (j += 1) {
+                const opt = findShort(opts, arg[j]) orelse return error.UnknownOption;
+                if (opt.kind == .flag) {
+                    try bumpFlag(&res, opt.name);
+                    continue;
+                }
+                if (j + 1 < arg.len) {
+                    try appendValue(&res, opt, arg[j + 1 ..]);
+                } else {
+                    i += 1;
+                    if (i >= args.len) return error.MissingValue;
+                    try appendValue(&res, opt, args[i]);
+                }
+                break;
             }
         } else {
             try res.positionals.append(res.allocator, arg);
@@ -241,6 +265,22 @@ pub fn parseBool(str: []const u8) error{InvalidBool}!bool {
     return error.InvalidBool;
 }
 
+/// Parse a level name (`trace`/`debug`/`info`/`warn`/`err`), case-insensitive.
+/// Drives `VLMZSD_LOG_LEVEL`; a bad value is a configuration error.
+pub fn parseLevel(str: []const u8) error{InvalidLevel}!Level {
+    const known = [_]struct { name: []const u8, level: Level }{
+        .{ .name = "trace", .level = .trace },
+        .{ .name = "debug", .level = .debug },
+        .{ .name = "info", .level = .info },
+        .{ .name = "warn", .level = .warn },
+        .{ .name = "err", .level = .err },
+    };
+    for (known) |entry| {
+        if (std.ascii.eqlIgnoreCase(str, entry.name)) return entry.level;
+    }
+    return error.InvalidLevel;
+}
+
 fn hexVal(c: u8) error{InvalidGuid}!u8 {
     return switch (c) {
         '0'...'9' => c - '0',
@@ -274,6 +314,7 @@ pub fn parseGuid(str: []const u8) error{InvalidGuid}![16]u8 {
 
 /// Log level, from most to least verbose.
 pub const Level = enum {
+    trace,
     debug,
     info,
     warn,
@@ -381,6 +422,10 @@ pub const Logger = struct {
         if (!self.queue.tryPush(self.io, bytes, to_err)) {
             _ = self.dropped.fetchAdd(1, .monotonic);
         }
+    }
+
+    pub fn trace(self: *Logger, comptime fmt: []const u8, args: anytype) void {
+        self.emit(.trace, fmt, args);
     }
 
     pub fn debug(self: *Logger, comptime fmt: []const u8, args: anytype) void {
@@ -526,6 +571,7 @@ pub const Logger = struct {
 
 fn levelLabel(level: Level) []const u8 {
     return switch (level) {
+        .trace => "trace: ",
         .debug => "debug: ",
         .info => "",
         .warn => "warning: ",
@@ -679,6 +725,16 @@ test "parseBool" {
     try std.testing.expectError(error.InvalidBool, parseBool("maybe"));
 }
 
+test "parseLevel" {
+    try std.testing.expectEqual(Level.trace, try parseLevel("trace"));
+    try std.testing.expectEqual(Level.debug, try parseLevel("DEBUG"));
+    try std.testing.expectEqual(Level.info, try parseLevel("Info"));
+    try std.testing.expectEqual(Level.warn, try parseLevel("WARN"));
+    try std.testing.expectEqual(Level.err, try parseLevel("err"));
+    try std.testing.expectError(error.InvalidLevel, parseLevel("loud"));
+    try std.testing.expectError(error.InvalidLevel, parseLevel(""));
+}
+
 test "parseGuid" {
     const g = try parseGuid("00112233-4455-6677-8899-aabbccddeeff");
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff }, &g);
@@ -737,6 +793,28 @@ test "parse errors" {
     try std.testing.expectError(error.FlagTakesNoValue, parse(alloc, &test_opts, &.{"--verbose=1"}));
 }
 
+test "short flags cluster and count" {
+    const alloc = std.testing.allocator;
+    const opts = [_]Opt{
+        .{ .name = "verbose", .short = 'v', .repeatable = true },
+        .{ .name = "quiet", .short = 'q', .repeatable = true },
+        .{ .name = "count", .short = 'n', .kind = .int, .hint = "u32" },
+    };
+
+    var res = try parse(alloc, &opts, &.{ "-vvq", "-v" });
+    defer res.deinit();
+    try std.testing.expectEqual(@as(u32, 3), res.flagCount("verbose"));
+    try std.testing.expectEqual(@as(u32, 1), res.flagCount("quiet"));
+    try std.testing.expect(res.hasFlag("verbose"));
+    try std.testing.expectEqual(@as(u32, 0), res.flagCount("absent"));
+
+    // A value option ends the cluster and takes the rest of the argument.
+    var glued = try parse(alloc, &opts, &.{"-vn3"});
+    defer glued.deinit();
+    try std.testing.expectEqual(@as(u32, 1), glued.flagCount("verbose"));
+    try std.testing.expectEqualStrings("3", glued.get("count").?);
+}
+
 test "help renders groups" {
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -787,6 +865,34 @@ test "logger routes levels to the matching sink" {
     // Both lines carry the fixed ISO-8601 UTC prefix.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out_text, "Z "));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, err_text, "Z "));
+}
+
+test "trace is the lowest level and routes to stdout" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out_buffer: [4096]u8 = undefined;
+    var err_buffer: [4096]u8 = undefined;
+    var log = try Logger.init(gpa, io, &out_buffer, &err_buffer);
+    defer log.deinit(gpa);
+    log.min_level = .trace;
+
+    log.trace("deep {d}", .{2});
+
+    var out_sink: [512]u8 = undefined;
+    var err_sink: [512]u8 = undefined;
+    var out_writer: std.Io.Writer = .fixed(&out_sink);
+    var err_writer: std.Io.Writer = .fixed(&err_sink);
+    log.queue.close(io);
+    log.runWriter(&out_writer, &err_writer);
+
+    try std.testing.expect(std.mem.indexOf(u8, out_writer.buffered(), "trace: deep 2") != null);
+    try std.testing.expectEqual(@as(usize, 0), err_writer.buffered().len);
+
+    // Below the default level it is filtered out before the queue.
+    log.min_level = .info;
+    log.trace("hidden", .{});
+    var batch: [4]line_queue.Slot = undefined;
+    try std.testing.expectEqual(@as(usize, 0), log.queue.popBatch(io, &batch));
 }
 
 test "min_level filters before the queue" {
