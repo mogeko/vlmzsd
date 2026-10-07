@@ -400,7 +400,7 @@ fn logProtocolEvent(context: ?*anyopaque, event: network.Event) void {
     const ctx: *ClientContext = @ptrCast(@alignCast(context orelse return));
     switch (event) {
         .packet => |p| {
-            if (!ctx.quiet) ctx.log.debug("{s}: RPC packet type {d}, frag_length {d}", .{ ctx.peer, p.packet_type, p.frag_length });
+            if (!ctx.quiet) ctx.log.trace("{s}: RPC packet type {d}, frag_length {d}", .{ ctx.peer, p.packet_type, p.frag_length });
         },
         .bind_negotiated => |ndr64| {
             if (!ctx.quiet) ctx.log.debug("{s}: BIND: negotiated {s}", .{ ctx.peer, if (ndr64) "NDR64" else "NDR32" });
