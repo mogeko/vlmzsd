@@ -184,7 +184,8 @@ when the level is `err` (`-qq`).
 The level is chosen by the repeatable `-v`/`-q` flags (`-v` `debug`, `-vv`+
 `trace`; `-q` `warn`, `-qq`+ `err`; any `-q` wins over `-v`), then
 `VLMZSD_LOG_LEVEL` (`trace`/`debug`/`info`/`warn`/`err`, case-insensitive). An
-unrecognized `VLMZSD_LOG_LEVEL` is a fatal configuration error.
+unrecognized `VLMZSD_LOG_LEVEL` is ignored with a warning, leaving the level at
+the default `info`.
 
 > [!WARNING]
 > `VLMZSD_VERBOSE`/`VLMZSD_QUIET` are deprecated. They are still honored as the
