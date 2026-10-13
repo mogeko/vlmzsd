@@ -502,6 +502,17 @@ fn serveClientThread(ctx: *ClientContext) void {
             logClosed(ctx, "at shutdown", .{});
             return;
         },
+        error.ConnectionResetByPeer, error.SocketUnconnected => {
+            // The client aborted the connection (a RST, not a FIN): it gave up
+            // on a slow server, or a probe/firewall/EDR reset it. `send` to a
+            // peer that already left reports EPIPE, which the socket layer
+            // folds into `SocketUnconnected`, so the same client behaviour can
+            // surface from the write path. Like `closed by peer`, this is how a
+            // connection ends — not a server fault — so it keeps the close-line
+            // phrasing and level, with the error name kept for diagnosis.
+            logClosed(ctx, "by peer ({s})", .{@errorName(e)});
+            return;
+        },
         else => {
             ctx.log.warn("connection from {s} error: {s}", .{ ctx.peer, @errorName(e) });
             return;
