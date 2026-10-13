@@ -11,8 +11,9 @@ client for it).
   environment variables.
 - **Three-tier precedence, fixed:** built-in default < environment variable <
   CLI argument (see [§3](#3-configuration-precedence)).
-- **Discoverable.** `--help` is complete and grouped by concern; every default
-  value is shown.
+- **Discoverable.** `--help` is complete and grouped by concern (the same
+  groups as §5–§6); this document adds the environment-variable and default
+  columns.
 - **Human-friendly types.** Durations and GUIDs are written in readable form,
   not magic numbers.
 
@@ -33,8 +34,7 @@ requests (one by default, `--count` for more) to an existing KMS server. When
 
 Every `vlmzsd` option that configures server behaviour has both a CLI flag and an
 environment variable (see the tables in [§5](#5-server-vlmzsd-options)). The client is interactive and is
-configured entirely through CLI arguments; there are no environment variables
-for `vlmzs`.
+configured entirely through CLI arguments; no `VLMZSD_*` variable applies to it.
 
 Precedence, highest to lowest:
 
@@ -93,6 +93,11 @@ Grouped by concern (help is rendered in these groups).
 | `--timeout <dur>` | | `30s` | `VLMZSD_TIMEOUT` | idle timeout; `0` disables |
 | `--max-clients <n>` | `-m` | `1024` | `VLMZSD_MAX_CLIENTS` | concurrent client cap; `0` = unlimited |
 
+`--listen` takes an **IP literal only**, repeatable to bind several addresses;
+the port always comes from `--port`, so `--listen 0.0.0.0:1688` is rejected as an
+invalid address. The default `::` is a dual-stack socket covering IPv4 and IPv6,
+and falls back to `0.0.0.0` on a host without an IPv6 stack.
+
 `--max-clients` bounds the number of concurrent client connections, and with it the server's worker
 threads: the pool never reclaims an idle thread, so the count settles at
 `min(peak concurrent clients, --max-clients) + 2` (the accept loop and the log writer). While the cap
@@ -110,8 +115,9 @@ connection immediately even with `--timeout 0`, so stopping the server never wai
 |---|---|---|---|---|
 | `--data <file>` | | embedded | `VLMZSD_DATA` | external `.kmd` file; default is the built-in data |
 
-When `--data` is not given, both binaries search the FHS/XDG data directories
-for a `.kmd` file, highest priority first:
+When `--data` is not given, both binaries search the FHS data directories for a
+`.kmd` file, highest priority first. `$XDG_DATA_HOME` is **not** consulted; the
+user level is `$HOME/.local/share/vlmzsd`:
 
 1. `$HOME/.local/share/vlmzsd/*.kmd` (user level)
 2. `/etc/vlmzsd/*.kmd` (admin override)
@@ -119,10 +125,13 @@ for a `.kmd` file, highest priority first:
 4. `/usr/local/share/vlmzsd/*.kmd` (locally installed)
 5. `/usr/share/vlmzsd/*.kmd` (distribution-packaged)
 
-Within a directory, the alphabetically greatest `*.kmd` name wins. If no
-`.kmd` file is found anywhere, the built-in data is used. Builds that ship
-without it fail to start instead, and tell you to point `--data` at a `.kmd`
-file.
+Within a directory, the alphabetically greatest `*.kmd` name wins, and only
+regular files count — a symlinked `.kmd` is skipped. If no `.kmd` file is found
+anywhere, the built-in data is used. Builds that ship without it fail to start
+instead, and tell you to point `--data` at a `.kmd` file. A `.kmd` file that is
+found but unreadable or invalid is a startup error (exit `1`), not a fallback.
+Either binary logs which file won: `loaded KMS data from <file>`, or `using
+embedded KMS data` (at `-v`).
 
 ### ePID
 
@@ -130,8 +139,20 @@ file.
 |---|---|---|---|---|
 | `--epid <name>=<epid>` | | — | `VLMZSD_EPID` | repeatable / comma-separated |
 | `--randomize <0\|1\|2>` | | `1` | `VLMZSD_RANDOMIZE` | ePID randomization level |
-| `--lcid <n>` | | — | `VLMZSD_LCID` | fixed LCID for randomized ePIDs |
-| `--build <n>` | | — | `VLMZSD_BUILD` | fixed build number for randomized ePIDs |
+| `--lcid <n>` | | random | `VLMZSD_LCID` | fixed LCID for randomized ePIDs (`0` = random) |
+| `--build <n>` | | random | `VLMZSD_BUILD` | fixed build number for randomized ePIDs (`0` = random) |
+
+`--randomize` decides which ePID a client receives in the RESPONSE:
+
+| Level | ePID |
+|---|---|
+| `0` | the static ePID stored in the `.kmd` data |
+| `1` (default) | one random ePID per CSVLC, generated at startup and reused for the whole run |
+| `2` | a fresh random ePID for every request |
+
+`--lcid`/`--build` pin the LCID and host build the randomized levels use;
+unset (`0`) means "pick one at random". `--epid` overrides beat every level, and
+any other `--randomize` value behaves like `0`.
 
 ### Activation policy
 
@@ -144,6 +165,17 @@ file.
 | `--check-client-time` | | off | `VLMZSD_CHECK_CLIENT_TIME` | validate client timestamp |
 | `--maintain-clients` | | off | `VLMZSD_MAINTAIN_CLIENTS` | keep client list across requests |
 | `--start-empty` | | off | `VLMZSD_START_EMPTY` | start with empty client list |
+
+`--whitelist` and `--ip-protection` are bit masks: add the levels you want
+(`3` = both bits).
+
+- `--whitelist`: `1` rejects a request whose AppID does not match the `.kmd`
+  data; `2` rejects retail/preview products.
+- `--ip-protection`: `1` listens only on the host's private addresses — it
+  replaces `--listen` — and `2` rejects clients whose address is public.
+
+Bits outside those are ignored, so a value above the documented range is accepted
+and behaves like the levels it shares bits with.
 
 ### Protocol
 
@@ -165,6 +197,9 @@ file.
 `-v`/`-q` select the log level and `VLMZSD_LOG_LEVEL` sets it directly; see
 [Logging](#logging).
 
+`--pid-file` is written once, after the listeners are up, and is **not** removed
+on exit; a failure to write it is a warning, not a startup error.
+
 Signals: the first `SIGINT`/`SIGTERM` shuts the server down gracefully — it stops accepting, closes
 the live connections, and drains the log before exiting with status `0`. A **second** signal (and any
 later one) exits immediately with status `128 + signum` (`130` for `SIGINT`, `143` for `SIGTERM`)
@@ -172,14 +207,30 @@ without draining. It is there for the case where the log sink itself is blocked:
 because a write to that sink would block the same way, so the status is the only report. `SIGKILL`
 cannot be caught.
 
+Exit status: `0` after a graceful shutdown, and `0` for `--help`/`--version`.
+Every startup failure — an unreadable or invalid `.kmd`, no usable `--listen`
+address, or an option that does not parse — reports one `error:` line and exits
+`1` (an argument error prints `vlmzsd: error: <reason>` without the log
+timestamp). A forced exit (second signal) uses `128 + signum` instead.
+
 ### Logging
 
-One line per event: a UTC ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`), a level
-prefix, and the message. Levels, most to least verbose: `trace`, `debug`,
-`info` (default), `warn`, `err`. `trace`/`debug`/`info` go to **stdout**,
-`warn`/`err` to **stderr** (Unix convention). Lines below the chosen level are
-dropped before formatting; `err` is never suppressed, while `warn` is dropped
-when the level is `err` (`-qq`).
+One line per event: a UTC ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`), a label,
+and the message. Levels, most to least verbose: `trace`, `debug`, `info`
+(default), `warn`, `err`. The label is spelled out — `trace:`, `debug:`,
+`warning:`, `error:` — and `info` lines carry none:
+
+```
+2026-10-13T13:02:01Z vlmzsd 0.5.1 listening on port 1688
+2026-10-13T13:02:01Z debug: [::ffff:127.0.0.1]:54336: BIND: negotiated NDR64
+2026-10-13T13:02:00Z warning: client cap reached (1024), deferring accept
+```
+
+`warn`/`err` are the names used by `-q`, `VLMZSD_LOG_LEVEL`, and the option
+tables above; the text they print is `warning`/`error`. `trace`/`debug`/`info`
+go to **stdout**, `warn`/`err` to **stderr** (Unix convention). Lines below the
+chosen level are dropped before formatting; `err` is never suppressed, while
+`warn` is dropped when the level is `err` (`-qq`).
 
 The level is chosen by the repeatable `-v`/`-q` flags (`-v` `debug`, `-vv`+
 `trace`; `-q` `warn`, `-qq`+ `err`; any `-q` wins over `-v`), then
@@ -202,7 +253,8 @@ Delivery is asynchronous (a bounded queue, one writer task), so a slow consumer
 never blocks a worker. Lines can be lost:
 
 - the queue is full → the line is dropped instead of blocking the producer;
-- the line is too long → truncated to the queue's slot size;
+- the line is too long → truncated to 256 bytes (timestamp and label included;
+  the last byte is always a newline, so the line stays greppable);
 - the sink write fails → ignored, so a broken stdout cannot take the server down;
 - the exit is forced (second signal, see Signals above) → the drain is skipped.
 
@@ -240,19 +292,16 @@ printed while nothing has been lost.
 | `--timeout <dur>` | | `30s` | idle timeout; `0` disables |
 | `--verbose` | `-v` | off | verbosity |
 
-`--timeout` applies to the BIND reply and to every RESPONSE read: each packet
-read waits through a cancelable `Io` operation whose deadline the backend owns,
-so the client fails with `error.Timeout` rather than blocking forever on a peer
-that accepted the connection and then went silent. It does **not** bound
-`connect` — Zig 0.17's `std.Io.Threaded` backend still panics on
-`ConnectOptions.timeout` ("TODO implement"), so an unreachable host is bounded
-only by the kernel's own SYN timeout.
+`--timeout` bounds the BIND reply and every RESPONSE read, so the client fails
+instead of blocking forever on a peer that accepted the connection and then went
+silent. It does **not** bound the connection attempt: an unreachable host is
+bounded only by the kernel's own SYN timeout.
 
-With `--reconnect-per-request`, each request runs as its own task on the
-`Io.Threaded` pool under a window of **one request per logical CPU** (8 when the
-platform cannot report a count). The window is a thread bound, not a tuning
-knob: a request parked in a read owns a pool thread, and the pool never reclaims
-one, so `--count` must not decide the thread count — `-n 600` against a silent
-peer settles at `min(600, cores) + 1` threads and completes in waves, rather
-than as 600 threads. Without `--reconnect-per-request` all requests share one
-keep-alive connection and are sent sequentially, so there is nothing to window.
+`--reconnect-per-request` opens a new connection per request instead of reusing
+one. Requests then run concurrently, roughly one per logical CPU — a request
+parked in a read holds a worker — so `--count 600` against a silent peer
+completes in waves rather than as 600 threads. Without it, all requests share one
+keep-alive connection and are sent sequentially.
+
+The client exits `0` when all its requests succeeded, and `1` when one fails or
+an option is invalid.
