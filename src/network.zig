@@ -566,13 +566,30 @@ fn isLoopbackAddress(addr: *const std.posix.sockaddr) bool {
     };
 }
 
+/// Read the connected socket's peer address, or null when it cannot be
+/// determined.
+///
+/// `std.posix.getpeername` cannot be used here: it maps `EINVAL` to
+/// `unreachable`, and Darwin reports `EINVAL` for a connection the peer has
+/// already reset (verified: an RST in the receive queue makes `getpeername`
+/// fail, a graceful FIN leaves it working). A client that gives up on a slow
+/// server would then panic the serving task instead of surfacing as "unknown
+/// peer". Calling the syscall directly keeps every failure — including that
+/// one — a value, which is what these callers expect: they race with a peer
+/// that can vanish at any moment.
+fn peerAddress(fd: std.posix.socket_t) ?std.posix.sockaddr.storage {
+    var addr: std.posix.sockaddr.storage align(8) = undefined;
+    var addrlen: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    const rc = std.posix.system.getpeername(fd, @ptrCast(&addr), &addrlen);
+    if (std.posix.errno(rc) != .SUCCESS) return null;
+    return addr;
+}
+
 /// True when the connected socket's peer is a loopback address (the container
 /// HEALTHCHECK probes from here). Returns false when the peer address cannot
 /// be determined.
 pub fn isLoopbackPeer(fd: std.posix.socket_t) bool {
-    var addr: std.posix.sockaddr.storage align(8) = undefined;
-    var addrlen: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    std.posix.getpeername(fd, @ptrCast(&addr), &addrlen) catch return false;
+    const addr = peerAddress(fd) orelse return false;
     return isLoopbackAddress(@ptrCast(&addr));
 }
 
@@ -580,20 +597,17 @@ pub fn isLoopbackPeer(fd: std.posix.socket_t) bool {
 /// when the peer address cannot be determined (the C `serveClient` closes such
 /// connections), so callers treat false as "reject".
 pub fn isClientPrivate(fd: std.posix.socket_t) bool {
-    var addr: std.posix.sockaddr.storage align(8) = undefined;
-    var addrlen: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    std.posix.getpeername(fd, @ptrCast(&addr), &addrlen) catch return false;
+    const addr = peerAddress(fd) orelse return false;
     return isPrivateIPAddress(@ptrCast(&addr));
 }
 
 /// Format the connected socket's peer address into `buf` (e.g. "1.2.3.4:1688").
-/// Returns "unknown" when the peer address cannot be determined.
+/// Returns "unknown peer" when the peer address cannot be determined (see
+/// `peerAddress`) — the peer is already gone, so it can no longer be named.
 pub fn formatPeer(fd: std.posix.socket_t, buf: []u8) []const u8 {
-    var addr: std.posix.sockaddr.storage align(8) = undefined;
-    var addrlen: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    std.posix.getpeername(fd, @ptrCast(&addr), &addrlen) catch return "unknown";
+    const addr = peerAddress(fd) orelse return "unknown peer";
     var w = Io.Writer.fixed(buf);
-    sockaddrToIpAddress(@ptrCast(&addr)).format(&w) catch return "unknown";
+    sockaddrToIpAddress(@ptrCast(&addr)).format(&w) catch return "unknown peer";
     return w.buffered();
 }
 
@@ -1293,4 +1307,72 @@ test "a split packet arrives across refills" {
 fn sendAfterDelay(io: Io, pair: *StreamPair) Io.Cancelable!void {
     try io.sleep(.{ .nanoseconds = 100 * 1_000_000 }, .awake);
     pair.send(io, "def") catch return;
+}
+
+/// Abort `pair`'s client end: `SO_LINGER 0` makes `close` send a RST instead of
+/// a FIN — how a client that gave up on a slow server ends the connection.
+fn resetClient(io: Io, pair: *StreamPair) !void {
+    const linger: std.posix.linger = .{ .onoff = 1, .linger = 0 };
+    try std.posix.setsockopt(pair.client.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&linger));
+    pair.closeClient(io);
+}
+
+/// Poll `formatPeer` until the kernel has processed the RST (only it knows
+/// when), so the test does not depend on a fixed sleep.
+fn peerAfterReset(io: Io, fd: std.posix.socket_t, buf: []u8) ![]const u8 {
+    var attempt: u8 = 0;
+    while (attempt < 100) : (attempt += 1) {
+        const peer = formatPeer(fd, buf);
+        if (std.mem.eql(u8, peer, "unknown peer")) return peer;
+        try io.sleep(.{ .nanoseconds = 10 * 1_000_000 }, .awake);
+    }
+    return error.PeerNameNeverDropped;
+}
+
+// A peer that resets the connection can no longer be named, and asking must not
+// panic. Darwin fails `getpeername` with EINVAL for a reset connection, and
+// `std.posix.getpeername` maps EINVAL to `unreachable`; called from a serving
+// task that aborts the whole process. On Linux the same state is ENOTCONN.
+// The reset then reads as `ConnectionResetByPeer`, the error `serveClientThread`
+// reports for this case.
+test "a reset peer has no name and reads as a reset" {
+    const alloc = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try StreamPair.init(io);
+    defer pair.deinit(io);
+
+    try resetClient(io, &pair);
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("unknown peer", try peerAfterReset(io, pair.accepted.socket.handle, &buf));
+    try std.testing.expect(!isLoopbackPeer(pair.accepted.socket.handle));
+
+    var reader = emptyReader();
+    var packet: [8]u8 = undefined;
+    try std.testing.expectError(error.ConnectionResetByPeer, readAll(pair.readOptions(io, ms(1_000)), &reader, &packet));
+}
+
+// The counterpart: a graceful close (FIN) leaves the address readable, so
+// "unknown peer" stays diagnostic of a reset rather than of any close — the
+// close line for a plain disconnect keeps naming the client.
+test "a gracefully closed peer keeps its name" {
+    const alloc = std.testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try StreamPair.init(io);
+    defer pair.deinit(io);
+
+    pair.closeClient(io);
+
+    var buf: [64]u8 = undefined;
+    const peer = formatPeer(pair.accepted.socket.handle, &buf);
+    try std.testing.expect(std.mem.startsWith(u8, peer, "127.0.0.1:"));
+    try std.testing.expect(isLoopbackPeer(pair.accepted.socket.handle));
 }
