@@ -50,7 +50,9 @@ ARG VLMZSD_GIT_SHA
 RUN zig build vlmzsd vlmzs -Dcpu=baseline -Doptimize=safe \
         -Dgit-sha="${VLMZSD_GIT_SHA}" -Dno-embedded-data
 
-FROM gcr.io/distroless/base-nossl-debian13:latest
+FROM gcr.io/distroless/base-nossl-debian13:nonroot
+
+USER nonroot
 
 COPY --from=builder /opt/app/zig-out/bin/vlmzsd /usr/bin/vlmzsd
 COPY --from=builder /opt/app/zig-out/bin/vlmzs /usr/bin/vlmzs
