@@ -2,29 +2,27 @@ const std = @import("std");
 /// The project version, read from `build.zig.zon` (single source of truth).
 const version = @import("build.zig.zon").version;
 
-/// The commit hash embedded in the binaries, always in the short (7-char) form.
-/// Precedence: `-Dgit-sha=...` > `git rev-parse --short HEAD` > "unknown" —
-/// the last when there is no checkout to ask, e.g. the container build, whose
-/// context carries no `.git` and whose image installs no `git`.
-fn gitCommitHash(b: *std.Build) []const u8 {
-    const description = "Commit hash to embed; defaults to `git rev-parse --short HEAD`";
-    if (b.option([]const u8, "git-sha", description)) |given| {
-        if (shortCommitHash(given)) |hash| return hash;
-    }
-    const result = b.runFallible(&.{ "git", "rev-parse", "--short", "HEAD" }, .{ .stderr_behavior = .ignore });
-    return switch (result) {
-        .success => |out| std.mem.trim(u8, out, " \t\r\n"),
-        .spawn_failed, .bad_exit_code, .crashed => "unknown",
-    };
-}
-
-/// Trim a supplied hash to 7 characters, so `-Dgit-sha=$GITHUB_SHA` (40 hex
-/// chars) prints exactly like a local `git rev-parse --short`. A value that is
-/// not hex, or already short, is returned as given; an empty one is rejected so
-/// that `-Dgit-sha=` still falls back to git.
-fn shortCommitHash(given: []const u8) ?[]const u8 {
+/// The commit hash to show in `--version`, or `""` when the build was not given
+/// one. Release builds pass `-Dgit-sha=$GITHUB_SHA`: CI does, and the container
+/// must because its context has no `.git` and its image installs no `git`. The
+/// value is trimmed to 7 characters here, so a 40-character SHA prints exactly
+/// like `git rev-parse --short`; a value that is not hex, or already short, is
+/// kept as given.
+///
+/// Deliberately *not* read from `git` at configure time, and no build date: both
+/// are untracked state, which 0.17 answers with a poisoned configuration cache —
+/// a configurer process on every `zig build`, for a string that only decorates
+/// `--version`. No `dependOn*` declaration replaces it either: none expresses
+/// the wall clock, and a content dependency on the git ref dies when `git gc`
+/// packs refs away. A build date on top would also make two builds of the same
+/// commit differ between days.
+fn commitHash(b: *std.Build) []const u8 {
+    const given = b.option(
+        []const u8,
+        "git-sha",
+        "Commit hash to embed in `--version`, trimmed to 7 characters; CI and the container pass it",
+    ) orelse return "";
     const trimmed = std.mem.trim(u8, given, " \t\r\n");
-    if (trimmed.len == 0) return null;
     if (trimmed.len <= 7) return trimmed;
     for (trimmed) |c| {
         if (!std.ascii.isHex(c)) return trimmed;
@@ -32,44 +30,26 @@ fn shortCommitHash(given: []const u8) ?[]const u8 {
     return trimmed[0..7];
 }
 
-/// Current UTC date as `YYYY-MM-DD`.
-fn buildDate(b: *std.Build) []const u8 {
-    const now = std.Io.Clock.now(.real, b.graph.io);
-    const secs: u64 = @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_s));
-    const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
-    const yad = epoch.getEpochDay().calculateYearDay();
-    const mad = yad.calculateMonthDay();
-    return b.fmt("{d:0>4}-{d:0>2}-{d:0>2}", .{
-        @as(u32, yad.year),
-        @as(u32, @backingInt(mad.month)),
-        @as(u32, mad.day_index) + 1,
-    });
-}
-
 pub fn build(b: *std.Build) void {
-    // The configure logic reads state the build cache cannot track — the git
-    // checkout (`git rev-parse`, below) and the wall clock (`buildDate`) — so
-    // the configuration must not be reused between invocations: 0.17 would
-    // otherwise embed the previous run's hash and date after a new commit or on
-    // a later day. `Graph.poisonCache` is the declaration for exactly this.
-    b.graph.poisonCache();
-
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const git_hash = gitCommitHash(b);
-    const build_date = buildDate(b);
+    const git_hash = commitHash(b);
     const mod = b.addModule("vlmzsd", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .link_libc = false,
     });
 
-    // Expose build-time facts (version, git hash, build date, embedded-data
-    // flag) to source via `@import("build_options")`.
+    // Expose build-time facts (version, commit hash, embedded-data flag) to
+    // source via `@import("build_options")`.
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
-    build_options.addOption([]const u8, "git_hash", git_hash);
-    build_options.addOption([]const u8, "build_date", build_date);
+    // What `--version` prints: the bare semver, plus the commit when the build
+    // was given one. The format lives here so the three binaries cannot drift.
+    build_options.addOption([]const u8, "version_display", if (git_hash.len == 0)
+        version
+    else
+        b.fmt("{s} ({s})", .{ version, git_hash }));
     build_options.addOption(bool, "embedded_data", !(b.option(bool, "no-embedded-data", "Do not embed the default .kmd data; vlmzsd then requires --data <file>") orelse false));
 
     const exe = b.addExecutable(.{

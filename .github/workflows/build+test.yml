@@ -13,13 +13,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: mogeko/setup-zig@v1
-      - run: zig build vlmzsd vlmzs kmdconv --summary all
+      # `-Dgit-sha` is how the commit reaches `--version`: the build must not ask
+      # `git` itself, since that would poison the 0.17 configure cache.
+      - run: zig build vlmzsd vlmzs kmdconv -Dgit-sha=${{ github.sha }} --summary all
       - run: zig build test --summary all
       - run: |
+          short=${GITHUB_SHA::7}
           for bin in ./zig-out/bin/vlmzsd ./zig-out/bin/vlmzs; do
             "$bin" --version
-            if "$bin" --version | grep -q unknown; then
-              echo "::error::$bin reports 'unknown': the git hash was not embedded"
+            if ! "$bin" --version | grep -q "($short)"; then
+              echo "::error::$bin does not report the commit hash $short passed via -Dgit-sha"
               exit 1
             fi
           done

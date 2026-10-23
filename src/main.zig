@@ -17,8 +17,7 @@ const EnvironMap = std.process.Environ.Map;
 
 const build_options = @import("build_options");
 const version = build_options.version;
-const git_hash = build_options.git_hash;
-const build_date = build_options.build_date;
+const version_display = build_options.version_display;
 const default_port: u16 = 1688;
 
 /// `--ip-protection` bit masks (docs/cli.md §5).
@@ -824,7 +823,7 @@ pub fn main(init: std.process.Init) !void {
     if (res.hasFlag("version")) {
         var buf: [64]u8 = undefined;
         var fw = std.Io.File.writer(std.Io.File.stdout(), init.io, &buf);
-        try fw.interface.print("vlmzsd {s} ({s} {s})\n", .{ version, git_hash, build_date });
+        try fw.interface.print("vlmzsd {s}\n", .{version_display});
         try fw.interface.flush();
         return;
     }

@@ -115,10 +115,14 @@ source linked above).
   - `@embedFile` only reaches files inside the module's package path (`src/`).
 - `minimum_zig_version` is `0.17.0`; keep `build.zig` in line with that version.
 - **`build.zig` must stay 0.17-shaped.** `b.args` is gone — `run_cmd.addPassthruArgs()` passes the
-  `zig build run -- …` tail through. And because 0.17 now caches the configure phase (and can skip
-  `build.zig` altogether), a build script that reads state the cache cannot see must declare it:
-  `build.zig` embeds the git hash and the build date, so it calls `b.graph.poisonCache()`. Remove
-  that call and `--version` silently reports the previous run's hash and date.
+  `zig build run -- …` tail through. Keep the **configure phase pure** (0.17 caches it and skips
+  `build.zig` entirely when it can): it must read only tracked inputs — build options, `build.zig.zon`,
+  declared `dependOn*` files. Do not run `git` or read the clock from `build.zig`: that is untracked
+  state, it forces `b.graph.poisonCache()` (a configurer process on every build, ~90 ms), and no
+  `dependOn*` replaces it — none expresses the wall clock, and a content dependency on a git ref dies
+  when `git gc` packs refs into `packed-refs`. That is why `--version` prints the commit only when the
+  build was given `-Dgit-sha` (CI and the container pass it) and carries no build date. Verify with
+  `zig build --cache-poison=disallowed`.
 - **Container builds must use `-Dcpu=baseline`.** `zig build` defaults to the *native* CPU model;
   a CI ARM runner (e.g. Graviton) then emits SVE instructions that crash with SIGILL on CPUs
   without SVE (e.g. Apple Silicon). The `Dockerfile` pins `-Dcpu=baseline` for portability.

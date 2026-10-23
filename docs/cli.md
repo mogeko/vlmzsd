@@ -82,7 +82,7 @@ Grouped by concern (help is rendered in these groups).
 | Option | Short | Default | Env var | Notes |
 |---|---|---|---|---|
 | `--help` | `-h` | | — | print the grouped option list and exit |
-| `--version` | `-V` | | — | print version, commit, and build date, then exit |
+| `--version` | `-V` | | — | print the version (with the embedded commit when the build was given `-Dgit-sha`), then exit |
 
 ### Network
 
