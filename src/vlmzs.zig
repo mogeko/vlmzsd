@@ -15,9 +15,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const build_options = @import("build_options");
-const version = build_options.version;
-const git_hash = build_options.git_hash;
-const build_date = build_options.build_date;
+const version_display = build_options.version_display;
 const default_port: u16 = 1688;
 const default_grace_minutes: u32 = 43200;
 /// Idle timeout for the BIND reply and every RESPONSE read, mirroring the
@@ -817,7 +815,7 @@ pub fn main(init: std.process.Init) !void {
     if (res.hasFlag("version")) {
         var buf: [64]u8 = undefined;
         var fw = std.Io.File.writer(std.Io.File.stdout(), init.io, &buf);
-        try fw.interface.print("vlmzs {s} ({s} {s})\n", .{ version, git_hash, build_date });
+        try fw.interface.print("vlmzs {s}\n", .{version_display});
         try fw.interface.flush();
         return;
     }

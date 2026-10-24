@@ -10,9 +10,7 @@ const vlmzsd = @import("vlmzsd");
 const kmsdata = vlmzsd.kmsdata;
 
 const build_options = @import("build_options");
-const version = build_options.version;
-const git_hash = build_options.git_hash;
-const build_date = build_options.build_date;
+const version_display = build_options.version_display;
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -89,7 +87,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "-V") or std.mem.eql(u8, a, "--version")) {
             var vbuf: [64]u8 = undefined;
             var vw = std.Io.File.writer(std.Io.File.stdout(), init.io, &vbuf);
-            try vw.interface.print("kmdconv {s} ({s} {s})\n", .{ version, git_hash, build_date });
+            try vw.interface.print("kmdconv {s}\n", .{version_display});
             try vw.interface.flush();
             return;
         } else if (std.mem.eql(u8, a, "-r") or std.mem.eql(u8, a, "--reverse")) {
