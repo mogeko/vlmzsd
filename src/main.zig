@@ -580,6 +580,16 @@ fn handleShutdown(sig: std.posix.SIG) callconv(.c) void {
     _ = std.c.write(shutdown_pipe[1], &byte, 1);
 }
 
+/// The self-pipe's ends as `Io` handles, so the read side and the close path
+/// agree on their flags: the read end stays blocking (its waiter is meant to
+/// park), the write end is non-blocking (see `installSignalHandlers`).
+fn shutdownPipeFile(comptime end: enum { read, write }) Io.File {
+    return switch (end) {
+        .read => .{ .handle = shutdown_pipe[0], .flags = .{ .nonblocking = false } },
+        .write => .{ .handle = shutdown_pipe[1], .flags = .{ .nonblocking = true } },
+    };
+}
+
 /// Create the self-pipe and install handlers so Ctrl-C / `docker stop` shut the
 /// server down cleanly.
 fn installSignalHandlers(io: Io, log: *cli_helper.Logger) void {
@@ -751,8 +761,7 @@ const ServerContext = struct {
             };
         }
 
-        // The read end stays blocking: the task is meant to park in it.
-        const pipe: Io.File = .{ .handle = shutdown_pipe[0], .flags = .{ .nonblocking = false } };
+        const pipe: Io.File = shutdownPipeFile(.read);
         select.concurrent(.shutdown, shutdownTask, .{ self.io, pipe }) catch |e| {
             // Without this waiter the loop could never stop on a signal.
             self.log.err("failed to start shutdown reader: {s}", .{@errorName(e)});
@@ -1096,8 +1105,8 @@ pub fn main(init: std.process.Init) !void {
     // out a close-before-join bug.
     installSignalHandlers(init.io, &log);
     defer {
-        _ = std.c.close(shutdown_pipe[0]);
-        _ = std.c.close(shutdown_pipe[1]);
+        shutdownPipeFile(.read).close(init.io);
+        shutdownPipeFile(.write).close(init.io);
     }
 
     // Long-lived group for the connection tasks. Each task's resources are
