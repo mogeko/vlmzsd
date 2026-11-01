@@ -24,7 +24,8 @@ const default_port: u16 = 1688;
 const ip_protect_private_listen: u8 = 1; // listen only on private addresses
 const ip_protect_reject_public: u8 = 2; // reject clients with public IPs
 
-/// Maximum listen sockets (plus one shutdown-pipe slot in the poll set).
+/// Maximum listen sockets; also the width of the accept loop's armed-socket
+/// bit set, which is why its select result buffer is `max_listen_sockets + 2`.
 const max_listen_sockets = 64;
 /// Longest decimal PID string (generous upper bound).
 const pid_str_buffer_size = 16;
@@ -34,10 +35,6 @@ const pid_str_buffer_size = 16;
 /// reports its options (see `ServerContext.in_flight`). `0` still means
 /// "unlimited" (docs/cli.md §5).
 const default_client_cap: u32 = 1024;
-/// Poll timeout in milliseconds while the client cap is reached. Nothing else
-/// would wake the accept loop when a slot frees, so the loop re-checks the gate
-/// on this interval instead of blocking indefinitely.
-const saturated_poll_ms: i32 = 100;
 
 /// Embedded default `.kmd` data, unless built with `-Dno-embedded-data`
 /// (then `--data <file>` is required at runtime).
@@ -342,20 +339,25 @@ fn buildEpidOverrides(
     return overrides;
 }
 
-/// Admission gate for concurrent client tasks, replacing a blocking
+/// Admission gate for concurrent client tasks, rather than a blocking
 /// `Io.Semaphore` wait: `Io.Semaphore` offers no non-blocking query, so the
-/// accept loop could not ask "is there room?" *before* accepting, and would sit
-/// in `waitUncancelable` (not a cancelation point) after every extra `accept`.
+/// accept loop could not ask "is there room?" *before* arming an accept, and
+/// would sit in `waitUncancelable` (not a cancelation point) after every extra
+/// `accept`.
 ///
 /// Invariant: the accept loop is the sole acquirer, which is what lets `peak`
 /// be a plain counter. A second acceptor would also need a CAS loop for it (and
-/// could race the cap check in `acceptOne`).
+/// could race the cap check in `admit`).
 const InFlight = struct {
     count: std.atomic.Value(u32) = .init(0),
     /// Maximum concurrent client tasks; `0` means unlimited.
     cap: u32,
     /// High-water mark of `count`; written only by the accept loop.
     peak: u32 = 0,
+    /// Set by `release`, waited on by the accept loop while it is parked at the
+    /// cap. Sticky until `reset`, so a set that races the loop's gate check is
+    /// still seen by its next `wait` — nothing to miss.
+    slot_free: Io.Event = .unset,
 
     /// Take a slot, or report that the gate is closed. Never blocks.
     fn tryAcquire(self: *InFlight) bool {
@@ -369,10 +371,13 @@ const InFlight = struct {
     }
 
     /// Return a slot taken by `tryAcquire`; must be called exactly once per
-    /// successful acquire.
-    fn release(self: *InFlight) void {
+    /// successful acquire. Wakes the accept loop if it is parked at the cap; a
+    /// `set` with no waiter is harmless, because the loop resets it before
+    /// re-reading the gate.
+    fn release(self: *InFlight, io: Io) void {
         const previous = self.count.fetchSub(1, .acq_rel);
         std.debug.assert(previous > 0);
+        self.slot_free.set(io);
     }
 
     /// True while no slot is free. Always false when the cap is `0`.
@@ -399,6 +404,7 @@ const ClientContext = struct {
     /// responses (non-zero, one per connection — C `RpcAssocGroup++`).
     rpc_assoc_group: u32,
     in_flight: *InFlight,
+    tally: *ThreadTally,
     log: *cli_helper.Logger,
     /// Peer address ("host:port") formatted into `peer_buf` on entry, so every
     /// protocol event can name the connection it belongs to.
@@ -444,6 +450,74 @@ fn logClosed(ctx: *ClientContext, comptime cause: []const u8, args: anytype) voi
     ctx.log.debug("connection from {s} closed " ++ cause, .{ctx.peer} ++ args);
 }
 
+/// The log writer's task. It is counted but not announced: it starts before the
+/// resolved log level is applied, so its own start line would be filtered out at
+/// `-v` (or, worse, appear at random depending on the schedule), and `main`
+/// announces the role once the level is known instead.
+fn logWriterTask(log: *cli_helper.Logger, tally: *ThreadTally) void {
+    stated_pool_thread = true;
+    _ = tally.total.fetchAdd(1, .monotonic);
+    cli_helper.Logger.writerLoop(log);
+}
+
+/// Which server tasks have already announced the calling thread. Every pool
+/// thread runs at least one of them, so counting first uses per thread counts
+/// the pool exactly, with no registry to keep and no lock on the path.
+threadlocal var stated_pool_thread = false;
+threadlocal var stated_client_thread = false;
+
+/// The pool's threads, as this process has observed them. `std.Io.Threaded`
+/// spawns a worker when a task is dispatched and none is idle, and never
+/// reclaims one, so a thread's first task is its only lifecycle event: it is
+/// created on demand and lives until the process exits. Counting first uses
+/// therefore yields the process's thread count after adding the main thread —
+/// no estimate, and no gap for the threads that only ever ran an `accept`, the
+/// shutdown read, or the log writer.
+const ThreadTally = struct {
+    /// Every pool thread that has run a server task.
+    total: std.atomic.Value(u32) = .init(0),
+    /// The subset that has served a client, which is what scales with load.
+    clients: std.atomic.Value(u32) = .init(0),
+};
+
+/// Report the calling thread when it runs a server task: once when the thread
+/// itself is first seen, and once more when it first serves a client. Both are
+/// needed — a thread usually starts out on an `accept` and is then handed the
+/// connection it accepted. Each event has exactly one wording, so `serving
+/// clients` lines count client worker threads and `started` lines count the
+/// pool's non-client threads. When a thread debuts on a connection the second
+/// line carries both facts and the first one is skipped.
+///
+/// The id is the OS thread id — `gettid` on Linux, so it matches `ps -L` and
+/// `/proc/<pid>/task/<tid>`, and `pthread_threadid_np` on macOS, the id
+/// `sample`/`spindump` and crash reports show.
+fn notePoolThread(
+    tally: *ThreadTally,
+    log: *cli_helper.Logger,
+    comptime serving_client: bool,
+) void {
+    const new_thread = !stated_pool_thread;
+    const new_client = serving_client and !stated_client_thread;
+    if (!new_thread and !new_client) return;
+
+    const thread_id = std.Thread.getCurrentId();
+    if (new_thread) {
+        stated_pool_thread = true;
+        _ = tally.total.fetchAdd(1, .monotonic);
+    }
+    const threads = tally.total.load(.monotonic);
+    if (!new_client) {
+        log.debug("pool worker {d} started (pool threads: {d})", .{ thread_id, threads });
+        return;
+    }
+    stated_client_thread = true;
+    const clients = tally.clients.fetchAdd(1, .monotonic) + 1;
+    log.debug(
+        "pool worker {d} serving clients (client workers: {d}, pool threads: {d})",
+        .{ thread_id, clients, threads },
+    );
+}
+
 /// Serve one connection as a pooled task (dispatched via `Group.concurrent`).
 /// Releases its admission slot and frees the context on exit.
 fn serveClientThread(ctx: *ClientContext) void {
@@ -452,15 +526,19 @@ fn serveClientThread(ctx: *ClientContext) void {
         // Copy the gate out before `destroy` invalidates `ctx`, and release
         // last: the count must never lag behind the resources it accounts for,
         // or the accept loop could admit a client over the cap.
+        const io = ctx.io;
         const in_flight = ctx.in_flight;
         ctx.gpa.destroy(ctx);
-        in_flight.release();
+        in_flight.release(io);
     }
 
     // Only when --quiet-loopback is on, and only for loopback peers (the
     // container HEALTHCHECK): suppress debug chatter; warn/err still logs.
     ctx.quiet = ctx.quiet_loopback and network.isLoopbackPeer(ctx.stream.socket.handle);
     ctx.peer = network.formatPeer(ctx.stream.socket.handle, &ctx.peer_buf);
+    // Before the connection line, and regardless of `quiet`: this reports the
+    // thread, not the connection.
+    notePoolThread(ctx.tally, ctx.log, true);
     if (!ctx.quiet) ctx.log.debug("connection from {s} accepted", .{ctx.peer});
 
     const now_unix = cli_helper.nowUnix(ctx.io);
@@ -481,7 +559,7 @@ fn serveClientThread(ctx: *ClientContext) void {
         .disconnect_per_request = ctx.disconnect_per_request,
         // Reads go through `Io.operateTimeout(.net_receive)`: the backend owns
         // the deadline and the cancelation point, so SIGINT/SIGTERM ends every
-        // parked read at once (no self-pipe needed).
+        // parked read at once.
         .idle = .{ .peer = .{
             .io = ctx.io,
             .handle = ctx.stream.socket.handle,
@@ -528,14 +606,17 @@ fn serveClientThread(ctx: *ClientContext) void {
 }
 
 /// Self-pipe write end (`[1]`): the SIGINT/SIGTERM handler writes one byte here
-/// (async-signal-safe) to wake the poll loop; the read end (`[0]`) is polled
-/// like a listen socket. This is the classic self-pipe trick — the handler does
-/// no cleanup itself, so the normal control flow (and its defers) runs the
-/// shutdown. The pipe is the one piece of unavoidable global state: a signal
-/// handler cannot take a context pointer.
+/// (async-signal-safe) to announce the signal. The read end (`[0]`) is the
+/// input of a shutdown task parked in an `Io` read inside the accept loop's
+/// `Io.Select` (see `shutdownTask`), so the handler does no cleanup itself and
+/// the normal control flow (with its defers) runs the shutdown. The pipe is the
+/// one piece of unavoidable global state: a handler cannot take a context
+/// pointer, and `Io.Event.set` is a vtable call, so the wake-up has to be a
+/// plain `write`.
 ///
-/// The first signal wakes the accept loop, which runs the shutdown; a second one
-/// exits hard from the handler itself (see `handleShutdown`).
+/// The first signal ends the shutdown task and the accept loop runs the
+/// shutdown; a second one exits hard from the handler itself (see
+/// `handleShutdown`).
 var shutdown_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 
 /// A second SIGINT/SIGTERM abandons the drain and exits hard; the first one is
@@ -565,10 +646,20 @@ fn handleShutdown(sig: std.posix.SIG) callconv(.c) void {
         // is the only channel still guaranteed to work.
         std.c._exit(128 + @as(c_int, @intCast(@backingInt(sig))));
     }
-    // Wake the accept loop: write one byte. A flag alone would not work —
-    // std.posix.poll swallows EINTR and keeps blocking.
+    // Wake the accept loop: one byte, which its shutdown task receives from an
+    // `Io` read. A flag alone would not work: nobody is parked on it.
     const byte: [1]u8 = .{1};
     _ = std.c.write(shutdown_pipe[1], &byte, 1);
+}
+
+/// The self-pipe's ends as `Io` handles, so the read side and the close path
+/// agree on their flags: the read end stays blocking (its waiter is meant to
+/// park), the write end is non-blocking (see `installSignalHandlers`).
+fn shutdownPipeFile(comptime end: enum { read, write }) Io.File {
+    return switch (end) {
+        .read => .{ .handle = shutdown_pipe[0], .flags = .{ .nonblocking = false } },
+        .write => .{ .handle = shutdown_pipe[1], .flags = .{ .nonblocking = true } },
+    };
 }
 
 /// Create the self-pipe and install handlers so Ctrl-C / `docker stop` shut the
@@ -642,7 +733,65 @@ fn createListenSockets(
     }
 }
 
-/// State shared by the accept loop: everything it needs to poll the listen
+/// Bit `index` of the accept loop's armed-socket set.
+fn armedBit(index: usize) u64 {
+    std.debug.assert(index < max_listen_sockets);
+    return @as(u64, 1) << @intCast(index);
+}
+
+/// What wakes the accept loop. `Io.Select` reports the first task to finish,
+/// so a signal, a new client, and a freed admission slot all arrive here.
+const AcceptWake = union(enum) {
+    /// One byte from the self-pipe: SIGINT/SIGTERM arrived.
+    shutdown: [1]u8,
+    /// A listen socket produced a client (or an `accept` error to report).
+    client: AcceptOutcome,
+    /// The loop was parked at the client cap and a task released its slot.
+    slot_free: void,
+};
+
+/// One `accept` result, tagged with the socket it came from.
+const AcceptOutcome = union(enum) {
+    accepted: struct { server: usize, stream: Io.net.Stream },
+    failed: struct { server: usize, err: Io.net.Server.AcceptError },
+};
+
+/// One `accept` on the listen socket at `server_index`: one task, one client,
+/// so the loop handles, and re-arms, each socket once per connection. A blocked
+/// `accept` is a task whose thread the backend can interrupt, which is why it
+/// can be one of the select's waiters.
+fn acceptTask(self: *ServerContext, server_index: usize) AcceptOutcome {
+    notePoolThread(&self.tally, self.log, false);
+    const stream = self.servers[server_index].accept(self.io) catch |err| return .{
+        .failed = .{ .server = server_index, .err = err },
+    };
+    return .{ .accepted = .{ .server = server_index, .stream = stream } };
+}
+
+/// Park until the signal handler's byte reaches the shutdown pipe. The read is
+/// a cancelable `Io` operation, so the select's cancel path ends it if the loop
+/// stops without a signal; the byte itself is irrelevant, only its arrival is.
+fn shutdownTask(io: Io, pipe: Io.File, tally: *ThreadTally, log: *cli_helper.Logger) [1]u8 {
+    notePoolThread(tally, log, false);
+    var byte: [1]u8 = .{0};
+    var buffer: [1]u8 = undefined;
+    var reader = pipe.readerStreaming(io, &buffer);
+    _ = reader.interface.readSliceShort(&byte) catch 0;
+    return byte;
+}
+
+/// Park until a client task frees an admission slot.
+fn slotFreeTask(
+    io: Io,
+    gate: *InFlight,
+    tally: *ThreadTally,
+    log: *cli_helper.Logger,
+) void {
+    notePoolThread(tally, log, false);
+    gate.slot_free.wait(io) catch {};
+}
+
+/// State shared by the accept loop: everything it needs to wait on the listen
 /// sockets, gate accepted clients on `in_flight`, and dispatch them onto the
 /// worker pool.
 const ServerContext = struct {
@@ -653,83 +802,149 @@ const ServerContext = struct {
     cfg: *const kms.ServerConfig,
     servers: []Io.net.Server,
     in_flight: InFlight,
+    tally: ThreadTally,
     conn_group: *Io.Group,
     port_str: []const u8,
     prng: std.Random,
     /// Next association group id; seeded non-zero (C `RpcAssocGroup = rand32()`).
     assoc_group: u32,
 
-    /// Poll the listen sockets and the shutdown pipe, accepting and
-    /// dispatching clients until SIGINT/SIGTERM arrives.
+    /// Accept and dispatch clients until SIGINT/SIGTERM arrives.
+    ///
+    /// One `Io.Select` owns every wait, one waiter per wake-up source: a
+    /// shutdown reader (the handler's byte on the self-pipe), one `accept` per
+    /// listen socket (re-armed after each result), and — while the client cap
+    /// is reached — an admission-gate event that `InFlight.release` sets.
+    /// `await` returns whichever completes first, so the loop blocks in one
+    /// place and always has something to act on.
+    ///
+    /// Each waiter is a `concurrent` task, never `async`: `async` may run a
+    /// task inline, and an `accept` parked on this thread could not observe a
+    /// cancelation request.
     fn run(self: *ServerContext) !void {
-        var poll_fds: [max_listen_sockets + 1]std.posix.pollfd = undefined;
-        const pipe_index = self.servers.len; // the shutdown pipe's slot in `fds`
-        // One warn per saturation period: saturation is a property of the
-        // period, not of each poll iteration.
-        var saturated_logged = false;
+        std.debug.assert(self.servers.len <= max_listen_sockets);
+
+        // One result slot per possibly-outstanding task: the shutdown read,
+        // one `accept` per listen socket, and at most one gate wait. An
+        // undersized buffer would deadlock `Select.cancel`.
+        var wakes: [max_listen_sockets + 2]AcceptWake = undefined;
+        var select: Io.Select(AcceptWake) = .init(self.io, &wakes);
+        defer {
+            // `cancel` rather than `cancelDiscard`: a completed accept may still
+            // sit in the queue holding an open stream, so drain and close what
+            // the tasks produced instead of dropping it.
+            while (select.cancel()) |wake| switch (wake) {
+                .client => |outcome| switch (outcome) {
+                    .accepted => |client| client.stream.close(self.io),
+                    .failed => {},
+                },
+                .shutdown, .slot_free => {},
+            };
+        }
+
+        const pipe: Io.File = shutdownPipeFile(.read);
+        const tally: *ThreadTally = &self.tally;
+        select.concurrent(.shutdown, shutdownTask, .{ self.io, pipe, tally, self.log }) catch |e| {
+            // Without this waiter the loop could never stop on a signal.
+            self.log.err("failed to start shutdown reader: {s}", .{@errorName(e)});
+            return e;
+        };
+
+        // Bit `i` is set while server `i` has an accept task in flight. An
+        // armed socket stays armed until its accept reports, so the loop never
+        // dispatches a second one for the same socket.
+        var armed: u64 = 0;
+        var slot_free_armed = false;
+        var saturated = false;
 
         while (true) {
-            // Admission control runs *before* `accept`: while the cap is
-            // reached, the listen sockets stay out of the poll set, so excess
-            // connections wait in the kernel backlog (TCP backpressure) instead
-            // of being accepted into a worker that has nowhere to go.
-            const saturated = self.in_flight.atCap();
-            if (saturated and !saturated_logged) {
-                saturated_logged = true;
-                self.log.warn("client cap reached ({d}), deferring accept", .{self.in_flight.cap});
+            // Admission control runs *before* arming accepts: while the cap is
+            // reached, the listen sockets have no accept task, so excess
+            // connections wait in the kernel backlog (TCP backpressure)
+            // instead of being accepted into a worker that has nowhere to go.
+            const at_cap = self.in_flight.atCap();
+            if (at_cap != saturated) {
+                saturated = at_cap;
+                // One warn per saturation period: saturation is a property of
+                // the period, not of each wake-up.
+                if (saturated) self.log.warn(
+                    "client cap reached ({d}), deferring accept",
+                    .{self.in_flight.cap},
+                );
             }
-            if (!saturated) saturated_logged = false;
 
-            // While saturated only the shutdown pipe is polled, so SIGINT is
-            // still handled promptly; the pipe sits last in `poll_fds`, so it
-            // is at `fds[pipe_slot]` in either case.
-            const first: usize = if (saturated) pipe_index else 0;
-            const fds = poll_fds[first .. pipe_index + 1];
-            const pipe_slot: usize = pipe_index - first;
             if (!saturated) {
-                for (self.servers, 0..) |*s, i| {
-                    fds[i] = .{ .fd = s.socket.handle, .events = std.posix.POLL.IN, .revents = 0 };
-                }
+                try self.armAccepts(&select, &armed);
+            } else if (!slot_free_armed) {
+                // Reset, *then* re-read the gate: a release before this read
+                // lowers the count (so the loop accepts at once), and one after
+                // it sets the event (so the wait returns at once). This order
+                // makes the wake-up neither losable nor able to spin.
+                self.in_flight.slot_free.reset();
+                if (!self.in_flight.atCap()) continue;
+                select.concurrent(.slot_free, slotFreeTask, .{
+                    self.io,
+                    &self.in_flight,
+                    tally,
+                    self.log,
+                }) catch |e| {
+                    // Without this waiter a saturated loop would wait forever.
+                    self.log.err("failed to start admission-gate wait: {s}", .{@errorName(e)});
+                    return e;
+                };
+                slot_free_armed = true;
             }
-            fds[pipe_slot] = .{ .fd = shutdown_pipe[0], .events = std.posix.POLL.IN, .revents = 0 };
 
-            // Blocking indefinitely is only safe while unsaturated: at the cap
-            // a slot can free at any moment, and nothing else would wake us.
-            const timeout_ms: i32 = if (saturated) saturated_poll_ms else -1;
-            const nready = std.posix.poll(fds, timeout_ms) catch |e| {
-                self.log.err("poll failed: {s}", .{@errorName(e)});
+            const wake = select.await() catch |e| {
+                self.log.err("accept wait failed: {s}", .{@errorName(e)});
                 return e;
             };
-            if (nready == 0) continue;
 
-            // A byte on the shutdown pipe means SIGINT/SIGTERM arrived: return
-            // so the defers run their cleanup.
-            if (fds[pipe_slot].revents & std.posix.POLL.IN != 0) {
-                self.log.info("shutdown signal received, exiting", .{});
-                self.log.info("peak concurrent clients: {d}", .{self.in_flight.peak});
-                return;
-            }
-
-            // No listen socket is in the poll set while saturated, so no
-            // server slot can be ready.
-            if (!saturated) {
-                for (self.servers, 0..) |*s, i| {
-                    if (fds[i].revents & std.posix.POLL.IN == 0) continue;
-                    self.acceptOne(s);
-                }
+            switch (wake) {
+                // SIGINT/SIGTERM: return so `main`'s defers run the shutdown.
+                .shutdown => {
+                    self.log.info("shutdown signal received, exiting", .{});
+                    self.log.info("peak concurrent clients: {d}", .{self.in_flight.peak});
+                    const clients = self.tally.clients.load(.acquire);
+                    const threads = self.tally.total.load(.acquire);
+                    self.log.info(
+                        "worker threads: {d} ({d} served clients)",
+                        .{ threads, clients },
+                    );
+                    return;
+                },
+                .slot_free => slot_free_armed = false,
+                .client => |outcome| switch (outcome) {
+                    .accepted => |client| {
+                        armed &= ~armedBit(client.server);
+                        self.admit(client.stream);
+                    },
+                    .failed => |failure| {
+                        armed &= ~armedBit(failure.server);
+                        self.log.warn("accept failed: {s}", .{@errorName(failure.err)});
+                    },
+                },
             }
         }
     }
 
-    /// Accept one client from `server`, apply ip-protection, take an admission
-    /// slot, and dispatch the connection onto the pool. Every early return
-    /// closes the stream and leaves the slot count unchanged.
-    fn acceptOne(self: *ServerContext, server: *Io.net.Server) void {
-        const stream = server.accept(self.io) catch |e| {
-            self.log.warn("accept failed: {s}", .{@errorName(e)});
-            return;
-        };
+    /// Arm one accept task per listen socket that has none in flight.
+    fn armAccepts(self: *ServerContext, select: *Io.Select(AcceptWake), armed: *u64) !void {
+        for (self.servers, 0..) |_, i| {
+            const bit = armedBit(i);
+            if (armed.* & bit != 0) continue;
+            select.concurrent(.client, acceptTask, .{ self, i }) catch |e| {
+                self.log.err("failed to start accept task: {s}", .{@errorName(e)});
+                return e;
+            };
+            armed.* |= bit;
+        }
+    }
 
+    /// Apply ip-protection, take an admission slot, and dispatch one accepted
+    /// connection onto the pool. Every early return closes the stream and
+    /// leaves the slot count unchanged.
+    fn admit(self: *ServerContext, stream: Io.net.Stream) void {
         // ip-protection level 2: reject clients with a public IP.
         if (self.opts.ip_protection & ip_protect_reject_public != 0) {
             if (!network.isClientPrivate(stream.socket.handle)) {
@@ -739,10 +954,9 @@ const ServerContext = struct {
             }
         }
 
-        // The loop checked `atCap` just before polling and is the only
-        // acquirer, so this can only fail if a second acceptor appears (which
-        // would also invalidate `InFlight.peak`). Drop the connection rather
-        // than exceed the cap.
+        // The loop checked `atCap` before arming accepts and is the only
+        // acquirer, so this fails only for an accept that completed before the
+        // cap was reached. Drop that connection rather than exceed the cap.
         if (!self.in_flight.tryAcquire()) {
             stream.close(self.io);
             self.log.warn("admission gate refused an accepted client, dropping connection", .{});
@@ -751,7 +965,7 @@ const ServerContext = struct {
 
         const ctx = self.gpa.create(ClientContext) catch |e| {
             stream.close(self.io);
-            self.in_flight.release();
+            self.in_flight.release(self.io);
             self.log.warn("out of memory accepting client: {s}", .{@errorName(e)});
             return;
         };
@@ -768,6 +982,7 @@ const ServerContext = struct {
             .timeout_seconds = @intCast(self.opts.timeout_seconds),
             .rpc_assoc_group = self.assoc_group,
             .in_flight = &self.in_flight,
+            .tally = &self.tally,
             .log = self.log,
             .quiet_loopback = self.opts.quiet_loopback,
         };
@@ -778,7 +993,7 @@ const ServerContext = struct {
         self.conn_group.concurrent(self.io, serveClientThread, .{ctx}) catch |e| {
             ctx.stream.close(self.io);
             self.gpa.destroy(ctx);
-            self.in_flight.release();
+            self.in_flight.release(self.io);
             self.log.warn("failed to dispatch client task: {s}", .{@errorName(e)});
         };
     }
@@ -837,10 +1052,11 @@ pub fn main(init: std.process.Init) !void {
     // the way out, and a queue with no consumer would block that drain. The
     // separate group lets shutdown drain it *after* the connection tasks have
     // stopped, so lines they logged on the way out still reach the sink.
+    var tally: ThreadTally = .{};
     var log_group: Io.Group = .init;
     defer log_group.cancel(init.io);
     defer log.shutdown(init.io);
-    log_group.concurrent(init.io, cli_helper.Logger.writerLoop, .{&log}) catch |e| {
+    log_group.concurrent(init.io, logWriterTask, .{ &log, &tally }) catch |e| {
         // Degraded mode: the pool refused the task, so log synchronously.
         log.direct = true;
         log.warn("failed to start log writer task: {s}; logging synchronously", .{@errorName(e)});
@@ -852,6 +1068,10 @@ pub fn main(init: std.process.Init) !void {
     defer opts.deinit(init.gpa);
 
     log.min_level = opts.log_level;
+    // The log writer is the one pool task that started before the level was
+    // known, so its own start line was filtered by the default; announce the
+    // role here instead, keeping the thread census complete for a `-v` reader.
+    log.debug("log writer task started", .{});
     // Configuration notices are ordinary `warn` lines and obey the resolved
     // level: `-q` (warn) shows them, `-qq` (err) silences them.
     if (opts.invalid_log_level) |value| log.warn("ignoring invalid VLMZSD_LOG_LEVEL \"{s}\" (expected trace, debug, info, warn, or err)", .{value});
@@ -968,8 +1188,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // The client cap is enforced by `ServerContext.in_flight`, an admission
-    // gate checked *before* `accept`. It is not delegated to the pool:
-    // `std.Io.Threaded` never reclaims an idle worker (they live until
+    // gate checked *before* an accept task is armed. It is not delegated to the
+    // pool: `std.Io.Threaded` never reclaims an idle worker (they live until
     // `deinit`), and `std.process.Init` does not expose its options, so the
     // bound has to be our own invariant.
 
@@ -978,13 +1198,14 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Signals first, so the shutdown pipe outlives its waiters and its close
-    // runs after the connection group joins (defers run in reverse). Reads no
-    // longer poll the pipe — they are canceled through `Io` — but the accept
-    // loop does, and keeping the order rules out a close-before-join bug.
+    // runs after the connection group joins (defers run in reverse). The
+    // accept loop's shutdown task reads the pipe as an `Io` operation, and
+    // `run` cancels that task before it returns, so keeping this order rules
+    // out a close-before-join bug.
     installSignalHandlers(init.io, &log);
     defer {
-        _ = std.c.close(shutdown_pipe[0]);
-        _ = std.c.close(shutdown_pipe[1]);
+        shutdownPipeFile(.read).close(init.io);
+        shutdownPipeFile(.write).close(init.io);
     }
 
     // Long-lived group for the connection tasks. Each task's resources are
@@ -1002,6 +1223,7 @@ pub fn main(init: std.process.Init) !void {
         .cfg = &cfg,
         .servers = servers.items,
         .in_flight = .{ .cap = opts.max_clients },
+        .tally = tally,
         .conn_group = &conn_group,
         .port_str = port_str,
         .prng = rng,
@@ -1011,6 +1233,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "InFlight admits up to the cap, then refuses without leaking slots" {
+    const io: Io = std.testing.io;
     var gate: InFlight = .{ .cap = 2 };
     try std.testing.expectEqual(@as(u32, 0), gate.count.load(.acquire));
     try std.testing.expect(!gate.atCap());
@@ -1025,17 +1248,18 @@ test "InFlight admits up to the cap, then refuses without leaking slots" {
     try std.testing.expect(!gate.tryAcquire());
     try std.testing.expectEqual(@as(u32, 2), gate.count.load(.acquire));
 
-    gate.release();
+    gate.release(io);
     try std.testing.expect(!gate.atCap());
     try std.testing.expect(gate.tryAcquire());
     try std.testing.expectEqual(@as(u32, 2), gate.count.load(.acquire));
 
-    gate.release();
-    gate.release();
+    gate.release(io);
+    gate.release(io);
     try std.testing.expectEqual(@as(u32, 0), gate.count.load(.acquire));
 }
 
 test "InFlight peak survives idle periods" {
+    const io: Io = std.testing.io;
     var gate: InFlight = .{ .cap = 8 };
     try std.testing.expectEqual(@as(u32, 0), gate.peak);
 
@@ -1046,9 +1270,9 @@ test "InFlight peak survives idle periods" {
         try std.testing.expect(gate.tryAcquire());
         try std.testing.expectEqual(@as(u32, 3), gate.peak);
 
-        gate.release();
-        gate.release();
-        gate.release();
+        gate.release(io);
+        gate.release(io);
+        gate.release(io);
         // Idle again: the high-water mark is what shutdown reports, so it must
         // not be reset when the count drops.
         try std.testing.expectEqual(@as(u32, 0), gate.count.load(.acquire));
@@ -1059,12 +1283,13 @@ test "InFlight peak survives idle periods" {
     const four = [_]u32{ 1, 2, 3, 4 };
     for (four) |_| try std.testing.expect(gate.tryAcquire());
     try std.testing.expectEqual(@as(u32, 4), gate.peak);
-    for (four) |_| gate.release();
+    for (four) |_| gate.release(io);
     try std.testing.expectEqual(@as(u32, 0), gate.count.load(.acquire));
     try std.testing.expectEqual(@as(u32, 4), gate.peak);
 }
 
 test "InFlight cap of 0 is unlimited" {
+    const io: Io = std.testing.io;
     var gate: InFlight = .{ .cap = 0 };
     try std.testing.expect(!gate.atCap());
 
@@ -1076,8 +1301,34 @@ test "InFlight cap of 0 is unlimited" {
     try std.testing.expectEqual(@as(u32, 1000), gate.count.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1000), gate.peak);
 
-    while (i > 0) : (i -= 1) gate.release();
+    while (i > 0) : (i -= 1) gate.release(io);
     try std.testing.expectEqual(@as(u32, 0), gate.count.load(.acquire));
+}
+
+test "a slot freed while the accept loop is at the cap cannot be missed" {
+    // The accept loop resets `slot_free`, re-reads the gate, then parks on it.
+    // A release before that re-read shows up in the count; a release after it
+    // sets the event, which stays set until the loop resets it again — so a
+    // wait that has not parked yet still returns. Pin both halves of that
+    // hand-off: the wake-up must not be lost, and the wait must not spin.
+    const io: Io = std.testing.io;
+    var gate: InFlight = .{ .cap = 1 };
+    try std.testing.expect(gate.tryAcquire());
+
+    gate.slot_free.reset();
+    try std.testing.expect(gate.atCap());
+
+    gate.release(io);
+    try std.testing.expect(!gate.atCap());
+    try std.testing.expect(gate.slot_free.isSet());
+    try gate.slot_free.wait(io); // returns at once: the set came first
+
+    // An unset event does not report a spurious wake-up, so the loop cannot
+    // spin at the cap.
+    gate.slot_free.reset();
+    try std.testing.expectError(error.Timeout, gate.slot_free.waitTimeout(io, .{
+        .duration = .{ .raw = .{ .nanoseconds = std.time.ns_per_ms }, .clock = .awake },
+    }));
 }
 
 // The shutdown policy is exercised through `noteShutdownSignal` and a local

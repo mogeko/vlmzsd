@@ -78,20 +78,33 @@ source linked above).
 - Concurrency: one `std.Io.Group` for the process lifetime; each accepted connection is one
   `Group.concurrent` task on the `std.Io.Threaded` pool (threads are spawned on demand and reused,
   never `std.Thread.spawn`/`detach`). `--max-clients` is enforced by an atomic in-flight counter
-  (`InFlight`) checked *before* `accept`: while at the cap the listen sockets leave the poll set, so
-  excess connections queue in the kernel backlog. The pool itself never shrinks (a worker lives until
-  `deinit`), so this gate is what keeps threads at `min(peak clients, cap) + 2`. `Group.cancel` joins
+  (`InFlight`) checked *before* an accept task is armed: while at the cap no listen socket has an
+  accept task, so excess connections queue in the kernel backlog. The pool itself never shrinks (a
+  worker lives until `deinit`), so this gate is what keeps live threads at one worker per client
+  served, plus the main thread, the log writer, the shutdown reader, and one accept task per listen
+  socket. Because a worker never stops before the process does, its first task is its only lifecycle
+  event: every pool task reports its thread into `ServerContext.tally` — once when the thread is
+  first seen and once when it first serves a client (a thread-local flag each, no registry) — so
+  shutdown can report `worker threads: N (M served clients)` — `N` counted,
+  hence the process thread count is exactly `N + 1` (main). `M`, the part that scales with load, is
+  reported next to `peak concurrent clients`; the two run equal under a steady load and `M` can be a
+  couple higher under connect/close churn (idle workers rotate in while accept tasks are re-armed).
+  Neither grows with the connection count. `Group.cancel` joins
   in-flight tasks at shutdown, and connection reads are `Io` operations
   (`io.operateTimeout(.{ .net_receive = … })` in `network.readSome`), whose wait is a backend
   cancelation point — so SIGINT/SIGTERM ends a parked read with `error.Canceled` at once, with no
-  self-pipe. Per-connection state (PRNG, 4 KiB read/write buffers) stays
+  read-side self-pipe. Per-connection state (PRNG, 4 KiB read/write buffers) stays
   task-local; shared mutable state uses `Io.Mutex` (logger) or `std.atomic.Mutex` (client lists).
   The `vlmzs` client bounds its own pool use the same way: `--reconnect-per-request` dispatches each
   request as a task behind an `Io.Semaphore` window of one per logical CPU, so `--count` cannot set
-  the thread count. The one hand-rolled wait left is the accept loop's `std.posix.poll` — there is no
-  accept *operation* to express it with — and it owns all three of the things the skill says such a
-  wait must: a wake fd (the shutdown pipe), a deadline while saturated, and `std.posix.poll`'s own
-  `EINTR` retry.
+  the thread count.
+- The accept loop has **no hand-rolled wait** (`ServerContext.run`): `Io.Select` reports the first
+  of three kinds of task — the shutdown reader (parked in an `Io` file read that the SIGINT/SIGTERM
+  handler's one-byte pipe write ends), one `accept` per listen socket (a blocked `accept` is a task
+  the backend can interrupt, which is what replaces registering the sockets with `poll`), and, while
+  saturated, an `Io.Event` that `InFlight.release` sets so a freed slot wakes the loop instead of a
+  100 ms polling interval. The signal handler only writes that byte (async-signal-safe) and `_exit`s
+  on a second signal.
 
 ## CLI implementation decisions
 
