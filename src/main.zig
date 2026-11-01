@@ -339,10 +339,11 @@ fn buildEpidOverrides(
     return overrides;
 }
 
-/// Admission gate for concurrent client tasks, replacing a blocking
+/// Admission gate for concurrent client tasks, rather than a blocking
 /// `Io.Semaphore` wait: `Io.Semaphore` offers no non-blocking query, so the
-/// accept loop could not ask "is there room?" *before* accepting, and would sit
-/// in `waitUncancelable` (not a cancelation point) after every extra `accept`.
+/// accept loop could not ask "is there room?" *before* arming an accept, and
+/// would sit in `waitUncancelable` (not a cancelation point) after every extra
+/// `accept`.
 ///
 /// Invariant: the accept loop is the sole acquirer, which is what lets `peak`
 /// be a plain counter. A second acceptor would also need a CAS loop for it (and
@@ -486,7 +487,7 @@ fn serveClientThread(ctx: *ClientContext) void {
         .disconnect_per_request = ctx.disconnect_per_request,
         // Reads go through `Io.operateTimeout(.net_receive)`: the backend owns
         // the deadline and the cancelation point, so SIGINT/SIGTERM ends every
-        // parked read at once (no self-pipe needed).
+        // parked read at once.
         .idle = .{ .peer = .{
             .io = ctx.io,
             .handle = ctx.stream.socket.handle,
@@ -537,8 +538,9 @@ fn serveClientThread(ctx: *ClientContext) void {
 /// input of a shutdown task parked in an `Io` read inside the accept loop's
 /// `Io.Select` (see `shutdownTask`), so the handler does no cleanup itself and
 /// the normal control flow (with its defers) runs the shutdown. The pipe is the
-/// one piece of unavoidable global state: a signal handler cannot take a
-/// context pointer, and neither a futex nor an `Io.Event` is usable from one.
+/// one piece of unavoidable global state: a handler cannot take a context
+/// pointer, and `Io.Event.set` is a vtable call, so the wake-up has to be a
+/// plain `write`.
 ///
 /// The first signal ends the shutdown task and the accept loop runs the
 /// shutdown; a second one exits hard from the handler itself (see
@@ -572,8 +574,8 @@ fn handleShutdown(sig: std.posix.SIG) callconv(.c) void {
         // is the only channel still guaranteed to work.
         std.c._exit(128 + @as(c_int, @intCast(@backingInt(sig))));
     }
-    // Wake the accept loop: write one byte, which its shutdown task reads as an
-    // `Io` operation. A flag alone would not work — nothing polls it.
+    // Wake the accept loop: one byte, which its shutdown task receives from an
+    // `Io` read. A flag alone would not work: nobody is parked on it.
     const byte: [1]u8 = .{1};
     _ = std.c.write(shutdown_pipe[1], &byte, 1);
 }
@@ -674,8 +676,8 @@ const AcceptOutcome = union(enum) {
 
 /// One `accept` on the listen socket at `server_index`: one task, one client,
 /// so the loop handles, and re-arms, each socket once per connection. A blocked
-/// `accept` is a task the backend can interrupt, which is what replaces the
-/// listen sockets' `poll` registration.
+/// `accept` is a task whose thread the backend can interrupt, which is why it
+/// can be one of the select's waiters.
 fn acceptTask(io: Io, server_index: usize, server: *Io.net.Server) AcceptOutcome {
     const stream = server.accept(io) catch |err| return .{
         .failed = .{ .server = server_index, .err = err },
@@ -718,13 +720,16 @@ const ServerContext = struct {
 
     /// Accept and dispatch clients until SIGINT/SIGTERM arrives.
     ///
-    /// Every wait is a task parked in a cancelable `Io` operation — the
-    /// shutdown pipe read, one `accept` per listen socket, the admission-gate
-    /// event — and `Io.Select` reports whichever finishes first. Nothing here
-    /// is a hand-rolled `poll`: there is no accept *operation* to express the
-    /// listen sockets with, but a blocked `accept` is already a task whose
-    /// thread the backend can interrupt, so `Select` supplies what `poll`
-    /// supplied before (a wake-up path, a deadline, and cancelability).
+    /// One `Io.Select` owns every wait, one waiter per wake-up source: a
+    /// shutdown reader (the handler's byte on the self-pipe), one `accept` per
+    /// listen socket (re-armed after each result), and — while the client cap
+    /// is reached — an admission-gate event that `InFlight.release` sets.
+    /// `await` returns whichever completes first, so the loop blocks in one
+    /// place and always has something to act on.
+    ///
+    /// Each waiter is a `concurrent` task, never `async`: `async` may run a
+    /// task inline, and an `accept` parked on this thread could not observe a
+    /// cancelation request.
     fn run(self: *ServerContext) !void {
         std.debug.assert(self.servers.len <= max_listen_sockets);
 
@@ -781,9 +786,9 @@ const ServerContext = struct {
                 try self.armAccepts(&select, &armed);
             } else if (!slot_free_armed) {
                 // Reset, *then* re-read the gate: a release before this read
-                // lowers the count (so we accept at once), and one after it
-                // sets the event (so the wait returns at once). Neither can be
-                // lost, which is why the wake-up needs no polling interval.
+                // lowers the count (so the loop accepts at once), and one after
+                // it sets the event (so the wait returns at once). This order
+                // makes the wake-up neither losable nor able to spin.
                 self.in_flight.slot_free.reset();
                 if (!self.in_flight.atCap()) continue;
                 select.concurrent(.slot_free, slotFreeTask, .{ self.io, &self.in_flight }) catch |e| {
@@ -1075,8 +1080,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // The client cap is enforced by `ServerContext.in_flight`, an admission
-    // gate checked *before* `accept`. It is not delegated to the pool:
-    // `std.Io.Threaded` never reclaims an idle worker (they live until
+    // gate checked *before* an accept task is armed. It is not delegated to the
+    // pool: `std.Io.Threaded` never reclaims an idle worker (they live until
     // `deinit`), and `std.process.Init` does not expose its options, so the
     // bound has to be our own invariant.
 
@@ -1195,8 +1200,8 @@ test "a slot freed while the accept loop is at the cap cannot be missed" {
     // The accept loop resets `slot_free`, re-reads the gate, then parks on it.
     // A release before that re-read shows up in the count; a release after it
     // sets the event, which stays set until the loop resets it again — so a
-    // wait that has not parked yet still returns. That hand-off is what
-    // replaced the old 100 ms polling interval, so pin both halves of it.
+    // wait that has not parked yet still returns. Pin both halves of that
+    // hand-off: the wake-up must not be lost, and the wait must not spin.
     const io: Io = std.testing.io;
     var gate: InFlight = .{ .cap = 1 };
     try std.testing.expect(gate.tryAcquire());
