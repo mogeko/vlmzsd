@@ -781,12 +781,7 @@ fn shutdownTask(io: Io, pipe: Io.File, tally: *ThreadTally, log: *cli_helper.Log
 }
 
 /// Park until a client task frees an admission slot.
-fn slotFreeTask(
-    io: Io,
-    gate: *InFlight,
-    tally: *ThreadTally,
-    log: *cli_helper.Logger,
-) void {
+fn slotFreeTask(io: Io, gate: *InFlight, tally: *ThreadTally, log: *cli_helper.Logger) void {
     notePoolThread(tally, log, false);
     gate.slot_free.wait(io) catch {};
 }
