@@ -80,8 +80,16 @@ source linked above).
   never `std.Thread.spawn`/`detach`). `--max-clients` is enforced by an atomic in-flight counter
   (`InFlight`) checked *before* an accept task is armed: while at the cap no listen socket has an
   accept task, so excess connections queue in the kernel backlog. The pool itself never shrinks (a
-  worker lives until `deinit`), so this gate is what keeps threads at `min(peak clients, cap) + 4`
-  (one accept task per listen socket, the shutdown reader, the log writer). `Group.cancel` joins
+  worker lives until `deinit`), so this gate is what keeps live threads at one worker per client
+  served, plus the main thread, the log writer, the shutdown reader, and one accept task per listen
+  socket. Because a worker never stops before the process does, its first task is its only lifecycle
+  event: every pool task reports its thread into `ServerContext.tally` — once when the thread is
+  first seen and once when it first serves a client (a thread-local flag each, no registry) — so
+  shutdown can report `worker threads: N (M served clients)` — `N` counted,
+  hence the process thread count is exactly `N + 1` (main). `M`, the part that scales with load, is
+  reported next to `peak concurrent clients`; the two run equal under a steady load and `M` can be a
+  couple higher under connect/close churn (idle workers rotate in while accept tasks are re-armed).
+  Neither grows with the connection count. `Group.cancel` joins
   in-flight tasks at shutdown, and connection reads are `Io` operations
   (`io.operateTimeout(.{ .net_receive = … })` in `network.readSome`), whose wait is a backend
   cancelation point — so SIGINT/SIGTERM ends a parked read with `error.Canceled` at once, with no

@@ -7,9 +7,10 @@ Why this works
 the `std.Io.Threaded` pool. The pool spawns a fresh thread whenever a task is
 dispatched and no pool thread happens to be idle, and a worker thread only exits
 at `Threaded.deinit` — never while the process lives. So the process's thread
-count equals the **peak** number of *served* connections (+4: one accept task
-per listen address, the shutdown reader, and the log writer), and it never
-shrinks again — *served*, because
+count is the pool's high-water mark: one worker per client served at once (a
+little more under churn — see `worker threads` in the server's shutdown summary),
+plus one accept task per listen address, the shutdown reader, and the log writer.
+It never shrinks again — *served*, because
 `--max-clients` caps how many run at once (see `AGENTS.md` -> Concurrency;
 the deviation from C is in docs/migration.md §5).
 
@@ -38,13 +39,14 @@ Watch the server's thread count while it runs (1s interval):
     podman exec <ctr> sh -c 'ls /proc/$(pidof vlmzsd)/task | wc -l'
 
 Reading the result:
-    * server thread count ≈ min(peak connections, `--max-clients`) + 4, and it
-      stays after this script exits;
+    * server thread count = the `worker threads` the server reports at shutdown
+      + 1 (the main thread), and it stays after this script exits; the
+      parenthesised `served clients` count is the part that scales with load;
     * the cap is checked before an accept task is armed, so once it is reached
       the listen sockets have no accept task and surplus connections sit in the
       kernel's listen queue instead of occupying a worker;
     * this script's open count therefore plateaus at the cap + that queue
-      (`kern.ipc.somaxconn`, 128 on macOS → measured 1152 open, 1028 server
+      (`kern.ipc.somaxconn`, 128 on macOS → measured 1152 open, ~1026 server
       threads against a default server). Whatever does not fit is refused by
       the kernel, which shows up as `reconnect`/`fail` churn: expected, not a
       server fault. `--connections 1024` gives a churn-free run at the cap;

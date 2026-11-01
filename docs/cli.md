@@ -99,12 +99,31 @@ invalid address. The default `::` is a dual-stack socket covering IPv4 and IPv6,
 and falls back to `0.0.0.0` on a host without an IPv6 stack.
 
 `--max-clients` bounds the number of concurrent client connections, and with it the server's worker
-threads: the pool never reclaims an idle thread, so the count settles at
-`min(peak concurrent clients, --max-clients) + 4` (one accept task per `--listen` address, the
-shutdown reader, and the log writer). While the cap is reached the listener stops accepting: further
-connections wait in the kernel backlog (TCP backpressure) instead of taking a worker, and one warning
-is logged per saturation period. A freed slot wakes the listener again at once — the cap is an
-admission event, not a polling interval. `0` removes the cap and is reported as a warning at startup.
+threads: the pool never reclaims an idle thread, so the threads a run holds are the main thread, the
+log writer, the shutdown reader, one accept task per `--listen` address, and one worker per client
+being served. Connections over the cap are not accepted at all: they wait in the kernel backlog (TCP
+backpressure) instead of taking a worker, and one warning is logged per saturation period. A freed
+slot wakes the listener again at once — the cap is an admission event, not a polling interval. `0`
+removes the cap and is reported as a warning at startup.
+
+Threads are visible in the log rather than only through `ps`. At `-v` every pool thread reports
+itself, once, when it is first seen (`debug: pool worker <id> started (pool threads: N)`) and once
+more when it first serves a client (`debug: pool worker <id> serving clients (client workers: M, pool
+threads: N)`) — a thread usually starts out on an `accept` and is then handed the connection it
+accepted, so the second line is what ties a connection to a thread. The id is the OS thread id. The
+log writer cannot report itself that early, so its role is announced instead (`debug: log writer task
+started`). The shutdown summary reports two different numbers at `info`:
+
+- `peak concurrent clients` — the load: the most clients served at one moment.
+- `worker threads: N (M served clients)` — the resource: `N` pool threads, `M` of which have served
+  a client. The other `N - M` are the log writer, the shutdown reader, and one `accept` per
+  `--listen` address.
+
+`N` is counted rather than derived — each thread reports its own first task — so the process thread
+count is exactly `N + 1` (the main thread) and matches what `ps` shows. `M` is the part that scales
+with load: equal to the peak under a steady load, a couple higher under rapid connect/close churn,
+where the pool rotates through an idle worker while an accept task is re-armed. Neither number grows
+with the total number of connections served.
 
 `--timeout` bounds how long a read waits for its peer; `0` disables the idle timeout, so a silent
 peer is kept until it disconnects. It never delays shutdown: `SIGINT`/`SIGTERM` ends an idle

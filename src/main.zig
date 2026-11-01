@@ -404,6 +404,7 @@ const ClientContext = struct {
     /// responses (non-zero, one per connection — C `RpcAssocGroup++`).
     rpc_assoc_group: u32,
     in_flight: *InFlight,
+    tally: *ThreadTally,
     log: *cli_helper.Logger,
     /// Peer address ("host:port") formatted into `peer_buf` on entry, so every
     /// protocol event can name the connection it belongs to.
@@ -449,6 +450,74 @@ fn logClosed(ctx: *ClientContext, comptime cause: []const u8, args: anytype) voi
     ctx.log.debug("connection from {s} closed " ++ cause, .{ctx.peer} ++ args);
 }
 
+/// The log writer's task. It is counted but not announced: it starts before the
+/// resolved log level is applied, so its own start line would be filtered out at
+/// `-v` (or, worse, appear at random depending on the schedule), and `main`
+/// announces the role once the level is known instead.
+fn logWriterTask(log: *cli_helper.Logger, tally: *ThreadTally) void {
+    stated_pool_thread = true;
+    _ = tally.total.fetchAdd(1, .monotonic);
+    cli_helper.Logger.writerLoop(log);
+}
+
+/// Which server tasks have already announced the calling thread. Every pool
+/// thread runs at least one of them, so counting first uses per thread counts
+/// the pool exactly, with no registry to keep and no lock on the path.
+threadlocal var stated_pool_thread = false;
+threadlocal var stated_client_thread = false;
+
+/// The pool's threads, as this process has observed them. `std.Io.Threaded`
+/// spawns a worker when a task is dispatched and none is idle, and never
+/// reclaims one, so a thread's first task is its only lifecycle event: it is
+/// created on demand and lives until the process exits. Counting first uses
+/// therefore yields the process's thread count after adding the main thread —
+/// no estimate, and no gap for the threads that only ever ran an `accept`, the
+/// shutdown read, or the log writer.
+const ThreadTally = struct {
+    /// Every pool thread that has run a server task.
+    total: std.atomic.Value(u32) = .init(0),
+    /// The subset that has served a client, which is what scales with load.
+    clients: std.atomic.Value(u32) = .init(0),
+};
+
+/// Report the calling thread when it runs a server task: once when the thread
+/// itself is first seen, and once more when it first serves a client. Both are
+/// needed — a thread usually starts out on an `accept` and is then handed the
+/// connection it accepted. Each event has exactly one wording, so `serving
+/// clients` lines count client worker threads and `started` lines count the
+/// pool's non-client threads. When a thread debuts on a connection the second
+/// line carries both facts and the first one is skipped.
+///
+/// The id is the OS thread id — `gettid` on Linux, so it matches `ps -L` and
+/// `/proc/<pid>/task/<tid>`, and `pthread_threadid_np` on macOS, the id
+/// `sample`/`spindump` and crash reports show.
+fn notePoolThread(
+    tally: *ThreadTally,
+    log: *cli_helper.Logger,
+    comptime serving_client: bool,
+) void {
+    const new_thread = !stated_pool_thread;
+    const new_client = serving_client and !stated_client_thread;
+    if (!new_thread and !new_client) return;
+
+    const thread_id = std.Thread.getCurrentId();
+    if (new_thread) {
+        stated_pool_thread = true;
+        _ = tally.total.fetchAdd(1, .monotonic);
+    }
+    const threads = tally.total.load(.monotonic);
+    if (!new_client) {
+        log.debug("pool worker {d} started (pool threads: {d})", .{ thread_id, threads });
+        return;
+    }
+    stated_client_thread = true;
+    const clients = tally.clients.fetchAdd(1, .monotonic) + 1;
+    log.debug(
+        "pool worker {d} serving clients (client workers: {d}, pool threads: {d})",
+        .{ thread_id, clients, threads },
+    );
+}
+
 /// Serve one connection as a pooled task (dispatched via `Group.concurrent`).
 /// Releases its admission slot and frees the context on exit.
 fn serveClientThread(ctx: *ClientContext) void {
@@ -467,6 +536,9 @@ fn serveClientThread(ctx: *ClientContext) void {
     // container HEALTHCHECK): suppress debug chatter; warn/err still logs.
     ctx.quiet = ctx.quiet_loopback and network.isLoopbackPeer(ctx.stream.socket.handle);
     ctx.peer = network.formatPeer(ctx.stream.socket.handle, &ctx.peer_buf);
+    // Before the connection line, and regardless of `quiet`: this reports the
+    // thread, not the connection.
+    notePoolThread(ctx.tally, ctx.log, true);
     if (!ctx.quiet) ctx.log.debug("connection from {s} accepted", .{ctx.peer});
 
     const now_unix = cli_helper.nowUnix(ctx.io);
@@ -688,8 +760,9 @@ const AcceptOutcome = union(enum) {
 /// so the loop handles, and re-arms, each socket once per connection. A blocked
 /// `accept` is a task whose thread the backend can interrupt, which is why it
 /// can be one of the select's waiters.
-fn acceptTask(io: Io, server_index: usize, server: *Io.net.Server) AcceptOutcome {
-    const stream = server.accept(io) catch |err| return .{
+fn acceptTask(self: *ServerContext, server_index: usize) AcceptOutcome {
+    notePoolThread(&self.tally, self.log, false);
+    const stream = self.servers[server_index].accept(self.io) catch |err| return .{
         .failed = .{ .server = server_index, .err = err },
     };
     return .{ .accepted = .{ .server = server_index, .stream = stream } };
@@ -698,7 +771,8 @@ fn acceptTask(io: Io, server_index: usize, server: *Io.net.Server) AcceptOutcome
 /// Park until the signal handler's byte reaches the shutdown pipe. The read is
 /// a cancelable `Io` operation, so the select's cancel path ends it if the loop
 /// stops without a signal; the byte itself is irrelevant, only its arrival is.
-fn shutdownTask(io: Io, pipe: Io.File) [1]u8 {
+fn shutdownTask(io: Io, pipe: Io.File, tally: *ThreadTally, log: *cli_helper.Logger) [1]u8 {
+    notePoolThread(tally, log, false);
     var byte: [1]u8 = .{0};
     var buffer: [1]u8 = undefined;
     var reader = pipe.readerStreaming(io, &buffer);
@@ -707,7 +781,13 @@ fn shutdownTask(io: Io, pipe: Io.File) [1]u8 {
 }
 
 /// Park until a client task frees an admission slot.
-fn slotFreeTask(io: Io, gate: *InFlight) void {
+fn slotFreeTask(
+    io: Io,
+    gate: *InFlight,
+    tally: *ThreadTally,
+    log: *cli_helper.Logger,
+) void {
+    notePoolThread(tally, log, false);
     gate.slot_free.wait(io) catch {};
 }
 
@@ -722,6 +802,7 @@ const ServerContext = struct {
     cfg: *const kms.ServerConfig,
     servers: []Io.net.Server,
     in_flight: InFlight,
+    tally: ThreadTally,
     conn_group: *Io.Group,
     port_str: []const u8,
     prng: std.Random,
@@ -762,7 +843,8 @@ const ServerContext = struct {
         }
 
         const pipe: Io.File = shutdownPipeFile(.read);
-        select.concurrent(.shutdown, shutdownTask, .{ self.io, pipe }) catch |e| {
+        const tally: *ThreadTally = &self.tally;
+        select.concurrent(.shutdown, shutdownTask, .{ self.io, pipe, tally, self.log }) catch |e| {
             // Without this waiter the loop could never stop on a signal.
             self.log.err("failed to start shutdown reader: {s}", .{@errorName(e)});
             return e;
@@ -800,7 +882,12 @@ const ServerContext = struct {
                 // makes the wake-up neither losable nor able to spin.
                 self.in_flight.slot_free.reset();
                 if (!self.in_flight.atCap()) continue;
-                select.concurrent(.slot_free, slotFreeTask, .{ self.io, &self.in_flight }) catch |e| {
+                select.concurrent(.slot_free, slotFreeTask, .{
+                    self.io,
+                    &self.in_flight,
+                    tally,
+                    self.log,
+                }) catch |e| {
                     // Without this waiter a saturated loop would wait forever.
                     self.log.err("failed to start admission-gate wait: {s}", .{@errorName(e)});
                     return e;
@@ -818,6 +905,12 @@ const ServerContext = struct {
                 .shutdown => {
                     self.log.info("shutdown signal received, exiting", .{});
                     self.log.info("peak concurrent clients: {d}", .{self.in_flight.peak});
+                    const clients = self.tally.clients.load(.acquire);
+                    const threads = self.tally.total.load(.acquire);
+                    self.log.info(
+                        "worker threads: {d} ({d} served clients)",
+                        .{ threads, clients },
+                    );
                     return;
                 },
                 .slot_free => slot_free_armed = false,
@@ -837,10 +930,10 @@ const ServerContext = struct {
 
     /// Arm one accept task per listen socket that has none in flight.
     fn armAccepts(self: *ServerContext, select: *Io.Select(AcceptWake), armed: *u64) !void {
-        for (self.servers, 0..) |*server, i| {
+        for (self.servers, 0..) |_, i| {
             const bit = armedBit(i);
             if (armed.* & bit != 0) continue;
-            select.concurrent(.client, acceptTask, .{ self.io, i, server }) catch |e| {
+            select.concurrent(.client, acceptTask, .{ self, i }) catch |e| {
                 self.log.err("failed to start accept task: {s}", .{@errorName(e)});
                 return e;
             };
@@ -889,6 +982,7 @@ const ServerContext = struct {
             .timeout_seconds = @intCast(self.opts.timeout_seconds),
             .rpc_assoc_group = self.assoc_group,
             .in_flight = &self.in_flight,
+            .tally = &self.tally,
             .log = self.log,
             .quiet_loopback = self.opts.quiet_loopback,
         };
@@ -958,10 +1052,11 @@ pub fn main(init: std.process.Init) !void {
     // the way out, and a queue with no consumer would block that drain. The
     // separate group lets shutdown drain it *after* the connection tasks have
     // stopped, so lines they logged on the way out still reach the sink.
+    var tally: ThreadTally = .{};
     var log_group: Io.Group = .init;
     defer log_group.cancel(init.io);
     defer log.shutdown(init.io);
-    log_group.concurrent(init.io, cli_helper.Logger.writerLoop, .{&log}) catch |e| {
+    log_group.concurrent(init.io, logWriterTask, .{ &log, &tally }) catch |e| {
         // Degraded mode: the pool refused the task, so log synchronously.
         log.direct = true;
         log.warn("failed to start log writer task: {s}; logging synchronously", .{@errorName(e)});
@@ -973,6 +1068,10 @@ pub fn main(init: std.process.Init) !void {
     defer opts.deinit(init.gpa);
 
     log.min_level = opts.log_level;
+    // The log writer is the one pool task that started before the level was
+    // known, so its own start line was filtered by the default; announce the
+    // role here instead, keeping the thread census complete for a `-v` reader.
+    log.debug("log writer task started", .{});
     // Configuration notices are ordinary `warn` lines and obey the resolved
     // level: `-q` (warn) shows them, `-qq` (err) silences them.
     if (opts.invalid_log_level) |value| log.warn("ignoring invalid VLMZSD_LOG_LEVEL \"{s}\" (expected trace, debug, info, warn, or err)", .{value});
@@ -1124,6 +1223,7 @@ pub fn main(init: std.process.Init) !void {
         .cfg = &cfg,
         .servers = servers.items,
         .in_flight = .{ .cap = opts.max_clients },
+        .tally = tally,
         .conn_group = &conn_group,
         .port_str = port_str,
         .prng = rng,
