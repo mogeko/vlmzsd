@@ -100,10 +100,11 @@ and falls back to `0.0.0.0` on a host without an IPv6 stack.
 
 `--max-clients` bounds the number of concurrent client connections, and with it the server's worker
 threads: the pool never reclaims an idle thread, so the count settles at
-`min(peak concurrent clients, --max-clients) + 2` (the accept loop and the log writer). While the cap
-is reached the listener stops accepting: further connections wait in the kernel backlog (TCP
-backpressure) instead of taking a worker, and one warning is logged per saturation period. `0`
-removes the cap and is reported as a warning at startup.
+`min(peak concurrent clients, --max-clients) + 4` (one accept task per `--listen` address, the
+shutdown reader, and the log writer). While the cap is reached the listener stops accepting: further
+connections wait in the kernel backlog (TCP backpressure) instead of taking a worker, and one warning
+is logged per saturation period. A freed slot wakes the listener again at once — the cap is an
+admission event, not a polling interval. `0` removes the cap and is reported as a warning at startup.
 
 `--timeout` bounds how long a read waits for its peer; `0` disables the idle timeout, so a silent
 peer is kept until it disconnects. It never delays shutdown: `SIGINT`/`SIGTERM` ends an idle
