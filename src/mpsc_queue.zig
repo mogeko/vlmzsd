@@ -3,11 +3,12 @@
 //! (<https://sites.google.com/site/1024cores/home/lock-free-algorithms/queues/bounded-mpmc-queue>),
 //! specialized to one consumer.
 //!
-//! Producers (`tryPush`, any number of threads) never block and never allocate:
-//! a push either takes a slot or is refused when the ring is full, and every
-//! refusal is counted. That is what a log path needs — a full ring must not
-//! stall a worker serving a client — and it is why the ring is lock-free instead
-//! of guarded by a mutex the way `line_queue` is.
+//! Any number of producers may call `tryPush`; exactly one consumer drains with
+//! `popCopy`/`popBatch` and waits on `awaitWork`. A push never blocks and never
+//! allocates: it either takes a slot or is refused when the ring is full, and
+//! every refusal is counted. That is what a log path needs — a full ring must
+//! not stall a worker serving a client — so the ring is lock-free: no producer
+//! ever waits on a lock held by another thread.
 //!
 //! The algorithm is Vyukov's. The ring has `capacity` cells (a power of two, so
 //! a position maps to a cell by a mask). `head` is the next position a producer
@@ -23,10 +24,19 @@
 //!
 //! Two consequences of that design are visible to a caller. A producer can
 //! reserve a position and be slow to publish, so `hasWork` (and therefore
-//! `popCopy`) can report "empty" while `head` has already moved on; the
-//! producer's wakeup, sent after it publishes, brings the consumer back. And a
-//! producer can see "full" while a slot frees a moment later: a lost wakeup is
-//! not possible, but a lost line is, and the counter records it.
+//! `popCopy`) can report "empty" while `head` has already moved on; the signal
+//! the producer sends after publishing brings the consumer back. And a producer
+//! can see "full" while a slot frees a moment later: a wakeup is not lost, but
+//! the value is, and the drop counter records it.
+//!
+//! The consumer parks on a signal counter. It reads the counter, tests the ring
+//! and the closed flag, and then waits only while the counter still holds the
+//! value it read, so a signal that lands after those tests ends the wait by
+//! value. `close` uses the same signal, which is what makes the shutdown
+//! handshake safe: a boolean latch would lose it, because re-arming a latch is
+//! a plain store that can erase a `close` arriving at the wrong moment, leaving
+//! the consumer parked with nothing left to wake it. A counter cannot be erased
+//! — every later signal changes the word the consumer waits on.
 //!
 //! Internal to the `vlmzsd`/`vlmzs` binaries: not part of the public API
 //! (see `docs/library.md`).
@@ -89,14 +99,21 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
         /// Oldest position not yet released. Only the single consumer writes
         /// it, which is what lets the consumer side skip the CAS.
         tail: std.atomic.Value(usize) align(std.atomic.cache_line) = .init(0),
-        /// Latched by a successful `tryPush` and by `close`; re-armed and
-        /// re-tested inside `awaitWork`, which owns that ordering (arming after
-        /// the emptiness test would drop a wakeup).
-        event: Io.Event = .unset,
+        /// Signal counter, bumped by every publish and by `close`. The consumer
+        /// waits only while the counter still holds the value it read before
+        /// testing the ring, so any later signal ends the wait by value. A
+        /// boolean latch cannot promise that: re-arming it is a plain store
+        /// that erases a `close` arriving at the wrong moment, and nothing is
+        /// left to wake the consumer.
+        wake: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
+        /// Set while the consumer is parked, or about to be. An optimization
+        /// only: it keeps the common push from issuing a wake syscall, and a
+        /// stale read of it costs a park that `wake` has already ended.
+        waiting: std.atomic.Value(bool) = .init(false),
         /// Set by `close`; producers then refuse instead of pushing.
         closed: std.atomic.Value(bool) = .init(false),
         /// Refused pushes, full or closed. Only a producer that is losing its
-        /// line touches it, so the accepted path pays nothing for the count. A
+        /// value touches it, so the accepted path pays nothing for the count. A
         /// refusal is counted where it happens: the queue cannot know whether
         /// the caller retries, so a retrying producer reads an upper bound here.
         dropped: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0),
@@ -131,11 +148,19 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
             const cell = &self.cells[position & mask];
             cell.value = value;
             // Publish with `release` so whoever acquires the sequence sees the
-            // payload. The wakeup must follow the publish, or a consumer that
-            // already tested emptiness could park with this line queued.
+            // payload. The signal must follow the publish, or a consumer that
+            // already tested emptiness could park with this value queued.
             cell.sequence.store(position +% 1, .release);
-            self.event.set(io);
+            self.signal(io);
             return .accepted;
+        }
+
+        /// Tell the consumer that the ring changed. The counter moves first and
+        /// unconditionally: that is what makes the signal impossible to lose,
+        /// and the `waiting` test only saves the syscall.
+        fn signal(self: *Self, io: Io) void {
+            _ = self.wake.fetchAdd(1, .release);
+            if (self.waiting.load(.monotonic)) io.futexWake(u32, &self.wake.raw, 1);
         }
 
         /// Claim the next position for this producer, or `null` when the ring
@@ -208,36 +233,41 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
         }
 
         /// Wait until at least one value is published, or until the queue is
-        /// closed and drained — whichever comes first, and without parking when
-        /// it can answer immediately.
+        /// closed with nothing left to drain — whichever comes first, and
+        /// without parking when it can answer immediately.
         ///
-        /// This owns the arm/test/park order, which is the only reason it
-        /// exists: the event must be re-armed *before* the emptiness test, or a
-        /// push that lands between the test and the park leaves the latch set
-        /// and the consumer sleeps with work queued. Inside the queue a caller
-        /// cannot get that order wrong.
+        /// The ticket is taken *before* the two tests, never after: a signal
+        /// that lands between the ticket and the park has already changed
+        /// `wake`, so the park returns at once, and one that lands before the
+        /// ticket is visible to the tests that follow it. Taking the ticket the
+        /// other way round would leave a window where the queue is closed, the
+        /// `closed` read is stale, and the park waits for a signal that already
+        /// happened.
         ///
-        /// Still a cancelation point: `error.Canceled` means the *wait* was
+        /// A cancelation point: `error.Canceled` means the *wait* was
         /// cancelled, not that the queue closed — whether to drain and stop is
         /// the caller's decision.
         pub fn awaitWork(self: *Self, io: Io) Io.Cancelable!Wake {
             while (true) {
-                self.event.reset();
+                const ticket = self.wake.load(.acquire);
                 if (self.hasWork()) return .work;
                 if (self.isClosed()) return .closed;
-                // A stale or spurious wakeup loops back to re-test, so it can
-                // never be reported as work that is not there.
-                try self.event.wait(io);
+                self.waiting.store(true, .monotonic);
+                io.futexWait(u32, &self.wake.raw, ticket) catch |err| {
+                    self.waiting.store(false, .monotonic);
+                    return err;
+                };
+                self.waiting.store(false, .monotonic);
             }
         }
 
-        /// Refuse further pushes and wake the consumer so it can drain and exit.
-        /// Call only after every producer has stopped: a push that passed the
-        /// `closed` check before this call can still publish afterwards, and a
-        /// consumer that already saw `.closed` would leave it behind.
+        /// Refuse further pushes and signal the consumer so it can drain and
+        /// exit. Call only after every producer has stopped: a push that passed
+        /// the `closed` check before this call can still publish afterwards,
+        /// and a consumer that already saw `.closed` would leave it behind.
         pub fn close(self: *Self, io: Io) void {
             self.closed.store(true, .release);
-            self.event.set(io);
+            self.signal(io);
         }
 
         pub fn isClosed(self: *const Self) bool {
@@ -266,12 +296,12 @@ const test_capacity = 8;
 const TestQueue = Queue(u32, test_capacity);
 
 /// Counts for the threaded tests. The wakeup case's producers retry until their
-/// line is accepted, so they only terminate because the consumer keeps draining
+/// value is accepted, so they only terminate because the consumer keeps draining
 /// the ring — which is what the case is there to prove.
 const producers = 4;
 const lines_per_producer = 200;
 
-// The queue's contract is pinned here in isolation from any logger: arrival
+// The queue's contract is pinned here in isolation from any caller: arrival
 // order (FIFO), the reserved-but-unpublished read as empty, the lossy full-ring
 // path with its counter, ring reuse across laps, close/drain semantics, and the
 // wakeup protocol. Only the last two cases start threads; the rest drive the
@@ -382,6 +412,45 @@ test "the ring wraps across laps without losing order" {
     try testing.expectEqual(@as(u64, 0), queue.droppedCount());
 }
 
+test "every signal moves the wake word" {
+    // The property `awaitWork` rests on, and the reason it parks on a counter
+    // rather than a boolean latch: a consumer that took its ticket and is about
+    // to park must be released by *any* later signal, including one that leaves
+    // the ring exactly as the ticket described. A latch cannot promise that —
+    // re-arming it erases a concurrent `close` — so this pins the counter
+    // rather than trying to reproduce a schedule.
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var queue = try TestQueue.init(alloc);
+    defer queue.deinit(alloc);
+
+    const initial = queue.wake.load(.acquire);
+    try testing.expectEqual(PushResult.accepted, queue.tryPush(io, 1));
+    const after_push = queue.wake.load(.acquire);
+    try testing.expect(after_push != initial);
+
+    // A push that is refused signals nothing: no state changed, so a ticket
+    // taken across it still describes an empty ring.
+    var i: u32 = 1;
+    while (i < test_capacity) : (i += 1) {
+        try testing.expectEqual(PushResult.accepted, queue.tryPush(io, i));
+    }
+    const before_refusal = queue.wake.load(.acquire);
+    try testing.expectEqual(PushResult.full, queue.tryPush(io, 0xdead));
+    try testing.expectEqual(before_refusal, queue.wake.load(.acquire));
+
+    var batch: [test_capacity]u32 = undefined;
+    try testing.expectEqual(@as(usize, test_capacity), queue.popBatch(&batch));
+
+    // `close` moves the word too, which is what makes a ticket taken before it
+    // unable to park: the wait returns at once instead of sleeping through the
+    // close.
+    const before_close = queue.wake.load(.acquire);
+    queue.close(io);
+    try testing.expect(queue.wake.load(.acquire) != before_close);
+    try testing.expectEqual(Wake.closed, try queue.awaitWork(io));
+}
+
 test "close refuses pushes and reports closed only once drained" {
     const alloc = testing.allocator;
     const io = testing.io;
@@ -407,9 +476,9 @@ test "close refuses pushes and reports closed only once drained" {
 
 test "a parked consumer is woken by a push and by close" {
     // The wakeup path: the consumer parks in `awaitWork` instead of polling, so
-    // every line has to arrive through a real wakeup and `close` has to wake it
-    // one last time. Push (wakeup after the publish) and close both race the
-    // consumer's arm/test/park, which is what `awaitWork` exists to make safe.
+    // every value has to arrive through a real wakeup and `close` has to wake it
+    // one last time. Push (signal after the publish) and close both race the
+    // consumer's ticket/test/wait, which is what `awaitWork` exists to make safe.
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const alloc = testing.allocator;
 
@@ -451,7 +520,7 @@ test "a parked consumer is woken by a push and by close" {
             var i: u32 = 0;
             while (i < lines_per_producer) : (i += 1) {
                 // Retry instead of dropping: the consumer keeps draining the
-                // ring, so a refusal is transient and the line eventually
+                // ring, so a refusal is transient and the value eventually
                 // lands. That also makes the consumer's total exact below.
                 while (self.queue.tryPush(self.io, self.id << 16 | i) != .accepted) {
                     std.atomic.spinLoopHint();
@@ -478,17 +547,17 @@ test "a parked consumer is woken by a push and by close" {
     try cons_group.await(io);
 
     try testing.expectEqual(@as(usize, producers * lines_per_producer), consumer.seen);
-    // Every line arrived and none arrived twice, so the consumer left the ring
+    // Every value arrived and none arrived twice, so the consumer left the ring
     // empty. Its drop counter is not necessarily zero: a retrying producer
-    // refuses lines that it then re-pushes, and the queue counts a refusal when
-    // it happens because it cannot know the caller will retry.
+    // refuses values that it then re-pushes, and the queue counts a refusal
+    // when it happens because it cannot know the caller will retry.
     try testing.expect(!queue.hasWork());
 }
 
 test "concurrent producers keep per-producer order and account for every push" {
     // Contention plus loss: producers never retry, so the ring overflows and
-    // lines are dropped. The test pins both halves of the contract — each
-    // producer's lines that did arrive are still in sequence order, and every
+    // values are dropped. The test pins both halves of the contract — each
+    // producer's values that did arrive are still in sequence order, and every
     // attempt is either seen by the consumer or counted as dropped.
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const alloc = testing.allocator;
@@ -570,7 +639,7 @@ test "concurrent producers keep per-producer order and account for every push" {
     const dropped: usize = @intCast(queue.takeDropped());
     try testing.expect(consumer.seen > 0);
     // The accounting invariant: a push was either taken by the ring and seen by
-    // the consumer exactly once, or refused and counted. No line is both.
+    // the consumer exactly once, or refused and counted. No value is both.
     try testing.expectEqual(producers * attempts, consumer.seen + dropped);
     try testing.expect(!consumer.out_of_order);
 }
