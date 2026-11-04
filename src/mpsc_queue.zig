@@ -112,10 +112,11 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
         waiting: std.atomic.Value(bool) = .init(false),
         /// Set by `close`; producers then refuse instead of pushing.
         closed: std.atomic.Value(bool) = .init(false),
-        /// Refused pushes, full or closed. Only a producer that is losing its
-        /// value touches it, so the accepted path pays nothing for the count. A
-        /// refusal is counted where it happens: the queue cannot know whether
-        /// the caller retries, so a retrying producer reads an upper bound here.
+        /// Refused pushes, full or closed — a monotonic total, never cleared.
+        /// Only a producer that is losing its value touches it, so the accepted
+        /// path pays nothing for the count. It counts refusals rather than lost
+        /// values: the queue cannot know whether the caller retries, so a
+        /// retrying producer makes this an upper bound.
         dropped: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0),
 
         /// Allocate the ring once, before any producer starts.
@@ -274,15 +275,11 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
             return self.closed.load(.acquire);
         }
 
-        /// Pushes refused since `init`, or since the last `takeDropped`.
+        /// Pushes refused since `init`. The total only grows, so a reporter
+        /// that wants the loss for one period keeps the value it last saw and
+        /// subtracts; the count a late reader sees is always the whole run's.
         pub fn droppedCount(self: *const Self) u64 {
             return self.dropped.load(.monotonic);
-        }
-
-        /// Read and clear the dropped count, for a consumer that reports loss
-        /// per period rather than per run.
-        pub fn takeDropped(self: *Self) u64 {
-            return self.dropped.swap(0, .monotonic);
         }
     };
 }
@@ -376,9 +373,15 @@ test "a full ring refuses pushes and counts every drop" {
     try testing.expectEqual(@as(usize, 1), queue.popBatch(&batch));
     try testing.expectEqual(@as(u32, 0xfeed), batch[0]);
 
-    // Counters are read-and-clear, so a reporter can cover one period at a time.
-    try testing.expectEqual(@as(u64, 2), queue.takeDropped());
-    try testing.expectEqual(@as(u64, 0), queue.takeDropped());
+    // The total never resets, so a period delta is the reporter's own
+    // subtraction: remember the total, and subtract it from the next reading.
+    const period_start = queue.droppedCount();
+    var j: u32 = 0;
+    while (j < test_capacity) : (j += 1) {
+        try testing.expectEqual(PushResult.accepted, queue.tryPush(io, j));
+    }
+    try testing.expectEqual(PushResult.full, queue.tryPush(io, 0xdead));
+    try testing.expectEqual(period_start + 1, queue.droppedCount());
 }
 
 test "the ring wraps across laps without losing order" {
@@ -636,7 +639,7 @@ test "concurrent producers keep per-producer order and account for every push" {
     queue.close(io);
     try cons_group.await(io);
 
-    const dropped: usize = @intCast(queue.takeDropped());
+    const dropped: usize = @intCast(queue.droppedCount());
     try testing.expect(consumer.seen > 0);
     // The accounting invariant: a push was either taken by the ring and seen by
     // the consumer exactly once, or refused and counted. No value is both.
