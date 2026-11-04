@@ -126,7 +126,11 @@ source linked above).
 - `std.Io` / `std.process.Init` are WIP in 0.17 — consult current stdlib source, not older tutorials.
   - `std.fs.cwd` is gone; file I/O goes through an `Io` instance: `std.Io.Threaded.init(alloc, .{})` → `.io()`.
   - `@embedFile` only reaches files inside the module's package path (`src/`).
-- `minimum_zig_version` is `0.17.0`; keep `build.zig` in line with that version.
+- `minimum_zig_version` is `0.17.0`; keep `build.zig` in line with that version. That field is
+  the *floor*, not a pin: the suite builds and passes on 0.17.0 and on 0.17.1, and CI installs
+  the floor (the `setup-zig` action reads `minimum_zig_version` when it is given no version),
+  while the `Dockerfile` pins 0.17.1 for the shipped container. Only raise the floor when the
+  code actually uses an API the older release lacks.
 - **`build.zig` must stay 0.17-shaped.** `b.args` is gone — `run_cmd.addPassthruArgs()` passes the
   `zig build run -- …` tail through. Keep the **configure phase pure** (0.17 caches it and skips
   `build.zig` entirely when it can): it must read only tracked inputs — build options, `build.zig.zon`,
