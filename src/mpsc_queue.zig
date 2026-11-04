@@ -99,28 +99,14 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
         /// Oldest position not yet released. Only the single consumer writes
         /// it, which is what lets the consumer side skip the CAS.
         tail: std.atomic.Value(usize) align(std.atomic.cache_line) = .init(0),
-        /// Signal counter, bumped by every publish and by `close`. The consumer
-        /// waits only while the counter still holds the value it read before
-        /// testing the ring, so any later signal ends the wait by value. A
-        /// boolean latch cannot promise that: re-arming it is a plain store
-        /// that erases a `close` arriving at the wrong moment, and nothing is
-        /// left to wake the consumer.
-        ///
-        /// 32 bits because the wait is a single futex word: `Io.futexWait` only
-        /// takes a `u32` (`@sizeOf(T) == @sizeOf(u32)`), so a wider counter
-        /// would not widen the word the kernel compares, and would not move the
-        /// wrap-around it is compared against.
+        /// Bumped by every publish and by `close`. The consumer parks on it, so
+        /// the wait ends when the value it read before testing the ring changes.
+        /// A `u32` because `Io.futexWait` takes a futex word.
         wake: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
-        /// One wake credit, held while the consumer is parked or about to be:
-        /// the consumer deposits it on the way into `futexWait`, and the first
-        /// signal to swap it back to false withdraws it and wakes. A burst of
-        /// pushes behind one parked consumer therefore pays a single wake
-        /// instead of one per push.
-        ///
-        /// An optimization, not a correctness requirement: `wake` ends the park,
-        /// so a stale read only skips a syscall the counter made unnecessary.
-        /// The common push still only *loads* it — an RMW would take this line
-        /// exclusively on every push and thrash it against the consumer.
+        /// Set while the consumer is parked or about to be. `signal` clears it to
+        /// claim the wake, so a burst of pushes behind one park wakes once, and
+        /// the common push only *loads* it. An optimization, not a correctness
+        /// requirement: `wake` alone ends the park.
         waiting: std.atomic.Value(bool) = .init(false),
         /// Set by `close`; producers then refuse instead of pushing.
         closed: std.atomic.Value(bool) = .init(false),
@@ -168,14 +154,11 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
             return .accepted;
         }
 
-        /// Tell the consumer that the ring changed. The counter moves first and
-        /// unconditionally: that is what makes the signal impossible to lose.
-        /// The `waiting` test then keeps the common push out of the kernel, and
-        /// the swap *withdraws the credit* — so a burst of pushes behind one
-        /// parked consumer pays for a single wake instead of one per push. A
-        /// stale `false` only skips a syscall the counter has made unnecessary:
-        /// the consumer's park compares against the ticket it took before
-        /// testing the ring, so a signal that arrived first ends it at once.
+        /// Tell the consumer that the ring changed. The counter is bumped
+        /// unconditionally, so no wake can be lost; the wake itself is
+        /// optimistic — the swap claims a parked consumer, so of the pushes that
+        /// arrive behind one park exactly one enters the kernel and the rest
+        /// skip it.
         fn signal(self: *Self, io: Io) void {
             _ = self.wake.fetchAdd(1, .release);
             if (self.waiting.load(.monotonic) and self.waiting.swap(false, .monotonic)) {
