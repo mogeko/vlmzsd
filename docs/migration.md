@@ -19,8 +19,8 @@ vendored in this repository.**
 - Error/exception paths (invalid version, short request, unknown context, data-file validation) are aligned with C behavior.
 - All remaining differences fall into one of two classes — "intentional design" or "defect fix" — and are itemized in section 5; none constitutes a wire incompatibility.
 
-Verification: the full suite (`zig build test`) passes — struct-layout asserts, byte-level golden
-vectors, round-trips — plus `vlmzs` ↔ `vlmzsd` end-to-end (v4/v5/v6, NDR32/NDR64, DNS, dual-stack).
+Verification: the full suite (`zig build test`) passes — comptime layout asserts, byte-level golden
+vectors, round-trips — and `vlmzs` ↔ `vlmzsd` has been exercised end-to-end (v4/v5/v6, NDR32/NDR64).
 
 ---
 
@@ -171,7 +171,7 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 - **ePID generation**: `platform(5)-group(5)-keyHi(3)-keyLo(6)-03-lang-build.0000-yday(3)year(4)`;
   `keyId ∈ [MinKeyId, MaxKeyId)`; the `hostBuild` `UseNdr64` flag must match the negotiated syntax;
   date `min = max(ReleaseDate, HostBuildReleaseDate)`, `max = max(now, BUILD_TIME)`, `span<=0` takes `min` (fixes C's `%0` UB);
-  the 160-entry LCID list matches C `LcidList` item-for-item.
+  the LCID list (`lcid_list`, 158 entries) keeps the C `LcidList` order.
 - **Client list** (`--maintain-clients`): `ClientList{guids[671], current_count, max_count, current_position}`;
   ring buffer + oldest-entry eviction; `max_count` capped at `min(required, 671)` (avoids the C out-of-bounds).
 
@@ -256,17 +256,15 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 
 ## 6. Verification
 
-- **Unit tests**: `zig build test --summary all` → all pass.
-  - `kms.zig`: struct layout comptime asserts; v4/v5/v6 request→response→decrypt round-trips; ePID format; client list insert/evict.
+- **Unit tests** (`zig build test --summary all` → all pass) for the migrated protocol behavior:
+  - `kms.zig`: struct layout pinned by comptime asserts (enforced by any build); v4/v5/v6 request→response→decrypt round-trips; ePID format; client list insert/evict.
   - `rpc.zig`: BIND negotiation (NDR32/NDR64/BTFN); request wrap (NDR32/NDR64); dispatch end-to-end; invalid-version HRESULT.
   - `crypto.zig`: v4 CMAC / v5 / v6 encryption / CBC / HMAC-SHA256 golden vectors.
   - `kmsdata.zig`: `.kmd` parsing field asserts.
-  - `network.zig`: private-IP classification; the read path (deadline, cancelation with no self-pipe, EOF, split packets).
-  - `main.zig` / `vlmzs.zig` / `cli_helper.zig`: the admission gate (`InFlight`); client report staging and `--timeout`; option parsing and validation.
-  - `line_queue.zig`: bounded lossy FIFO — drop/truncate accounting and the drain-before-cancel order.
+  - `network.zig`: private-IP classification.
 - **Golden vectors**: hard-coded hex constants in `src/crypto.zig` tests, derived from the upstream C `dump_vectors`.
-- **End-to-end**: `vlmzs` ↔ `vlmzsd` (v4/v5/v6, NDR32/NDR64, DNS, IPv4/IPv6 dual-stack, invalid-version rejection,
-  10 concurrent clients, `--max-clients` throttling).
+- **End-to-end (manual)**: `vlmzs` ↔ `vlmzsd` for v4/v5/v6 over NDR32 and NDR64, including
+  invalid-version rejection. Not part of `zig build test`.
 - **Real client**: final acceptance should be against a real Windows KMS client or packet capture (below).
 
 ## 7. Suggested final acceptance
