@@ -23,7 +23,7 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
 - `zig build` — build both binaries into `zig-out/`
 - `zig build run -- <args>` — build and run `vlmzsd`
 - `zig build test` — run unit tests (the module, both executables, `kmdconv`, and the internal
-  `network` / `cli_helper` / `line_queue` roots)
+  `network` / `cli_helper` / `line_queue` / `mpsc_queue` roots)
 - `build.zig` is the only build entrypoint — never add `make`/`gmake` targets.
 
 ## Architecture
@@ -38,7 +38,8 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
 | Server | `src/main.zig` | `vlmzsd` CLI + accept loop + `Io.Group` task dispatch onto the `std.Io.Threaded` pool |
 | Client | `src/vlmzs.zig` | `vlmzs` activation client |
 | Shared | `src/cli_helper.zig` | data-driven CLI parser (Opt table → parse/help/validate), value parsers (duration/bool/GUID), timestamped logger |
-| Log queue | `src/line_queue.zig` | bounded, lossy MPSC FIFO for log lines (preallocated, internal) |
+| Log queue | `src/line_queue.zig` | bounded, lossy MPSC FIFO for log lines (preallocated, mutex-serialized, internal) |
+| Queue (next) | `src/mpsc_queue.zig` | lock-free bounded lossy MPSC ring after Vyukov (reserve/publish on a per-cell sequence, drop counter, `awaitWork`/`close`); the intended `line_queue` replacement, not wired in yet |
 | Tests | `src/testutil.zig` | byte-compare / hex-diff helpers |
 
 ## Wire compatibility (core invariant)
