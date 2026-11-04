@@ -11,12 +11,12 @@ The `network`, `cli_helper` and `mpsc_queue` modules are internal to the
 
 ## Public modules
 
-| Module | Contents |
-|---|---|
-| `crypto` | From-scratch AES (v4 160-bit key, v6 key-schedule XOR), CMAC, HMAC-SHA256 |
-| `kmsdata` | `.kmd` binary data parsing and serialization ([`docs/kmd-format.md`](./kmd-format.md)) |
-| `kms` | KMS v4/v5/v6 protocol: request/response structs, ePID generation, response build & decrypt |
-| `rpc` | Hand-written DCE/RPC: BIND, NDR32/NDR64, FAULT framing |
+| Module    | Contents                                                                                   |
+| --------- | ------------------------------------------------------------------------------------------ |
+| `crypto`  | From-scratch AES (v4 160-bit key, v6 key-schedule XOR), CMAC, HMAC-SHA256                  |
+| `kmsdata` | `.kmd` binary data parsing and serialization ([`docs/kmd-format.md`](./kmd-format.md))     |
+| `kms`     | KMS v4/v5/v6 protocol: request/response structs, ePID generation, response build & decrypt |
+| `rpc`     | Hand-written DCE/RPC: BIND, NDR32/NDR64, FAULT framing                                     |
 
 ## Adding the dependency
 
@@ -24,7 +24,7 @@ Add it with `zig fetch --save` — Zig resolves the URL and fills in the `url`
 and `hash` for you:
 
 ```sh
-zig fetch --save git+https://github.com/mogeko/vlmzsd.git#v0.5.5
+zig fetch --save git+https://github.com/mogeko/vlmzsd.git#v0.5.6
 ```
 
 ## Wiring it into `build.zig`
