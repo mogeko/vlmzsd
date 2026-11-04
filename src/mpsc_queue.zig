@@ -111,9 +111,16 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
         /// would not widen the word the kernel compares, and would not move the
         /// wrap-around it is compared against.
         wake: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
-        /// Set while the consumer is parked, or about to be. An optimization
-        /// only: it keeps the common push from issuing a wake syscall, and a
-        /// stale read of it costs a park that `wake` has already ended.
+        /// One wake credit, held while the consumer is parked or about to be:
+        /// the consumer deposits it on the way into `futexWait`, and the first
+        /// signal to swap it back to false withdraws it and wakes. A burst of
+        /// pushes behind one parked consumer therefore pays a single wake
+        /// instead of one per push.
+        ///
+        /// An optimization, not a correctness requirement: `wake` ends the park,
+        /// so a stale read only skips a syscall the counter made unnecessary.
+        /// The common push still only *loads* it — an RMW would take this line
+        /// exclusively on every push and thrash it against the consumer.
         waiting: std.atomic.Value(bool) = .init(false),
         /// Set by `close`; producers then refuse instead of pushing.
         closed: std.atomic.Value(bool) = .init(false),
@@ -162,11 +169,18 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
         }
 
         /// Tell the consumer that the ring changed. The counter moves first and
-        /// unconditionally: that is what makes the signal impossible to lose,
-        /// and the `waiting` test only saves the syscall.
+        /// unconditionally: that is what makes the signal impossible to lose.
+        /// The `waiting` test then keeps the common push out of the kernel, and
+        /// the swap *withdraws the credit* — so a burst of pushes behind one
+        /// parked consumer pays for a single wake instead of one per push. A
+        /// stale `false` only skips a syscall the counter has made unnecessary:
+        /// the consumer's park compares against the ticket it took before
+        /// testing the ring, so a signal that arrived first ends it at once.
         fn signal(self: *Self, io: Io) void {
             _ = self.wake.fetchAdd(1, .release);
-            if (self.waiting.load(.monotonic)) io.futexWake(u32, &self.wake.raw, 1);
+            if (self.waiting.load(.monotonic) and self.waiting.swap(false, .monotonic)) {
+                io.futexWake(u32, &self.wake.raw, 1);
+            }
         }
 
         /// Claim the next position for this producer, or `null` when the ring
