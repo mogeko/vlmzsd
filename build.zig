@@ -144,10 +144,9 @@ pub fn build(b: *std.Build) void {
 
     const run_kmdconv_tests = b.addRunArtifact(kmdconv_tests);
 
-    // `network.zig`, `cli_helper.zig`, `line_queue.zig` and `mpsc_queue.zig`
-    // are internal to the binaries and no longer imported by `root.zig`, so
-    // test them directly. `network.zig` imports the `vlmzsd` module for the
-    // protocol layer.
+    // `network.zig`, `cli_helper.zig` and `mpsc_queue.zig` are internal to the
+    // binaries and no longer imported by `root.zig`, so test them directly.
+    // `network.zig` imports the `vlmzsd` module for the protocol layer.
     const network_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/network.zig"),
@@ -171,16 +170,6 @@ pub fn build(b: *std.Build) void {
 
     const run_cli_helper_tests = b.addRunArtifact(cli_helper_tests);
 
-    const line_queue_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/line_queue.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    const run_line_queue_tests = b.addRunArtifact(line_queue_tests);
-
     const mpsc_queue_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/mpsc_queue.zig"),
@@ -198,6 +187,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_kmdconv_tests.step);
     test_step.dependOn(&run_network_tests.step);
     test_step.dependOn(&run_cli_helper_tests.step);
-    test_step.dependOn(&run_line_queue_tests.step);
     test_step.dependOn(&run_mpsc_queue_tests.step);
 }

@@ -20,21 +20,21 @@ Logger contract with widely-agreed logging best practices.
   (`-v` `.debug`, `-vv`+ `.trace`; `-q` `.warn`, `-qq`+ `.err`; any `-q` wins over `-v`), from
   `VLMZSD_LOG_LEVEL`, or — deprecated — from `VLMZSD_VERBOSE`/`VLMZSD_QUIET`.
 - **Delivery**: asynchronous. A log call formats the line on the calling thread and hands it to a
-  bounded, **lossy** FIFO (`src/line_queue.zig`); a dedicated writer task owns the blocking
+  bounded, **lossy** FIFO (`src/mpsc_queue.zig`); a dedicated writer task owns the blocking
   `write`/`flush`.
 
 ## Pipeline, ordering, and loss
 
-`Logger` (producer) → `LineQueue` (bounded FIFO, 1024 × 256 B, preallocated at startup) → writer task
-(single consumer, `log_group`) → stdout/stderr.
+`Logger` (producer) → `mpsc_queue` (bounded lossy MPSC ring, 1024 × 256 B slots, preallocated at
+startup) → writer task (single consumer, `log_group`) → stdout/stderr.
 
 - **Filtered lines cost nothing**: the `min_level` check happens before formatting, locking, or
   enqueuing.
 - **Ordering is *arrival* order, not event order.** Within one thread (one connection) lines keep
-  program order. Across threads there is no total order: whoever wins the queue lock is written
-  first, and the timestamp is taken by the producer at call time — so in a rare preemption window a
-  line's timestamp may be smaller than its predecessor's. Never infer cross-thread causality from
-  log order.
+  program order. Across threads there is no total order: whoever reserves a ring slot first is
+  written first, and the timestamp is taken by the producer at call time — so in a rare preemption
+  window a line's timestamp may be smaller than its predecessor's. Never infer cross-thread
+  causality from log order.
 - **A log call returning does not mean the line is on disk.** It sits in the queue until the writer
   drains it. Only `log.shutdown(io)` — run after the connection tasks are joined and before
   `Group.cancel` cancels the writer — guarantees that everything accepted has been flushed.

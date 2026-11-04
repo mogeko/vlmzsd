@@ -4,8 +4,8 @@ The core protocol layer of `vlmzsd` is exposed as a Zig library module named
 `vlmzsd`. It is pure logic — no `std.Io`, no libc — so it can be embedded in
 any Zig project (including freestanding targets).
 
-The `network` and `cli_helper` modules are internal to the `vlmzsd`/`vlmzs`
-binaries and are **not** part of the public API.
+The `network`, `cli_helper` and `mpsc_queue` modules are internal to the
+`vlmzsd`/`vlmzs` binaries and are **not** part of the public API.
 
 > **Stability**: the public API is 0.x and may change between minor releases.
 

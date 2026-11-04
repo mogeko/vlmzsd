@@ -23,7 +23,7 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
 - `zig build` — build both binaries into `zig-out/`
 - `zig build run -- <args>` — build and run `vlmzsd`
 - `zig build test` — run unit tests (the module, both executables, `kmdconv`, and the internal
-  `network` / `cli_helper` / `line_queue` / `mpsc_queue` roots)
+  `network` / `cli_helper` / `mpsc_queue` roots)
 - `build.zig` is the only build entrypoint — never add `make`/`gmake` targets.
 
 ## Architecture
@@ -38,8 +38,7 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
 | Server | `src/main.zig` | `vlmzsd` CLI + accept loop + `Io.Group` task dispatch onto the `std.Io.Threaded` pool |
 | Client | `src/vlmzs.zig` | `vlmzs` activation client |
 | Shared | `src/cli_helper.zig` | data-driven CLI parser (Opt table → parse/help/validate), value parsers (duration/bool/GUID), timestamped logger |
-| Log queue | `src/line_queue.zig` | bounded, lossy MPSC FIFO for log lines (preallocated, mutex-serialized, internal) |
-| Queue (next) | `src/mpsc_queue.zig` | lock-free bounded lossy MPSC ring after Vyukov (reserve/publish on a per-cell sequence, drop counter, `awaitWork`/`close`); the intended `line_queue` replacement, not wired in yet |
+| Log queue | `src/mpsc_queue.zig` | lock-free bounded lossy MPSC ring after Vyukov (`Queue(T, capacity)`): reserve/publish on a per-cell sequence, a monotonic drop total, and a counter-based `awaitWork`/`close`. The logger instantiates it with its own slot type and depth. |
 | Tests | `src/testutil.zig` | byte-compare / hex-diff helpers |
 
 ## Wire compatibility (core invariant)
@@ -68,9 +67,9 @@ source linked above).
   `--verbose`/`--quiet` are repeatable (`-v` `debug`, `-vv` `trace`; `-q` `warn`, `-qq` `err`; any
   `-q` wins over `-v`); `VLMZSD_LOG_LEVEL` selects the level directly, and the deprecated
   `VLMZSD_VERBOSE`/`VLMZSD_QUIET` warn when present (see `docs/cli.md`). Lines are handed to a
-  bounded, **lossy** queue (`src/line_queue.zig`) and written by a dedicated writer task; a full
-  queue drops the line (counted, and reported on stderr as a per-period delta when the writer goes
-  idle and as the run's total at shutdown) instead of blocking a worker. Shutdown order
+  bounded, **lossy** queue (`src/mpsc_queue.zig`) and written by a dedicated writer task; a full
+  queue drops the line (the queue's monotonic total is reported on stderr as a per-period delta when
+  the writer goes idle and as the run's total at shutdown) instead of blocking a worker. Shutdown order
   is `conn_group.cancel` → `log.shutdown` → `log_group.cancel` → `log.deinit`, so lines logged while
   connections stop are still flushed. A second `SIGINT`/`SIGTERM` skips that drain and `_exit`s with
   `128 + signum`, so a blocked log sink cannot wedge a stop (see `docs/cli.md`). On a fatal startup
