@@ -105,6 +105,11 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
         /// boolean latch cannot promise that: re-arming it is a plain store
         /// that erases a `close` arriving at the wrong moment, and nothing is
         /// left to wake the consumer.
+        ///
+        /// 32 bits because the wait is a single futex word: `Io.futexWait` only
+        /// takes a `u32` (`@sizeOf(T) == @sizeOf(u32)`), so a wider counter
+        /// would not widen the word the kernel compares, and would not move the
+        /// wrap-around it is compared against.
         wake: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
         /// Set while the consumer is parked, or about to be. An optimization
         /// only: it keeps the common push from issuing a wake syscall, and a
