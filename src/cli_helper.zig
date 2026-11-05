@@ -324,6 +324,9 @@ pub const Level = enum {
 /// Maximum line length in bytes, including the trailing newline.
 const slot_size = 256;
 
+/// Length of the `YYYY-MM-DDTHH:MM:SSZ ` prefix every line starts with.
+const timestamp_len = 21;
+
 /// Ring depth. A power of two, which is what `mpsc_queue` requires.
 const capacity = 1024;
 
@@ -417,27 +420,28 @@ pub const Logger = struct {
         // nothing after formatting. The timestamp is taken here, at call time: it
         // records when the event happened, not when the writer got to it.
         var slot: Slot = .{ .err = level == .warn or level == .err, .len = 0, .bytes = undefined };
-        var writer: std.Io.Writer = .fixed(&slot.bytes);
-        writeTimestamp(&writer, self.io);
-        writer.writeAll(levelLabel(level)) catch {};
+        writeTimestampPrefix(slot.bytes[0..timestamp_len], self.io);
+        var line: std.Io.Writer = .fixed(slot.bytes[timestamp_len..]);
+        line.writeAll(levelLabel(level)) catch {};
         var full = false;
-        writer.print(fmt, args) catch {
+        line.print(fmt, args) catch {
             full = true;
         };
-        if (!full) writer.writeAll("\n") catch {
+        if (!full) line.writeAll("\n") catch {
             full = true;
         };
-        var bytes = writer.buffered();
         if (full) {
-            // A fixed writer only fails when the buffer is full, so the line
-            // holds exactly `slot_size` bytes. Overwrite the last byte with the
-            // newline to keep it a single, greppable line.
-            std.debug.assert(bytes.len == slot_size);
+            // A fixed writer only fails when the buffer is full, and it fills
+            // the buffer before failing, so the line holds exactly `slot_size`
+            // bytes. Overwrite the last byte with the newline to keep it a
+            // single, greppable line.
+            std.debug.assert(line.buffered().len == slot_size - timestamp_len);
             slot.bytes[slot_size - 1] = '\n';
-            bytes = &slot.bytes;
+            slot.len = slot_size;
             _ = self.truncated.fetchAdd(1, .monotonic);
+        } else {
+            slot.len = @intCast(timestamp_len + line.buffered().len);
         }
-        slot.len = @intCast(bytes.len);
 
         // The queue counts refusals itself, as a monotonic total the writer
         // turns into period deltas.
@@ -602,7 +606,9 @@ fn levelLabel(level: Level) []const u8 {
 /// One loss report: `<timestamp> warning: logging: dropped N line(s), truncated
 /// M line(s) <scope>`, where the scope names the period the numbers cover.
 fn writeCounterLine(w: *std.Io.Writer, io: Io, loss: Loss, scope: []const u8) void {
-    writeTimestamp(w, io);
+    var prefix: [timestamp_len]u8 = undefined;
+    writeTimestampPrefix(&prefix, io);
+    w.writeAll(&prefix) catch {};
     w.writeAll(levelLabel(.warn)) catch {};
     w.print("logging: dropped {d} line(s), truncated {d} line(s) {s}\n", .{
         loss.dropped,
@@ -612,15 +618,15 @@ fn writeCounterLine(w: *std.Io.Writer, io: Io, loss: Loss, scope: []const u8) vo
     w.flush() catch {};
 }
 
-/// Write a UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp followed by a space.
-fn writeTimestamp(w: *std.Io.Writer, io: Io) void {
+/// Write a UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp followed by a space. Its length
+/// is fixed, so it can be formatted straight into the line it belongs to.
+fn writeTimestampPrefix(buf: *[timestamp_len]u8, io: Io) void {
     const secs: u64 = @intCast(@divTrunc(Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_s));
     const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
     const yad = epoch.getEpochDay().calculateYearDay();
     const mad = yad.calculateMonthDay();
     const day_secs: u64 = secs % 86400;
-    var buf: [20]u8 = undefined;
-    const ts = std.fmt.bufPrint(&buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+    const written = std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z ", .{
         @as(u32, yad.year),
         @as(u32, @backingInt(mad.month)),
         @as(u32, mad.day_index) + 1,
@@ -628,8 +634,7 @@ fn writeTimestamp(w: *std.Io.Writer, io: Io) void {
         @as(u32, @intCast((day_secs % 3600) / 60)),
         @as(u32, @intCast(day_secs % 60)),
     }) catch unreachable;
-    w.writeAll(ts) catch {};
-    w.writeAll(" ") catch {};
+    std.debug.assert(written.len == timestamp_len);
 }
 
 /// Current Unix time in seconds (via the `realtime` clock).
