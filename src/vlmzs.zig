@@ -797,11 +797,7 @@ pub fn main(init: std.process.Init) !void {
 
     var res = cli_helper.parse(init.gpa, &vlmzs_opts, args_list.items) catch |err| {
         // Short diagnostic; the full help is one `--help` away.
-        var ebuf: [256]u8 = undefined;
-        var ew = std.Io.File.writer(std.Io.File.stderr(), init.io, &ebuf);
-        ew.interface.print("vlmzs: error: {s}\n", .{@errorName(err)}) catch {};
-        ew.interface.flush() catch {};
-        std.process.exit(1);
+        cli_helper.fatalStderr(init.io, "vlmzs", "{s}", .{@errorName(err)});
     };
     defer res.deinit();
 

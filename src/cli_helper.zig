@@ -367,8 +367,9 @@ const Loss = struct {
 /// on the calling thread, hands the slot over, and returns without touching the
 /// stdout/stderr descriptors. The blocking `write`/`flush` belongs to a
 /// dedicated writer task (`writerLoop`), so a slow consumer can never stall a
-/// worker. If that task cannot be started, `direct` degrades to writing
-/// synchronously from the calling thread.
+/// worker. There is no synchronous mode: without that task the queue has no
+/// consumer, so a caller that cannot start it reports on stderr and exits
+/// (see `fatalStderr`).
 pub const Logger = struct {
     io: Io,
     /// Messages below this level are dropped. Written once by `main` before any
@@ -380,19 +381,8 @@ pub const Logger = struct {
     /// this struct would point into the temporary that was just moved.
     out_buffer: []u8,
     err_buffer: []u8,
-    /// Degraded mode: writers write synchronously (the pre-queue behavior).
-    /// Set once, before any producer thread starts.
-    direct: bool = false,
-    /// Test seam for the degraded path. When set, `writeDirect` writes here
-    /// instead of the process descriptors: `zig build test` runs the test binary
-    /// with `--listen=-`, where stdout carries the runner's protocol, so a test
-    /// must never write to the real stdout. Production leaves these null.
-    direct_out: ?*std.Io.Writer = null,
-    direct_err: ?*std.Io.Writer = null,
     /// Set by the writer task once every accepted line has been flushed.
     done: Io.Event = .unset,
-    /// Guards the degraded synchronous path only.
-    direct_mutex: Io.Mutex = .init,
     /// Lines shortened to fit a slot (see `emit`). Producers only add; the
     /// writer turns the monotonic total into a period delta, the same way it
     /// reports the queue's drop total.
@@ -449,10 +439,6 @@ pub const Logger = struct {
         }
         slot.len = @intCast(bytes.len);
 
-        if (self.direct) {
-            self.writeDirect(bytes, slot.err);
-            return;
-        }
         // The queue counts refusals itself, as a monotonic total the writer
         // turns into period deltas.
         _ = self.queue.tryPush(self.io, slot);
@@ -478,26 +464,9 @@ pub const Logger = struct {
         self.emit(.err, fmt, args);
     }
 
-    /// Synchronous fallback for `direct` mode: take the lock, write and flush
-    /// from the calling thread, exactly like the pre-queue logger did.
-    fn writeDirect(self: *Logger, bytes: []const u8, to_err: bool) void {
-        self.direct_mutex.lockUncancelable(self.io);
-        defer self.direct_mutex.unlock(self.io);
-        if (if (to_err) self.direct_err else self.direct_out) |writer| {
-            writer.writeAll(bytes) catch {};
-            writer.flush() catch {};
-            return;
-        }
-        const file = if (to_err) std.Io.File.stderr() else std.Io.File.stdout();
-        var file_writer = std.Io.File.writer(file, self.io, if (to_err) self.err_buffer else self.out_buffer);
-        file_writer.interface.writeAll(bytes) catch {};
-        file_writer.interface.flush() catch {};
-    }
-
     /// Writer task body, dispatched with `Group.concurrent`. Owns the blocking
     /// I/O for both streams.
     pub fn writerLoop(self: *Logger) void {
-        std.debug.assert(!self.direct);
         var out_writer = std.Io.File.writer(std.Io.File.stdout(), self.io, self.out_buffer);
         var err_writer = std.Io.File.writer(std.Io.File.stderr(), self.io, self.err_buffer);
         self.runWriter(&out_writer.interface, &err_writer.interface);
@@ -598,14 +567,27 @@ pub const Logger = struct {
     }
 
     /// Stop accepting lines and block until the writer task has drained and
-    /// flushed everything. Must be called before `Group.cancel` (which would
+    /// flushed everything. Only valid while `writerLoop` is running: nothing
+    /// else latches `done`, so a caller whose writer task never started must
+    /// not reach here. Must be called before `Group.cancel` (which would
     /// cancel the writer) and before `deinit`. Idempotent.
     pub fn shutdown(self: *Logger, io: Io) void {
-        if (self.direct) return;
         self.queue.close(io);
         self.done.waitUncancelable(io);
     }
 };
+
+/// Report a startup failure that has no log consumer behind it — a parse error,
+/// or a writer task the pool refused to start — and exit. It cannot go through
+/// `Logger`: the line would be queued with nobody to drain it, since the queue's
+/// only consumer is the writer task that is missing.
+pub fn fatalStderr(io: Io, comptime program: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.File.writer(std.Io.File.stderr(), io, &buf);
+    w.interface.print(program ++ ": error: " ++ fmt ++ "\n", args) catch {};
+    w.interface.flush() catch {};
+    std.process.exit(1);
+}
 
 fn levelLabel(level: Level) []const u8 {
     return switch (level) {
@@ -871,14 +853,15 @@ test "help renders groups" {
 }
 
 // The producer/writer split is pinned here: formatting and stream routing, the
-// `min_level` early return, drop/truncate accounting, drain-on-shutdown, and
-// the degraded `direct` path. The writer loop runs on the test thread against
-// memory sinks (they are parameters of `runWriter`), so each case is
-// deterministic; only the real task dispatch is left to `main`.
+// `min_level` early return, drop/truncate accounting, and drain-on-shutdown.
+// The writer loop runs on the test thread against memory sinks (they are
+// parameters of `runWriter`), so each case is deterministic; only the real task
+// dispatch is left to `main`.
 //
 // No test may write to the process descriptors: `zig build test` runs the test
 // binary with `--listen=-`, where stdout is the runner's protocol channel, and a
-// stray line deadlocks the build. Hence the injectable `direct_*` sinks.
+// stray line deadlocks the build. Hence `runWriter` takes both sinks as
+// parameters instead of owning them.
 test "logger routes levels to the matching sink" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -1023,27 +1006,6 @@ test "shutdown drains what the queue accepted and is idempotent" {
     // `done` is latched by `runWriter`, so both calls return without blocking.
     log.shutdown(io);
     log.shutdown(io);
-}
-
-test "direct mode writes synchronously and bypasses the queue" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out_buffer: [4096]u8 = undefined;
-    var err_buffer: [4096]u8 = undefined;
-    var log = try Logger.init(gpa, io, &out_buffer, &err_buffer);
-    defer log.deinit(gpa);
-    log.direct = true;
-    log.min_level = .debug;
-
-    var sink: [512]u8 = undefined;
-    var sink_writer: std.Io.Writer = .fixed(&sink);
-    log.direct_out = &sink_writer;
-
-    log.info("direct {d}", .{1});
-
-    try std.testing.expect(std.mem.indexOf(u8, sink_writer.buffered(), "direct 1") != null);
-    var batch: [4]Slot = undefined;
-    try std.testing.expectEqual(@as(usize, 0), log.queue.popBatch(&batch));
 }
 
 // The loss report has two shapes: the delta since the writer's last report when

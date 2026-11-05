@@ -156,4 +156,5 @@ source linked above).
 - **Never write to the real stdout/stderr from a test.** `zig build test` runs each test binary with
   `--listen=-`, where stdout carries the runner's protocol: a stray write to fd 1 corrupts it and
   deadlocks the build. A standalone `zig test <file>` stays green (human mode), so it looks like a
-  deadlock in the code under test. Inject a sink instead — see `Logger.direct_out`/`direct_err`.
+  deadlock in the code under test. Inject a sink instead — `Logger.runWriter` takes both sinks as
+  parameters.

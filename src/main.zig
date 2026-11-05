@@ -1015,11 +1015,7 @@ pub fn main(init: std.process.Init) !void {
 
     var res = cli_helper.parse(init.gpa, &vlmzsd_opts, args_list.items) catch |err| {
         // Short diagnostic; the full help is one `--help` away.
-        var ebuf: [256]u8 = undefined;
-        var ew = std.Io.File.writer(std.Io.File.stderr(), init.io, &ebuf);
-        ew.interface.print("vlmzsd: error: {s}\n", .{@errorName(err)}) catch {};
-        ew.interface.flush() catch {};
-        std.process.exit(1);
+        cli_helper.fatalStderr(init.io, "vlmzsd", "{s}", .{@errorName(err)});
     };
     defer res.deinit();
 
@@ -1052,9 +1048,9 @@ pub fn main(init: std.process.Init) !void {
     defer log_group.cancel(init.io);
     defer log.shutdown(init.io);
     log_group.concurrent(init.io, logWriterTask, .{ &log, &tally }) catch |e| {
-        // Degraded mode: the pool refused the task, so log synchronously.
-        log.direct = true;
-        log.warn("failed to start log writer task: {s}; logging synchronously", .{@errorName(e)});
+        // No writer task means no consumer for the queue, so `fatal` would
+        // block in `shutdown`: report without the logger and exit.
+        cli_helper.fatalStderr(init.io, "vlmzsd", "failed to start log writer task: {s}", .{@errorName(e)});
     };
 
     var opts = resolveOptions(init.gpa, init.environ_map, &res) catch |e| {
