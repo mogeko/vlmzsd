@@ -140,9 +140,13 @@ source linked above).
   when `git gc` packs refs into `packed-refs`. That is why `--version` prints the commit only when the
   build was given `-Dgit-sha` (CI and the container pass it) and carries no build date. Verify with
   `zig build --cache-poison=disallowed`.
-- **Container builds must use `-Dcpu=baseline`.** `zig build` defaults to the *native* CPU model;
-  a CI ARM runner (e.g. Graviton) then emits SVE instructions that crash with SIGILL on CPUs
-  without SVE (e.g. Apple Silicon). The `Dockerfile` pins `-Dcpu=baseline` for portability.
+- **Container builds must use `-Dcpu=baseline` by default.** `zig build` defaults to the *native*
+  CPU model; a CI ARM runner (e.g. Graviton) then emits SVE instructions that crash with SIGILL on
+  CPUs without SVE (e.g. Apple Silicon). The `Dockerfile` therefore defaults its `VLMZSD_CPU`
+  build arg to `baseline` and passes it as `-Dcpu=`; `--build-arg VLMZSD_CPU=<model>[+feat-feat]`
+  overrides it for an image targeted at known CPUs (the trimming and validation are Zig's, so an
+  invalid value fails the build and prints the architecture's models). `VLMZSD_OPTIMIZE` does the
+  same for `-Doptimize`, defaulting to `safe`.
 - **Module code must not reference `std.c`.** `build.zig` sets `link_libc = false` for the `vlmzsd`
   module; only the `vlmzsd` executable links libc (for `std.c.pipe`/`fcntl`/`getpid` in
   `src/main.zig`). A `std.c` reference in a module file — including inside a `test` block, which is

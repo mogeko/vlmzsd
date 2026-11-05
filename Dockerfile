@@ -43,11 +43,16 @@ COPY ./build.zig.zon /opt/app/build.zig.zon
 COPY ./LICENSE /opt/app/LICENSE
 COPY ./README.md /opt/app/README.md
 
+# `-Dcpu` for the build: a model name, optionally with `+feat`/`-feat`. Keep
+# `baseline` unless the image is built and run for the same CPU.
+ARG VLMZSD_CPU="baseline"
+# `-Doptimize` for the build: debug, safe, fast, or small.
+ARG VLMZSD_OPTIMIZE="safe"
 # Pass it in — `--build-arg VLMZSD_GIT_SHA=$(git rev-parse --short HEAD)`,
 # or `$(git rev-parse HEAD)`, since `build.zig` trims it to 7 characters.
 ARG VLMZSD_GIT_SHA
 
-RUN zig build vlmzsd vlmzs -Dcpu=baseline -Doptimize=safe \
+RUN zig build -Dcpu="${VLMZSD_CPU}" -Doptimize="${VLMZSD_OPTIMIZE}" \
         -Dgit-sha="${VLMZSD_GIT_SHA}" -Dno-embedded-data
 
 FROM gcr.io/distroless/base-nossl-debian13:nonroot
