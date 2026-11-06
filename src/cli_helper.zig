@@ -505,6 +505,8 @@ pub const Logger = struct {
         // Final report: the run's totals, written even when the idle reports
         // already covered them, so the last word on the log is the tally.
         self.reportCounters(err_writer, .final);
+        // Belt and braces: both drains above already flushed, but `done` must
+        // never be set with bytes still buffered.
         out_writer.flush() catch {};
         err_writer.flush() catch {};
         self.done.set(self.io);
