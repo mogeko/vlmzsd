@@ -108,7 +108,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const git_hash = commitHash(b);
-    const embed_data = !(b.option(bool, "no-embedded-data", "Do not embed the default .kmd data; vlmzsd then requires --data <file>") orelse false);
+    const embed_data = !(b.option(
+        bool,
+        "no-embedded-data",
+        "Omit the default .kmd data; both binaries then require --data <file>",
+    ) orelse false);
 
     // The protocol layer as a library: no `std.Io`, no libc. `optimize` is set
     // here as well as on each binary's module so that the library's own test
