@@ -151,6 +151,12 @@ pub fn build(b: *std.Build) void {
         .description = "Build the kmdconv developer tool (JSON <-> .kmd)",
     });
 
+    // The `.kmd` data as a file too, so an installed tree works without the
+    // copy embedded in the binaries: `<prefix>/share/vlmzsd` is on the runtime
+    // search path (`cli_helper.loadFhsKmd`).
+    const install_data = b.addInstallFile(b.path("src/vlmcsd.kmd"), "share/vlmzsd/data.kmd");
+    b.getInstallStep().dependOn(&install_data.step);
+
     const run_cmd = b.addRunArtifact(server.exe);
     run_cmd.step.dependOn(&server.install.step);
     run_cmd.addPassthruArgs();
