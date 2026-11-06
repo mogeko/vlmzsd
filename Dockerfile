@@ -52,16 +52,17 @@ ARG VLMZSD_OPTIMIZE="safe"
 # or `$(git rev-parse HEAD)`, since `build.zig` trims it to 7 characters.
 ARG VLMZSD_GIT_SHA
 
-RUN zig build -Dcpu="${VLMZSD_CPU}" -Doptimize="${VLMZSD_OPTIMIZE}" \
+RUN zig build install --prefix /usr/ \
+        -Dcpu="${VLMZSD_CPU}" -Doptimize="${VLMZSD_OPTIMIZE}" \
         -Dgit-sha="${VLMZSD_GIT_SHA}" -Dno-embedded-data
 
 FROM gcr.io/distroless/base-nossl-debian13:nonroot
 
 USER nonroot
 
-COPY --from=builder /opt/app/zig-out/bin/vlmzsd /usr/bin/vlmzsd
-COPY --from=builder /opt/app/zig-out/bin/vlmzs /usr/bin/vlmzs
-COPY --from=builder /opt/app/src/vlmcsd.kmd /usr/share/vlmzsd/data.kmd
+COPY --from=builder /usr/bin/vlmzsd /usr/bin/vlmzsd
+COPY --from=builder /usr/bin/vlmzs /usr/bin/vlmzs
+COPY --from=builder /usr/share/vlmzsd/data.kmd /usr/share/vlmzsd/data.kmd
 COPY --from=builder /opt/app/LICENSE /usr/share/doc/vlmzsd/copyright
 COPY --from=builder /opt/app/README.md /usr/share/doc/vlmzsd/README.md
 
