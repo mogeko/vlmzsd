@@ -30,162 +30,146 @@ fn commitHash(b: *std.Build) []const u8 {
     return trimmed[0..7];
 }
 
+/// The state the helpers below share: the build, its resolved target and
+/// optimize mode, the `vlmzsd` library module, and `build_options`.
+const Context = struct {
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    /// The `vlmzsd` library module: the protocol layer, imported by all three
+    /// binaries and by the test roots that need it.
+    lib: *std.Build.Module,
+    /// `build_options`, shared by the three binaries.
+    options: *std.Build.Step.Options,
+
+    /// One executable and what the graph wants from it: the artifact, its
+    /// install step, and the `zig build <name>` step that produces just it. The
+    /// module is kept so the tests can reuse it — a test compiled from the same
+    /// module runs in the same configuration (target, optimize, libc, imports,
+    /// build options) as the shipped binary.
+    const Binary = struct {
+        exe: *std.Build.Step.Compile,
+        /// Needed by `run`, which installs before launching.
+        install: *std.Build.Step.InstallArtifact,
+    };
+
+    const BinaryOptions = struct {
+        /// Shown by `zig build --help`; derived from the name when empty.
+        description: []const u8 = "",
+        /// Part of `zig build` (the default install step).
+        installed: bool = true,
+        /// `true` only for the server: `src/main.zig` uses `std.c` for the
+        /// self-pipe, `fcntl` and `getpid`.
+        libc: bool = false,
+    };
+
+    fn binary(ctx: Context, name: []const u8, root: []const u8, opts: BinaryOptions) Binary {
+        const exe = ctx.b.addExecutable(.{
+            .name = name,
+            .root_module = ctx.b.createModule(.{
+                .root_source_file = ctx.b.path(root),
+                .target = ctx.target,
+                .optimize = ctx.optimize,
+                .link_libc = opts.libc,
+                .imports = &.{
+                    .{ .name = "vlmzsd", .module = ctx.lib },
+                },
+            }),
+        });
+        exe.root_module.addOptions("build_options", ctx.options);
+
+        const install = ctx.b.addInstallArtifact(exe, .{});
+        if (opts.installed) ctx.b.getInstallStep().dependOn(&install.step);
+        const description = if (opts.description.len == 0) ctx.b.fmt("Build {s}", .{name}) else opts.description;
+        ctx.b.step(name, description).dependOn(&install.step);
+
+        return .{ .exe = exe, .install = install };
+    }
+
+    /// A module rooted at one `src/` file, for tests the binaries' own roots do
+    /// not reach. Zig discovers `test` blocks through semantic analysis, so a
+    /// file whose tests nothing references would otherwise never run; a root of
+    /// its own makes its coverage independent of what happens to import it. The
+    /// `vlmzsd` import costs nothing for the files that do not use it: an unused
+    /// import is never analyzed.
+    fn fileModule(ctx: Context, path: []const u8) *std.Build.Module {
+        return ctx.b.createModule(.{
+            .root_source_file = ctx.b.path(path),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+            .imports = &.{
+                .{ .name = "vlmzsd", .module = ctx.lib },
+            },
+        });
+    }
+
+    /// Attach one test binary per root to `step`.
+    fn addTests(ctx: Context, step: *std.Build.Step, roots: []const *std.Build.Module) void {
+        for (roots) |root| {
+            const tests = ctx.b.addTest(.{ .root_module = root });
+            step.dependOn(&ctx.b.addRunArtifact(tests).step);
+        }
+    }
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const git_hash = commitHash(b);
-    const mod = b.addModule("vlmzsd", .{
+    const embed_data = !(b.option(bool, "no-embedded-data", "Do not embed the default .kmd data; vlmzsd then requires --data <file>") orelse false);
+
+    // The protocol layer as a library: no `std.Io`, no libc. `optimize` is set
+    // here as well as on each binary's module so that the library's own test
+    // root compiles in the mode the caller asked for.
+    const lib = b.addModule("vlmzsd", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .optimize = optimize,
         .link_libc = false,
     });
 
-    // Expose build-time facts (version, commit hash, embedded-data flag) to
-    // source via `@import("build_options")`.
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", version);
+    // Build-time facts for `@import("build_options")`.
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", version);
     // What `--version` prints: the bare semver, plus the commit when the build
     // was given one. The format lives here so the three binaries cannot drift.
-    build_options.addOption([]const u8, "version_display", if (git_hash.len == 0)
+    options.addOption([]const u8, "version_display", if (git_hash.len == 0)
         version
     else
         b.fmt("{s} ({s})", .{ version, git_hash }));
-    build_options.addOption(bool, "embedded_data", !(b.option(bool, "no-embedded-data", "Do not embed the default .kmd data; vlmzsd then requires --data <file>") orelse false));
+    options.addOption(bool, "embedded_data", embed_data);
 
-    const exe = b.addExecutable(.{
-        .name = "vlmzsd",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "vlmzsd", .module = mod },
-            },
-        }),
+    const ctx: Context = .{
+        .b = b,
+        .target = target,
+        .optimize = optimize,
+        .lib = lib,
+        .options = options,
+    };
+
+    const server = ctx.binary("vlmzsd", "src/main.zig", .{ .libc = true });
+    const client = ctx.binary("vlmzs", "src/vlmzs.zig", .{});
+    // A developer tool (JSON <-> .kmd), deliberately outside the default install.
+    const kmdconv = ctx.binary("kmdconv", "src/kmdconv.zig", .{
+        .installed = false,
+        .description = "Build the kmdconv developer tool (JSON <-> .kmd)",
     });
 
-    exe.root_module.addOptions("build_options", build_options);
-
-    const exe_install = b.addInstallArtifact(exe, .{});
-    b.getInstallStep().dependOn(&exe_install.step);
-    const vlmzsd_step = b.step("vlmzsd", "Build the vlmzsd server only");
-    vlmzsd_step.dependOn(&exe_install.step);
-
-    const vlmzs_exe = b.addExecutable(.{
-        .name = "vlmzs",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/vlmzs.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "vlmzsd", .module = mod },
-            },
-        }),
-    });
-
-    vlmzs_exe.root_module.addOptions("build_options", build_options);
-
-    const vlmzs_install = b.addInstallArtifact(vlmzs_exe, .{});
-    b.getInstallStep().dependOn(&vlmzs_install.step);
-    const vlmzs_step = b.step("vlmzs", "Build the vlmzs client only");
-    vlmzs_step.dependOn(&vlmzs_install.step);
-
-    // kmdconv: developer tool (JSON <-> .kmd). Not installed by default — it
-    // is not part of the user-facing surface, only built via `zig build kmdconv`.
-    const kmdconv_exe = b.addExecutable(.{
-        .name = "kmdconv",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/kmdconv.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "vlmzsd", .module = mod },
-            },
-        }),
-    });
-
-    kmdconv_exe.root_module.addOptions("build_options", build_options);
-
-    const kmdconv_install = b.addInstallArtifact(kmdconv_exe, .{});
-    const kmdconv_step = b.step("kmdconv", "Build the kmdconv developer tool (JSON <-> .kmd)");
-    kmdconv_step.dependOn(&kmdconv_install.step);
-
-    const run_step = b.step("run", "Run the app");
-
-    const run_cmd = b.addRunArtifact(exe);
-    run_step.dependOn(&run_cmd.step);
-
-    run_cmd.step.dependOn(b.getInstallStep());
-
+    const run_cmd = b.addRunArtifact(server.exe);
+    run_cmd.step.dependOn(&server.install.step);
     run_cmd.addPassthruArgs();
+    b.step("run", "Run the app").dependOn(&run_cmd.step);
 
-    const mod_tests = b.addTest(.{
-        .root_module = mod,
+    // One root per compilation unit. The binaries' modules cover the files their
+    // tests reach; the three file roots cover sources they do not, and are why
+    // some tests run in more than one root.
+    ctx.addTests(b.step("test", "Run tests"), &.{
+        lib,
+        server.exe.root_module,
+        client.exe.root_module,
+        kmdconv.exe.root_module,
+        ctx.fileModule("src/network.zig"),
+        ctx.fileModule("src/cli_helper.zig"),
+        ctx.fileModule("src/mpsc_queue.zig"),
     });
-
-    const run_mod_tests = b.addRunArtifact(mod_tests);
-
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-
-    const vlmzs_tests = b.addTest(.{
-        .root_module = vlmzs_exe.root_module,
-    });
-
-    const run_vlmzs_tests = b.addRunArtifact(vlmzs_tests);
-
-    const kmdconv_tests = b.addTest(.{
-        .root_module = kmdconv_exe.root_module,
-    });
-
-    const run_kmdconv_tests = b.addRunArtifact(kmdconv_tests);
-
-    // `network.zig`, `cli_helper.zig` and `mpsc_queue.zig` are internal to the
-    // binaries and no longer imported by `root.zig`, so test them directly.
-    // `network.zig` imports the `vlmzsd` module for the protocol layer.
-    const network_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/network.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "vlmzsd", .module = mod },
-            },
-        }),
-    });
-
-    const run_network_tests = b.addRunArtifact(network_tests);
-
-    const cli_helper_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/cli_helper.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    const run_cli_helper_tests = b.addRunArtifact(cli_helper_tests);
-
-    const mpsc_queue_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/mpsc_queue.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    const run_mpsc_queue_tests = b.addRunArtifact(mpsc_queue_tests);
-
-    const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
-    test_step.dependOn(&run_vlmzs_tests.step);
-    test_step.dependOn(&run_kmdconv_tests.step);
-    test_step.dependOn(&run_network_tests.step);
-    test_step.dependOn(&run_cli_helper_tests.step);
-    test_step.dependOn(&run_mpsc_queue_tests.step);
 }
