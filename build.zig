@@ -151,9 +151,10 @@ pub fn build(b: *std.Build) void {
         .description = "Build the kmdconv developer tool (JSON <-> .kmd)",
     });
 
-    // The `.kmd` data as a file too, so an installed tree works without the
-    // copy embedded in the binaries: `<prefix>/share/vlmzsd` is on the runtime
-    // search path (`cli_helper.loadFhsKmd`).
+    // The `.kmd` data as a file too, so an installed tree can run without the
+    // copy embedded in the binaries. `<prefix>/share/vlmzsd` is searched only
+    // when the prefix is `/usr` or `/usr/local` (`cli_helper.fhs_system_dirs`);
+    // anywhere else, pass `--data`.
     const install_data = b.addInstallFile(b.path("src/vlmcsd.kmd"), "share/vlmzsd/data.kmd");
     b.getInstallStep().dependOn(&install_data.step);
 
