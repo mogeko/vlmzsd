@@ -2,20 +2,12 @@ const std = @import("std");
 /// The project version, read from `build.zig.zon` (single source of truth).
 const version = @import("build.zig.zon").version;
 
-/// The commit hash to show in `--version`, or `""` when the build was not given
-/// one. Release builds pass `-Dgit-sha=$GITHUB_SHA`: CI does, and the container
-/// must because its context has no `.git` and its image installs no `git`. The
-/// value is trimmed to 7 characters here, so a 40-character SHA prints exactly
-/// like `git rev-parse --short`; a value that is not hex, or already short, is
-/// kept as given.
+/// The commit hash embedded in `--version`, or `""` when `-Dgit-sha` was not
+/// given. A hex value longer than 7 characters is trimmed the way
+/// `git rev-parse --short` prints it; anything else is kept as given.
 ///
-/// Deliberately *not* read from `git` at configure time, and no build date: both
-/// are untracked state, which 0.17 answers with a poisoned configuration cache —
-/// a configurer process on every `zig build`, for a string that only decorates
-/// `--version`. No `dependOn*` declaration replaces it either: none expresses
-/// the wall clock, and a content dependency on the git ref dies when `git gc`
-/// packs refs away. A build date on top would also make two builds of the same
-/// commit differ between days.
+/// Not read from `git` at configure time: that is untracked state, and 0.17
+/// answers it by poisoning the configure cache (see AGENTS.md).
 fn commitHash(b: *std.Build) []const u8 {
     const given = b.option(
         []const u8,
