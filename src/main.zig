@@ -36,6 +36,12 @@ const pid_str_buffer_size = 16;
 /// "unlimited" (docs/cli.md §5).
 const default_client_cap: u32 = 1024;
 
+/// `--lcid` and `--build` bounds for randomized ePIDs (docs/cli.md §5). The
+/// generator takes the LCID as a non-negative `i16`, and Windows build numbers
+/// fit in 16 bits; `0` means "pick one at random".
+const max_lcid: u32 = 32767;
+const max_build: u32 = 65535;
+
 /// Embedded default `.kmd` data, unless built with `-Dno-embedded-data`
 /// (then `--data <file>` is required at runtime).
 const embedded_kmd: []const u8 = if (build_options.embedded_data) @embedFile("vlmcsd.kmd") else &.{};
@@ -75,7 +81,7 @@ const vlmzsd_opts = [_]cli_helper.Opt{
 const ServerOptions = struct {
     port: u16 = default_port,
     listen: []const []const u8 = &.{"::"},
-    timeout_seconds: u64 = 30,
+    timeout_seconds: u32 = 30,
     max_clients: u32 = default_client_cap,
     data_file: ?[]const u8 = null,
     epids: []const []const u8 = &.{},
@@ -207,31 +213,40 @@ fn resolveDurationMinutes(
 ) !u32 {
     const raw = cli_val orelse envGet(env, env_name) orelse default_str;
     const seconds = try cli_helper.parseDurationSeconds(raw);
-    return @intCast(seconds / 60);
+    return std.math.cast(u32, seconds / 60) orelse error.IntervalOutOfRange;
 }
 
-/// Split a comma-separated env-var value into a trimmed list (gpa-allocated).
+/// Split a comma-separated env-var value into a trimmed list. The returned
+/// slice is the whole allocation, so the caller can free it with the length it
+/// received. Empty and whitespace-only segments are skipped.
 fn splitList(gpa: Allocator, s: []const u8) ![]const []const u8 {
-    var count: usize = 1;
-    for (s) |c| {
-        if (c == ',') count += 1;
+    var count: usize = 0;
+    var scan = std.mem.splitScalar(u8, s, ',');
+    while (scan.next()) |item| {
+        if (std.mem.trim(u8, item, " \t").len > 0) count += 1;
     }
+
     const out = try gpa.alloc([]const u8, count);
-    errdefer gpa.free(out);
     var it = std.mem.splitScalar(u8, s, ',');
     var i: usize = 0;
     while (it.next()) |item| {
         const trimmed = std.mem.trim(u8, item, " \t");
-        if (trimmed.len > 0) {
-            out[i] = trimmed;
-            i += 1;
-        }
+        if (trimmed.len == 0) continue;
+        out[i] = trimmed;
+        i += 1;
     }
-    return out[0..i];
+    std.debug.assert(i == count);
+    return out;
 }
 
 fn resolveOptions(gpa: Allocator, env: *const EnvironMap, res: *const cli_helper.Result) !ServerOptions {
+    // `vlmzsd` takes options only; a stray word is a mistyped flag value, not
+    // something to ignore.
+    if (res.positionals.items.len > 0) return error.UnexpectedPositional;
+
     var opts = ServerOptions{};
+    // The env-var lists own memory, so every error below releases them.
+    errdefer opts.deinit(gpa);
 
     opts.port = try resolveInt(u16, res.get("port"), env, "VLMZSD_PORT", default_port);
 
@@ -241,12 +256,15 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, res: *const cli_helper
         opts.listen = listen;
     } else if (envGet(env, "VLMZSD_LISTEN")) |s| {
         opts.listen_backing = try splitList(gpa, s);
-        opts.listen = opts.listen_backing.?;
+        const split = opts.listen_backing.?;
+        // A value without a single address stays unset, so the default applies.
+        if (split.len > 0) opts.listen = split;
     }
 
     opts.timeout_seconds = blk: {
         const raw = res.get("timeout") orelse envGet(env, "VLMZSD_TIMEOUT") orelse "30s";
-        break :blk try cli_helper.parseDurationSeconds(raw);
+        const seconds = try cli_helper.parseDurationSeconds(raw);
+        break :blk std.math.cast(u32, seconds) orelse return error.TimeoutOutOfRange;
     };
 
     opts.max_clients = try resolveInt(u32, res.get("max-clients"), env, "VLMZSD_MAX_CLIENTS", default_client_cap);
@@ -262,7 +280,9 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, res: *const cli_helper
 
     opts.randomize = try resolveInt(u8, res.get("randomize"), env, "VLMZSD_RANDOMIZE", 1);
     opts.lcid = try resolveInt(u32, res.get("lcid"), env, "VLMZSD_LCID", 0);
+    if (opts.lcid > max_lcid) return error.LcidOutOfRange;
     opts.build = try resolveInt(u32, res.get("build"), env, "VLMZSD_BUILD", 0);
+    if (opts.build > max_build) return error.BuildOutOfRange;
 
     opts.activation_interval_minutes = try resolveDurationMinutes(res.get("activation-interval"), env, "VLMZSD_ACTIVATION_INTERVAL", "2h");
     opts.renewal_interval_minutes = try resolveDurationMinutes(res.get("renewal-interval"), env, "VLMZSD_RENEWAL_INTERVAL", "7d");
@@ -290,6 +310,14 @@ fn findCsvlkByName(data: *const kmsdata.KmsData, name: []const u8) ?usize {
         if (std.mem.eql(u8, csvlk.name, name)) return i;
     }
     return null;
+}
+
+/// Store `epid` as the override for CSVLC `idx`, releasing the value an earlier
+/// `--epid` entry put there, so a repeated name keeps the last ePID.
+fn putOverride(gpa: Allocator, overrides: []?[]const u8, idx: usize, epid: []const u8) !void {
+    if (overrides[idx]) |previous| gpa.free(previous);
+    overrides[idx] = null;
+    overrides[idx] = try gpa.dupe(u8, epid);
 }
 
 /// Build the per-CSVLC ePID override table: `--epid` entries win, then level-1
@@ -322,7 +350,8 @@ fn buildEpidOverrides(
             log.warn("ignoring --epid for unknown CSVLC name: {s}", .{name});
             continue;
         };
-        overrides[idx] = try gpa.dupe(u8, epid);
+        // A repeated name keeps the last ePID; the earlier one is ours to free.
+        try putOverride(gpa, overrides, idx, epid);
     }
 
     // 2. Level-1 pre-randomization: one shared random build, random LCID,
@@ -977,7 +1006,7 @@ const ServerContext = struct {
             .use_ndr64 = self.opts.ndr64,
             .use_btfn = self.opts.btfn,
             .disconnect_per_request = self.opts.disconnect_per_request,
-            .timeout_seconds = @intCast(self.opts.timeout_seconds),
+            .timeout_seconds = self.opts.timeout_seconds,
             .rpc_assoc_group = self.assoc_group,
             .in_flight = &self.in_flight,
             .tally = &self.tally,
@@ -1056,8 +1085,13 @@ pub fn main(init: std.process.Init) !void {
         cli_helper.fatalStderr(init.io, "vlmzsd", "failed to start log writer task: {s}", .{@errorName(e)});
     };
 
-    var opts = resolveOptions(init.gpa, init.environ_map, &res) catch |e| {
-        fatal(&log, init.io, "invalid configuration: {s}", .{@errorName(e)});
+    var opts = resolveOptions(init.gpa, init.environ_map, &res) catch |e| switch (e) {
+        error.UnexpectedPositional => fatal(&log, init.io, "vlmzsd takes no positional arguments", .{}),
+        error.LcidOutOfRange => fatal(&log, init.io, "--lcid must be 0..{d} (0 = random)", .{max_lcid}),
+        error.BuildOutOfRange => fatal(&log, init.io, "--build must be 0..{d} (0 = random)", .{max_build}),
+        error.TimeoutOutOfRange => fatal(&log, init.io, "--timeout must be at most {d} seconds", .{std.math.maxInt(u32)}),
+        error.IntervalOutOfRange => fatal(&log, init.io, "policy interval must be at most {d} minutes", .{std.math.maxInt(u32)}),
+        else => fatal(&log, init.io, "invalid configuration: {s}", .{@errorName(e)}),
     };
     defer opts.deinit(init.gpa);
 
@@ -1405,4 +1439,101 @@ test "resolveLogLevel: CLI flags, VLMZSD_LOG_LEVEL, and invalid values" {
     try std.testing.expectEqual(cli_helper.Level.debug, try resolveLogLevel(&no_flags, &env, &invalid, &legacy_verbose, &legacy_quiet));
     try std.testing.expect(legacy_verbose);
     try std.testing.expect(!legacy_quiet);
+}
+
+test "splitList returns an exactly-sized list and skips empty segments" {
+    const gpa = std.testing.allocator;
+
+    // The returned slice must be the whole allocation: `ServerOptions.deinit`
+    // frees it at the length it received, so a shorter sub-slice would free the
+    // wrong size. Empty segments make the two lengths differ.
+    const list = try splitList(gpa, " 127.0.0.1, ,::1 ,");
+    defer gpa.free(list);
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    try std.testing.expectEqualStrings("127.0.0.1", list[0]);
+    try std.testing.expectEqualStrings("::1", list[1]);
+
+    // A value with no address at all allocates nothing, so freeing it is a
+    // no-op instead of a leak.
+    const empty = try splitList(gpa, " , ");
+    defer gpa.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    const single = try splitList(gpa, " :: ");
+    defer gpa.free(single);
+    try std.testing.expectEqual(@as(usize, 1), single.len);
+    try std.testing.expectEqualStrings("::", single[0]);
+}
+
+test "resolveOptions: env lists, numeric limits, and positional arguments" {
+    const gpa = std.testing.allocator;
+    var env: EnvironMap = .init(gpa);
+    defer env.deinit();
+
+    // A list with no address leaves the default in place.
+    try env.put("VLMZSD_LISTEN", " , ");
+    var default_listen = try cli_helper.parse(gpa, &vlmzsd_opts, &.{});
+    defer default_listen.deinit();
+    {
+        var opts = try resolveOptions(gpa, &env, &default_listen);
+        defer opts.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), opts.listen.len);
+        try std.testing.expectEqualStrings("::", opts.listen[0]);
+    }
+
+    // Gaps and padding are trimmed away, and the result owns its allocation.
+    try env.put("VLMZSD_LISTEN", "127.0.0.1,, ::1");
+    {
+        var opts = try resolveOptions(gpa, &env, &default_listen);
+        defer opts.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 2), opts.listen.len);
+        try std.testing.expectEqualStrings("127.0.0.1", opts.listen[0]);
+        try std.testing.expectEqualStrings("::1", opts.listen[1]);
+    }
+    _ = env.swapRemove("VLMZSD_LISTEN");
+
+    // The documented limits are accepted ...
+    var limits = try cli_helper.parse(gpa, &vlmzsd_opts, &.{
+        "--lcid",                "32767",
+        "--build",               "65535",
+        "--timeout",             "4294967295s",
+        "--activation-interval", "4294967295m",
+    });
+    defer limits.deinit();
+    {
+        var opts = try resolveOptions(gpa, &env, &limits);
+        defer opts.deinit(gpa);
+        try std.testing.expectEqual(max_lcid, opts.lcid);
+        try std.testing.expectEqual(max_build, opts.build);
+        try std.testing.expectEqual(std.math.maxInt(u32), opts.timeout_seconds);
+        try std.testing.expectEqual(std.math.maxInt(u32), opts.activation_interval_minutes);
+    }
+
+    // ... and one past each is a configuration error, not a panic.
+    const Case = struct { args: []const []const u8, expected: anyerror };
+    const cases = [_]Case{
+        .{ .args = &.{ "--lcid", "32768" }, .expected = error.LcidOutOfRange },
+        .{ .args = &.{ "--build", "65536" }, .expected = error.BuildOutOfRange },
+        .{ .args = &.{ "--timeout", "4294967296s" }, .expected = error.TimeoutOutOfRange },
+        .{ .args = &.{ "--activation-interval", "71582789h" }, .expected = error.IntervalOutOfRange },
+        .{ .args = &.{ "--renewal-interval", "71582789h" }, .expected = error.IntervalOutOfRange },
+        .{ .args = &.{"stray"}, .expected = error.UnexpectedPositional },
+    };
+    for (cases) |case| {
+        var res = try cli_helper.parse(gpa, &vlmzsd_opts, case.args);
+        defer res.deinit();
+        try std.testing.expectError(case.expected, resolveOptions(gpa, &env, &res));
+    }
+}
+
+test "a repeated --epid name replaces the earlier override without leaking" {
+    const gpa = std.testing.allocator;
+    var overrides = [_]?[]const u8{null};
+    defer if (overrides[0]) |s| gpa.free(s);
+
+    try putOverride(gpa, &overrides, 0, "03612-00000-000-000000-03-1033-19045.0000-0002023");
+    try std.testing.expectEqualStrings("03612-00000-000-000000-03-1033-19045.0000-0002023", overrides[0].?);
+
+    try putOverride(gpa, &overrides, 0, "03612-00000-000-000000-03-1033-22631.0000-0002025");
+    try std.testing.expectEqualStrings("03612-00000-000-000000-03-1033-22631.0000-0002025", overrides[0].?);
 }

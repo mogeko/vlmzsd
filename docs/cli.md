@@ -24,7 +24,9 @@ vlmzsd [OPTIONS]                 # KMS server (foreground)
 vlmzs [HOST[:PORT]] [OPTIONS]    # activation client
 ```
 
-Each binary supports `--help` / `-h` and `--version` / `-V`.
+Each binary supports `--help` / `-h` and `--version` / `-V`. `vlmzsd` accepts no
+positional arguments, and `vlmzs` accepts at most one; anything extra is a
+configuration error rather than being ignored.
 
 `vlmzsd` runs the KMS server in the foreground. `vlmzs` sends activation
 requests (one by default, `--count` for more) to an existing KMS server. When
@@ -49,7 +51,10 @@ Precedence, highest to lowest:
 - Boolean variables accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`
   (case-insensitive).
 - Repeatable options (`--listen`, `--epid`) are comma-separated in their
-  environment variable (e.g. `VLMZSD_LISTEN="0.0.0.0,::"`).
+  environment variable (e.g. `VLMZSD_LISTEN="0.0.0.0,::"`). Segments are
+  trimmed, and empty segments are skipped: `VLMZSD_LISTEN="0.0.0.0,,::"` binds
+  the same two addresses. A value with no non-empty segment counts as unset, so
+  the built-in default applies.
 - `VLMZSD_LOG_LEVEL` is the one environment variable with no matching CLI flag:
   it selects the log level directly (see [Logging](#logging)).
 
@@ -57,10 +62,12 @@ Precedence, highest to lowest:
 
 ### Duration
 
-`<n><unit>` with unit `s`/`m`/`h`/`d`/`w` (seconds, minutes, hours, days,
-weeks). Examples: `30s`, `2h`, `7d`, `90m`. The two policy intervals
+`<n><unit>` with unit `s`/`m`/`h`/`d`/`w` (seconds, minutes, hours,
+days, weeks). Examples: `30s`, `2h`, `7d`, `90m`. The two policy intervals
 (`--activation-interval`, `--renewal-interval`) are stored in whole minutes, so
-sub-minute values are rounded down; `0` disables where applicable.
+sub-minute values are rounded down; `0` disables where applicable. A duration
+that does not fit the field it feeds (seconds for `--timeout`, minutes for the
+policy intervals) is a configuration error, not a truncated value.
 
 ### GUID
 
@@ -71,7 +78,8 @@ Standard hyphenated hex: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
 
 `--epid <name>=<epid>`, where `<name>` is a CSVLC name from the `.kmd` data
 (e.g. `Windows`, `Office2013`) and `<epid>` is the 20-byte ePID string.
-Repeatable; comma-separated in the environment variable.
+Repeatable; comma-separated in the environment variable. A repeated `<name>`
+keeps its last ePID.
 
 ## 5. Server (`vlmzsd`) options
 
@@ -128,6 +136,8 @@ with the total number of connections served.
 `--timeout` bounds how long a read waits for its peer; `0` disables the idle timeout, so a silent
 peer is kept until it disconnects. It never delays shutdown: `SIGINT`/`SIGTERM` ends an idle
 connection immediately even with `--timeout 0`, so stopping the server never waits out live clients.
+The timeout is held in whole seconds, so a duration above `4294967295s` is rejected as a
+configuration error.
 
 ### Data
 
@@ -159,8 +169,8 @@ embedded KMS data` (at `-v`).
 |---|---|---|---|---|
 | `--epid <name>=<epid>` | | — | `VLMZSD_EPID` | repeatable / comma-separated |
 | `--randomize <0\|1\|2>` | | `1` | `VLMZSD_RANDOMIZE` | ePID randomization level |
-| `--lcid <n>` | | random | `VLMZSD_LCID` | fixed LCID for randomized ePIDs (`0` = random) |
-| `--build <n>` | | random | `VLMZSD_BUILD` | fixed build number for randomized ePIDs (`0` = random) |
+| `--lcid <n>` | | random | `VLMZSD_LCID` | fixed LCID for randomized ePIDs, `0..32767` (`0` = random) |
+| `--build <n>` | | random | `VLMZSD_BUILD` | fixed build number for randomized ePIDs, `0..65535` (`0` = random) |
 
 `--randomize` decides which ePID a client receives in the RESPONSE:
 
@@ -171,8 +181,10 @@ embedded KMS data` (at `-v`).
 | `2` | a fresh random ePID for every request |
 
 `--lcid`/`--build` pin the LCID and host build the randomized levels use;
-unset (`0`) means "pick one at random". `--epid` overrides beat every level, and
-any other `--randomize` value behaves like `0`.
+unset (`0`) means "pick one at random". The upper bounds (`32767` and `65535`)
+match what an ePID can carry; a larger value is rejected as a configuration
+error rather than truncated. `--epid` overrides beat every level, and any other
+`--randomize` value behaves like `0`.
 
 ### Activation policy
 
@@ -196,6 +208,9 @@ any other `--randomize` value behaves like `0`.
 
 Bits outside those are ignored, so a value above the documented range is accepted
 and behaves like the levels it shares bits with.
+
+Both policy intervals are whole minutes, so a duration whose minute count does
+not fit in 32 bits is rejected as a configuration error.
 
 ### Protocol
 
@@ -311,6 +326,10 @@ printed while nothing has been lost.
 | `--no-btfn` | | off | disable bind-time feature negotiation (on by default) |
 | `--timeout <dur>` | | `30s` | idle timeout; `0` disables |
 | `--verbose` | `-v` | off | verbosity |
+
+`--protocol` accepts only `4`, `5`, and `6`, and `--license-status` only
+`0..6`; any other value is a configuration error, as is a second positional
+argument.
 
 `--timeout` bounds the BIND reply and every RESPONSE read, so the client fails
 instead of blocking forever on a peer that accepted the connection and then went

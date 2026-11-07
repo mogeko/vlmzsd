@@ -18,6 +18,8 @@ const build_options = @import("build_options");
 const version_display = build_options.version_display;
 const default_port: u16 = 1688;
 const default_grace_minutes: u32 = 43200;
+/// Largest `--license-status` value (docs/cli.md §6).
+const max_license_status: u32 = 6;
 /// Idle timeout for the BIND reply and every RESPONSE read, mirroring the
 /// server's `--timeout` default.
 const default_timeout_seconds: u32 = 30;
@@ -102,6 +104,12 @@ const Output = struct {
         }
     }
 };
+
+/// Report a configuration error and exit. The client has no log queue to drain.
+fn fatal(out: *Output, comptime fmt: []const u8, args: anytype) noreturn {
+    out.eprint(fmt, args);
+    std.process.exit(1);
+}
 
 /// One request's staged output. A request emits many fragments — a `--verbose`
 /// request+response dump is ~25 lines — and they are *mid-line* fragments: the
@@ -313,7 +321,8 @@ fn parseHostPort(host_arg: []const u8) !struct { host: []const u8, port: u16 } {
 fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
     var opts = ClientOptions{};
 
-    // Positional HOST[:PORT].
+    // Positional HOST[:PORT]; a second word is a mistyped flag value.
+    if (res.positionals.items.len > 1) return error.UnexpectedPositional;
     if (res.positionals.items.len > 0) {
         const hp = try parseHostPort(res.positionals.items[0]);
         opts.host = hp.host;
@@ -322,7 +331,11 @@ fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
 
     opts.product = res.get("product");
     opts.data_file = res.get("data");
-    opts.protocol = if (res.get("protocol")) |s| try std.fmt.parseInt(u16, s, 10) else 0;
+    opts.protocol = if (res.get("protocol")) |s| blk: {
+        const version = try std.fmt.parseInt(u16, s, 10);
+        if (version != 4 and version != 5 and version != 6) return error.InvalidProtocol;
+        break :blk version;
+    } else 0;
     if (res.get("app-id")) |s| opts.app_id = try cli_helper.parseGuid(s);
     if (res.get("sku-id")) |s| opts.sku_id = try cli_helper.parseGuid(s);
     if (res.get("kms-id")) |s| opts.kms_id = try cli_helper.parseGuid(s);
@@ -339,6 +352,7 @@ fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
     }
     opts.list_products = res.hasFlag("list-products");
     opts.license_status = if (res.get("license-status")) |s| try std.fmt.parseInt(u32, s, 10) else 1;
+    if (opts.license_status > max_license_status) return error.InvalidLicenseStatus;
     opts.reconnect_per_request = res.hasFlag("reconnect-per-request");
     opts.timeout_seconds = if (res.get("timeout")) |s|
         std.math.cast(u32, try cli_helper.parseDurationSeconds(s)) orelse return error.InvalidTimeout
@@ -829,9 +843,11 @@ pub fn main(init: std.process.Init) !void {
     var err_buf: [4096]u8 = undefined;
     var out: Output = .init(init.io, &out_buf, &err_buf);
 
-    var opts = resolveOptions(&res) catch |e| {
-        out.eprint("error: {s}\n", .{@errorName(e)});
-        std.process.exit(1);
+    var opts = resolveOptions(&res) catch |e| switch (e) {
+        error.UnexpectedPositional => fatal(&out, "error: at most one HOST[:PORT] argument is accepted\n", .{}),
+        error.InvalidProtocol => fatal(&out, "error: --protocol must be 4, 5, or 6\n", .{}),
+        error.InvalidLicenseStatus => fatal(&out, "error: --license-status must be 0..{d}\n", .{max_license_status}),
+        else => fatal(&out, "error: {s}\n", .{@errorName(e)}),
     };
 
     // Load the KMS data: explicit path (--data) → FHS/XDG search → embedded
@@ -1163,4 +1179,44 @@ test "incomplete KMS data is rejected by the client" {
     try validateKmsData(&data);
     data.app_count = 0;
     try std.testing.expectError(error.IncompleteKmsData, validateKmsData(&data));
+}
+
+test "resolveOptions rejects out-of-range selections" {
+    const gpa = std.testing.allocator;
+
+    const Case = struct { args: []const []const u8, expected: anyerror };
+    const cases = [_]Case{
+        // `--protocol` selects the wire struct set; only 4/5/6 exist, and an
+        // explicit `0` must not fall back to "derive from the product".
+        .{ .args = &.{ "--protocol", "0" }, .expected = error.InvalidProtocol },
+        .{ .args = &.{ "--protocol", "3" }, .expected = error.InvalidProtocol },
+        .{ .args = &.{ "--protocol", "7" }, .expected = error.InvalidProtocol },
+        .{ .args = &.{ "--license-status", "7" }, .expected = error.InvalidLicenseStatus },
+        .{ .args = &.{ "127.0.0.1", "127.0.0.2" }, .expected = error.UnexpectedPositional },
+    };
+    for (cases) |case| {
+        var res = try cli_helper.parse(gpa, &vlmzs_opts, case.args);
+        defer res.deinit();
+        try std.testing.expectError(case.expected, resolveOptions(&res));
+    }
+}
+
+test "resolveOptions accepts the documented selection limits" {
+    const gpa = std.testing.allocator;
+
+    const accepted = [_][]const u8{ "4", "5", "6" };
+    for (accepted) |version| {
+        var res = try cli_helper.parse(gpa, &vlmzs_opts, &.{ "--protocol", version });
+        defer res.deinit();
+        const opts = try resolveOptions(&res);
+        try std.testing.expectEqual(try std.fmt.parseInt(u16, version, 10), opts.protocol);
+    }
+
+    var res = try cli_helper.parse(gpa, &vlmzs_opts, &.{
+        "--protocol", "6", "--license-status", "6", "127.0.0.1:1689",
+    });
+    defer res.deinit();
+    const opts = try resolveOptions(&res);
+    try std.testing.expectEqual(@as(u32, 6), opts.license_status);
+    try std.testing.expectEqual(@as(u16, 1689), opts.port);
 }
