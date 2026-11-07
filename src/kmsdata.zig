@@ -209,7 +209,10 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
         @memcpy(guid[0..], raw[base..][0..16]);
         item.* = .{
             .guid = guid,
-            .name = try cString(raw, std.math.cast(usize, readLe(u64, raw, base + 16)) orelse return error.InvalidFormat),
+            .name = try cString(raw, std.math.cast(
+                usize,
+                readLe(u64, raw, base + 16),
+            ) orelse return error.InvalidFormat),
             .app_index = raw[base + 24],
             .kms_index = raw[base + 25],
             .protocol_version = raw[base + 26],
@@ -225,7 +228,10 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
     for (host_builds, 0..) |*hb, i| {
         const base = hostbuild_offset + i * hostbuild_size;
         hb.* = .{
-            .display_name = try cString(raw, std.math.cast(usize, readLe(u64, raw, base)) orelse return error.InvalidFormat),
+            .display_name = try cString(raw, std.math.cast(
+                usize,
+                readLe(u64, raw, base),
+            ) orelse return error.InvalidFormat),
             .release_date = readLe(i64, raw, base + 8),
             .build_number = readLe(i32, raw, base + 16),
             .platform_id = readLe(i32, raw, base + 20),

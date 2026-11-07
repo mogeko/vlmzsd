@@ -717,7 +717,16 @@ pub fn createResponseBase(
     const pid: []const u8 = if (override) |p|
         p
     else if (cfg.randomization_level == 2)
-        generateRandomPid(cfg.data, epid_index, &pid_buf, @intCast(cfg.lcid), @intCast(cfg.build), rng, cfg.use_ndr64, now_unix) catch return hresult.invalid_arg
+        generateRandomPid(
+            cfg.data,
+            epid_index,
+            &pid_buf,
+            @intCast(cfg.lcid),
+            @intCast(cfg.build),
+            rng,
+            cfg.use_ndr64,
+            now_unix,
+        ) catch return hresult.invalid_arg
     else
         cfg.data.csvlk[epid_index].epid;
 
@@ -949,7 +958,11 @@ pub fn decryptResponseV4(
     result.pid_length_ok = checkPidLength(&out.base);
     result.version_ok = out.base.version == raw_request.base.version;
     result.hash_ok = std.mem.eql(u8, &out.mac, &mac);
-    result.timestamp_ok = std.mem.eql(u8, std.mem.asBytes(&out.base.client_time), std.mem.asBytes(&raw_request.base.client_time));
+    result.timestamp_ok = std.mem.eql(
+        u8,
+        std.mem.asBytes(&out.base.client_time),
+        std.mem.asBytes(&raw_request.base.client_time),
+    );
     result.client_machine_id_ok = guidEqual(&out.base.cmid, &raw_request.base.cmid);
     result.correct_response_size = @intCast(@sizeOf(ResponseV4) - pid_buffer_size * 2 + pid_size);
 
@@ -1067,7 +1080,11 @@ pub fn decryptResponseV6(
         raw_request.version == raw_request.base.version;
 
     result.pid_length_ok = checkPidLength(&out.base);
-    result.timestamp_ok = std.mem.eql(u8, std.mem.asBytes(&out.base.client_time), std.mem.asBytes(&raw_request.base.client_time));
+    result.timestamp_ok = std.mem.eql(
+        u8,
+        std.mem.asBytes(&out.base.client_time),
+        std.mem.asBytes(&raw_request.base.client_time),
+    );
     result.client_machine_id_ok = guidEqual(&out.base.cmid, &raw_request.base.cmid);
 
     // Rebuild the random key and verify its hash.
@@ -1078,7 +1095,9 @@ pub fn decryptResponseV6(
     crypto.sha256(&random_key, &hash_verify);
     result.hash_ok = std.mem.eql(u8, &out.hash, &hash_verify);
 
-    result.correct_response_size = @intCast((if (is_v6) response_v6_size else response_v5_size) - pid_buffer_size * 2 + pid_size);
+    result.correct_response_size = @intCast(
+        (if (is_v6) response_v6_size else response_v5_size) - pid_buffer_size * 2 + pid_size,
+    );
 
     if (is_v6) {
         if (hwid) |h| @memcpy(h, &out.hwid);

@@ -167,7 +167,9 @@ fn readSome(idle: ReadOptions, reader: *Io.Reader, buf: []u8) !usize {
     // `net_receive` is message oriented: one call copies at most one message
     // (never more than `buf.len` bytes) straight into `buf`, and reports EOF as
     // a zero-length message rather than as an error.
-    var messages = [1]Io.net.IncomingMessage{.{ .from = undefined, .data = undefined, .control = &.{}, .flags = undefined }};
+    var messages = [1]Io.net.IncomingMessage{
+        .{ .from = undefined, .data = undefined, .control = &.{}, .flags = undefined },
+    };
     const result = try peer.io.operateTimeout(.{ .net_receive = .{
         .socket_handle = peer.handle,
         .message_buffer = &messages,

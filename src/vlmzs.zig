@@ -781,7 +781,15 @@ fn sendRequestOn(
     if (proto == 4) {
         var req: kms.RequestV4 = undefined;
         kms.createRequestV4(&req, &base);
-        const sent = network.clientSendRequest(gpa, conn.reader, conn.writer, &conn.call_id, std.mem.asBytes(&req), conn.use_ndr64, conn.idle) catch |err| return markRetryableSend(conn, &discard_report, err);
+        const sent = network.clientSendRequest(
+            gpa,
+            conn.reader,
+            conn.writer,
+            &conn.call_id,
+            std.mem.asBytes(&req),
+            conn.use_ndr64,
+            conn.idle,
+        ) catch |err| return markRetryableSend(conn, &discard_report, err);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
             printRejection(sent.status, &report);
@@ -793,11 +801,23 @@ fn sendRequestOn(
             reportVerificationErrors(result, &report);
             return .failed;
         }
-        if (verbose) printResponseVerbose(&resp.base, null, result, &report) else printResultSummary(&resp.base, null, &report);
+        if (verbose) {
+            printResponseVerbose(&resp.base, null, result, &report);
+        } else {
+            printResultSummary(&resp.base, null, &report);
+        }
     } else {
         var req: kms.RequestV6 = undefined;
         kms.createRequestV6(&req, &base, rng);
-        const sent = network.clientSendRequest(gpa, conn.reader, conn.writer, &conn.call_id, std.mem.asBytes(&req), conn.use_ndr64, conn.idle) catch |err| return markRetryableSend(conn, &discard_report, err);
+        const sent = network.clientSendRequest(
+            gpa,
+            conn.reader,
+            conn.writer,
+            &conn.call_id,
+            std.mem.asBytes(&req),
+            conn.use_ndr64,
+            conn.idle,
+        ) catch |err| return markRetryableSend(conn, &discard_report, err);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
             printRejection(sent.status, &report);
@@ -814,7 +834,11 @@ fn sendRequestOn(
             return .failed;
         }
         const hwid_or_null: ?*const [8]u8 = if (is_v6) &hwid else null;
-        if (verbose) printResponseVerbose(&resp.base, hwid_or_null, result, &report) else printResultSummary(&resp.base, hwid_or_null, &report);
+        if (verbose) {
+            printResponseVerbose(&resp.base, hwid_or_null, result, &report);
+        } else {
+            printResultSummary(&resp.base, hwid_or_null, &report);
+        }
     }
     return .activated;
 }
