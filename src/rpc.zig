@@ -879,6 +879,46 @@ test "dispatch non-zero minor version returns HRESULT" {
     try std.testing.expectEqual(e_invalid_arg, parsed.status);
 }
 
+test "dispatch rejects oversized N_Policy without wrapping" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = kms.ServerConfig{ .data = &td.data };
+    var negotiation = BindNegotiation{ .ndr_ctx = 0, .ndr64_ctx = 1 };
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
+    const rng = prng.random();
+    const e_invalid_arg: i32 = @bitCast(@as(u32, 0x8007000D));
+
+    // `required_clients = n_policy * 2` is checked before the multiplication:
+    // a u32 wrap would turn 0x80000000 into 0 and 0x80000002 into 4, bypassing
+    // the > 2000 rule — docs/migration.md §5.
+    const rejected = [_]u32{ 1001, 0x8000_0000, 0x8000_0002, 0xFFFF_FFFF };
+    for (rejected) |n_policy| {
+        var base = makeBase(&td.data);
+        base.n_policy = n_policy;
+
+        var request_v6: kms.RequestV6 = undefined;
+        kms.createRequestV6(&request_v6, &base, rng);
+        const rpc_request = try wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), true, 2);
+        defer alloc.free(rpc_request);
+
+        const dispatch = try dispatchKmsRequest(alloc, rpc_request[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
+        try std.testing.expectEqual(@as(u16, 6), dispatch.major_version);
+        try std.testing.expect(dispatch.response_size < 0);
+
+        const resp_body = switch (dispatch.kind) {
+            .fault => return error.TestUnexpectedResult,
+            .response => |body| body,
+        };
+        defer alloc.free(resp_body);
+
+        const parsed = parseKmsResponse(resp_body, true);
+        try std.testing.expectEqual(e_invalid_arg, parsed.status);
+        try std.testing.expectEqual(@as(usize, 0), parsed.data.len);
+    }
+}
+
 test "too-short request disconnects" {
     const alloc = std.testing.allocator;
     var td = try loadTestData(alloc);

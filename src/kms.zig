@@ -569,8 +569,13 @@ pub fn createResponseBase(
 ) i32 {
     std.debug.assert(cfg.data.csvlk.len > 0);
 
-    const required_clients: u32 = if (request.n_policy < 1) 1 else request.n_policy << 1;
+    // Reject N_Policy values that would exceed the protocol limit before
+    // multiplying: a u32 wrap would turn 0x80000000 into 0 and 0x80000002
+    // into 4, bypassing the > 2000 rule below — docs/migration.md §5.
+    if (request.n_policy > max_required_clients / 2) return hresult.invalid_arg;
+    const required_clients: u32 = if (request.n_policy < 1) 1 else request.n_policy * 2;
     std.debug.assert(required_clients >= 1);
+    std.debug.assert(required_clients <= max_required_clients);
 
     const kms_items = cfg.data.kms();
     const index_opt = getProductIndex(&request.kms_id, kms_items);
@@ -1206,18 +1211,42 @@ fn makeVariantData(allocator: std.mem.Allocator, release_date: i64) !kmsdata.Kms
     };
 }
 
-test "required_clients over 2000 rejected" {
+test "required_clients over 2000 rejected without u32 wrap" {
     const alloc = std.testing.allocator;
     var td = try loadTestData(alloc);
     defer td.deinit(alloc);
 
-    var cfg = ServerConfig{ .data = &td.data };
-    var base = makeBase(&td.data, 6 << 16);
-    base.n_policy = 1001; // required_clients = 2002 > 2000 — docs/migration.md §5
+    const Case = struct {
+        n_policy: u32,
+        hr: i32,
+        /// Expected `Response.Count` when `hr == hresult.ok`.
+        count: u32 = 0,
+    };
+    // docs/migration.md §5: required_clients = 2 * N_Policy must stay in
+    // [1, 2000]. A u32 wrap would turn 0x80000000 into 0 and 0x80000002 into
+    // 4, so these values must be rejected before the multiplication.
+    const cases = [_]Case{
+        .{ .n_policy = 0, .hr = hresult.ok, .count = 1 },
+        .{ .n_policy = 1, .hr = hresult.ok, .count = 2 },
+        .{ .n_policy = 1000, .hr = hresult.ok, .count = 2000 },
+        .{ .n_policy = 1001, .hr = hresult.invalid_arg },
+        .{ .n_policy = 0x7FFF_FFFF, .hr = hresult.invalid_arg },
+        .{ .n_policy = 0x8000_0000, .hr = hresult.invalid_arg },
+        .{ .n_policy = 0x8000_0002, .hr = hresult.invalid_arg },
+        .{ .n_policy = 0xFFFF_FFFF, .hr = hresult.invalid_arg },
+    };
 
+    var cfg = ServerConfig{ .data = &td.data };
     var prng: std.Random.DefaultPrng = .init(0);
-    var resp: Response = undefined;
-    try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+    for (cases) |case| {
+        var base = makeBase(&td.data, 6 << 16);
+        base.n_policy = case.n_policy;
+
+        var resp: Response = undefined;
+        const hr = createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000);
+        try std.testing.expectEqual(case.hr, hr);
+        if (case.hr == hresult.ok) try std.testing.expectEqual(case.count, resp.count);
+    }
 }
 
 test "client time off by more than 4 hours rejected" {
