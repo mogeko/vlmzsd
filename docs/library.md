@@ -121,16 +121,26 @@ switch (result.kind) {
 ```
 
 The client side is symmetric: `rpc.buildBindRequest` → `rpc.wrapKmsRequest`,
-send, then `rpc.parseKmsResponse` → `kms.decryptResponseV6`.
+send, then `rpc.parseKmsResponse` → `kms.decryptResponseV6`. The same builders
+produce the two input bodies above, which is how a test can drive the sequence
+without a socket.
 
 ## Contract and pitfalls
 
 Rules you must know before calling into the library — they are not visible
 from type signatures alone:
 
-- **Ownership.** `kmsdata.parse` allocates every slice inside the returned
-  `KmsData` with the allocator you pass in. Call `data.deinit(allocator)`
-  exactly once, or you leak / double-free.
+- **Ownership.** `kmsdata.parse` allocates the three record arrays (`csvlk`,
+  `items`, `host_builds`) with the allocator you pass in; call
+  `data.deinit(allocator)` exactly once, or you leak / double-free. `write` is
+  the inverse and returns a buffer you own.
+- **Lifetime.** Parsing is zero-copy: every string in `KmsData` (CSVLC names,
+  product names, host-build display names) is a slice of the `raw` buffer you
+  passed to `parse`. Keep that buffer alive and unmodified for as long as the
+  data is used — an `@embedFile` slice or a file buffer freed only after
+  `data.deinit` is fine; freeing the file buffer first is a use-after-free.
+  `ServerConfig.data` is a pointer for the same reason: the `KmsData` outlives
+  the config.
 - **Wire compatibility is the invariant.** Every KMS struct is packed
   little-endian and byte-for-byte compatible with the C `vlmcsd`. Never reorder
   fields, add padding, or "improve" a field's type — clients are real Windows

@@ -220,8 +220,7 @@ fn rejectionReason(status: u32) ?[]const u8 {
     };
 }
 
-/// Format a Unix timestamp as UTC `YYYY-MM-DD HH:MM:SS` (C verbose dumps use
-/// `strftime("%Y-%m-%d %X", gmtime(...))`).
+/// Format a Unix timestamp as `YYYY-MM-DD HH:MM:SS` in UTC.
 fn formatUtc(unix: i64, buf: []u8) []const u8 {
     const secs: u64 = @intCast(unix);
     const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
@@ -230,7 +229,7 @@ fn formatUtc(unix: i64, buf: []u8) []const u8 {
     const day_secs: u64 = secs % 86400;
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
         @as(u32, yad.year),
-        @as(u32, @backingInt(mad.month)) + 1,
+        @as(u32, mad.month.numeric()),
         @as(u32, mad.day_index) + 1,
         @as(u32, @intCast(day_secs / 3600)),
         @as(u32, @intCast((day_secs % 3600) / 60)),
@@ -342,6 +341,11 @@ fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
     if (res.get("cmid")) |s| opts.cmid = try cli_helper.parseGuid(s);
     if (res.get("prev-cmid")) |s| opts.prev_cmid = try cli_helper.parseGuid(s);
     opts.workstation = res.get("workstation");
+    if (opts.workstation) |name| {
+        // The request field is UTF-16; the option is UTF-8. Reject a name that
+        // cannot be decoded instead of sending replacement bytes.
+        if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidWorkstation;
+    }
     opts.vm = res.hasFlag("vm");
     opts.count = if (res.get("count")) |s| try std.fmt.parseInt(u32, s, 10) else 1;
     opts.virtual_clients = if (res.get("virtual-clients")) |s| try std.fmt.parseInt(u32, s, 10) else 0;
@@ -402,14 +406,37 @@ fn randomCmid(rng: std.Random) [16]u8 {
     return g;
 }
 
+/// Fill the request's workstation name, a 64-code-unit UTF-16 field that must
+/// end with a NUL when it fits (C `utf8_to_ucs2`).
+///
+/// The option value is UTF-8, so it is decoded rather than copied byte by byte:
+/// a non-ASCII name would otherwise be sent as mojibake. Names longer than 63
+/// code units are truncated, never splitting a surrogate pair.
 fn setWorkstationName(base: *kms.Request, name: ?[]const u8, rng: std.Random) void {
+    const dst = base.workstation_name[0 .. kms.workstation_name_buffer - 1];
     if (name) |n| {
-        var i: usize = 0;
-        while (i < n.len and i < 63) : (i += 1) base.workstation_name[i] = n[i];
-        base.workstation_name[i] = 0;
+        // `resolveOptions` rejected invalid UTF-8, so the view cannot fail here.
+        var view = std.unicode.Utf8View.initUnchecked(n);
+        var it = view.iterator();
+        var len: usize = 0;
+        while (it.nextCodepoint()) |codepoint| {
+            if (codepoint < 0x10000) {
+                if (len == dst.len) break;
+                dst[len] = @intCast(codepoint);
+                len += 1;
+            } else {
+                // Surrogate pairs take two code units, or none.
+                if (dst.len - len < 2) break;
+                const offset = codepoint - 0x10000;
+                dst[len] = 0xD800 + @as(u16, @intCast(offset >> 10));
+                dst[len + 1] = 0xDC00 + @as(u16, @intCast(offset & 0x3FF));
+                len += 2;
+            }
+        }
+        base.workstation_name[len] = 0;
     } else {
         const len: usize = 1 + rng.uintLessThan(u8, 14);
-        for (0..len) |i| base.workstation_name[i] = 'A' + rng.uintLessThan(u8, 26);
+        for (0..len) |i| dst[i] = 'A' + rng.uintLessThan(u8, 26);
         base.workstation_name[len] = 0;
     }
 }
@@ -445,12 +472,24 @@ fn buildRequestBase(
     return base;
 }
 
+/// Narrow a NUL-terminated UTF-16 field to ASCII bytes. Valid for the ePID,
+/// whose characters are ASCII by construction.
 fn ucs2ToAscii(pid: *const [64]u16, out: []u8) []const u8 {
     var i: usize = 0;
     while (i < pid.len and pid[i] != 0 and i < out.len) : (i += 1) {
         out[i] = @truncate(pid[i]);
     }
     return out[0..i];
+}
+
+/// Decode a NUL-terminated UTF-16 field (`workstation_name`) as UTF-8. `out`
+/// must hold three bytes per code unit. An unpaired surrogate has no UTF-8
+/// form, so such a field prints as empty rather than as mojibake.
+fn utf16FieldToUtf8(field: *const [64]u16, out: []u8) []const u8 {
+    var len: usize = 0;
+    while (len < field.len and field[len] != 0) len += 1;
+    const written = std.unicode.utf16LeToUtf8(out, field[0..len]) catch return out[0..0];
+    return out[0..written];
 }
 
 /// Report each failed response-verification check to stderr (C `displayResponse`).
@@ -511,7 +550,8 @@ fn printRequestVerbose(req: *const kms.Request, data: *const kmsdata.KmsData, ou
     const minor: u16 = @truncate(req.version);
     var guid_buf: [64]u8 = undefined;
     var time_buf: [64]u8 = undefined;
-    var ws_buf: [64]u8 = undefined;
+    // Three UTF-8 bytes per UTF-16 code unit (63 units at most).
+    var ws_buf: [3 * kms.workstation_name_buffer]u8 = undefined;
 
     out.print("\nRequest Parameters\n==================\n\n", .{});
     out.print("Protocol version                : {d}.{d}\n", .{ major, minor });
@@ -524,7 +564,7 @@ fn printRequestVerbose(req: *const kms.Request, data: *const kmsdata.KmsData, ou
     out.print("Client machine ID               : {s}\n", .{formatGuid(&req.cmid, &guid_buf)});
     out.print("Previous client machine ID      : {s}\n", .{formatGuid(&req.cmid_prev, &guid_buf)});
     out.print("Client request timestamp (UTC)  : {s}\n", .{formatUtc(kms.fileTimeToUnixTime(kms.fileTimeToU64(req.client_time)), &time_buf)});
-    out.print("Workstation name                : {s}\n", .{ucs2ToAscii(&req.workstation_name, &ws_buf)});
+    out.print("Workstation name                : {s}\n", .{utf16FieldToUtf8(&req.workstation_name, &ws_buf)});
     out.print("N count policy (minimum clients): {d}\n", .{req.n_policy});
     out.print("\n", .{});
 }
@@ -956,6 +996,7 @@ pub fn main(init: std.process.Init) !void {
         error.UnexpectedPositional => fatal(&out, "error: at most one HOST[:PORT] argument is accepted\n", .{}),
         error.InvalidProtocol => fatal(&out, "error: --protocol must be 4, 5, or 6\n", .{}),
         error.InvalidLicenseStatus => fatal(&out, "error: --license-status must be 0..{d}\n", .{max_license_status}),
+        error.InvalidWorkstation => fatal(&out, "error: --workstation must be valid UTF-8\n", .{}),
         else => fatal(&out, "error: {s}\n", .{@errorName(e)}),
     };
 
@@ -1467,4 +1508,86 @@ test "a server that closes after each request is reconnected" {
     // answer line per request (the dropped attempt leaves no output behind).
     try std.testing.expectEqual(@as(u32, 0), failures);
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, sink.buffered(), "\n"));
+}
+
+test "the UTC timestamp uses the calendar month" {
+    // `std.time.epoch.Month` is backed by its calendar number (jan = 1), so a
+    // stray `+ 1` prints December for November.
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("2026-11-07 13:57:17", formatUtc(1_794_059_837, &buf));
+    try std.testing.expectEqualStrings("1970-01-01 00:00:00", formatUtc(0, &buf));
+    try std.testing.expectEqualStrings("2024-02-29 00:00:00", formatUtc(1_709_164_800, &buf));
+    try std.testing.expectEqualStrings("2038-01-19 03:14:07", formatUtc(std.math.maxInt(i32), &buf));
+}
+
+test "the workstation name is UTF-16, not raw UTF-8 bytes" {
+    const gpa = std.testing.allocator;
+    var data = try kmsdata.parse(gpa, @embedFile("vlmcsd.kmd"));
+    defer data.deinit(gpa);
+
+    var prng: std.Random.DefaultPrng = .init(0xabc);
+    const rng = prng.random();
+    var out_buf: [8192]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    var output = Output.init(std.testing.io, &out_buf, &err_buf);
+
+    // ASCII: one code unit per byte.
+    {
+        var opts = ClientOptions{};
+        opts.workstation = "wks-01";
+        const base = buildRequestBase(&opts, &data, 0, rng, std.testing.io);
+        try std.testing.expectEqual(@as(u16, 'w'), base.workstation_name[0]);
+        try std.testing.expectEqual(@as(u16, 0), base.workstation_name[6]);
+    }
+
+    // BMP text: two bytes in UTF-8 ("中") become one code unit.
+    {
+        var opts = ClientOptions{};
+        opts.workstation = "中文";
+        const base = buildRequestBase(&opts, &data, 0, rng, std.testing.io);
+        try std.testing.expectEqual(@as(u16, 0x4E2D), base.workstation_name[0]);
+        try std.testing.expectEqual(@as(u16, 0x6587), base.workstation_name[1]);
+        try std.testing.expectEqual(@as(u16, 0), base.workstation_name[2]);
+
+        // ... and the verbose dump prints it back as UTF-8.
+        var report_out: [4096]u8 = undefined;
+        var report_err: [64]u8 = undefined;
+        var report = Report.init(&output, &report_out, &report_err);
+        printRequestVerbose(&base, &data, &report);
+        try std.testing.expect(std.mem.indexOf(u8, report.out.buffered(), "Workstation name                : 中文") != null);
+    }
+
+    // Astral text: one code point, two UTF-16 code units.
+    {
+        var opts = ClientOptions{};
+        opts.workstation = "𐐷";
+        const base = buildRequestBase(&opts, &data, 0, rng, std.testing.io);
+        try std.testing.expectEqual(@as(u16, 0xD801), base.workstation_name[0]);
+        try std.testing.expectEqual(@as(u16, 0xDC37), base.workstation_name[1]);
+        try std.testing.expectEqual(@as(u16, 0), base.workstation_name[2]);
+    }
+
+    // Truncation keeps whole code points: 40 astral characters are 80 units,
+    // but the field holds 63 plus the terminator.
+    {
+        var name_buffer: [40 * 4]u8 = undefined;
+        var len: usize = 0;
+        for (0..40) |_| {
+            @memcpy(name_buffer[len..][0..4], "𐐷");
+            len += 4;
+        }
+        var opts = ClientOptions{};
+        opts.workstation = name_buffer[0..len];
+        const base = buildRequestBase(&opts, &data, 0, rng, std.testing.io);
+        try std.testing.expectEqual(@as(u16, 0xD801), base.workstation_name[60]);
+        try std.testing.expectEqual(@as(u16, 0xDC37), base.workstation_name[61]);
+        try std.testing.expectEqual(@as(u16, 0), base.workstation_name[62]);
+    }
+}
+
+test "an invalid UTF-8 workstation name is a configuration error" {
+    const gpa = std.testing.allocator;
+    var res = try cli_helper.parse(gpa, &vlmzs_opts, &.{ "--workstation", "\xff\xfe" });
+    defer res.deinit();
+    try std.testing.expectError(error.InvalidWorkstation, resolveOptions(&res));
 }

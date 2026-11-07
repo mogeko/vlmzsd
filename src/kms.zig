@@ -348,6 +348,13 @@ pub fn getReleaseDate(data: *const kmsdata.KmsData, host_build: i32) i64 {
     return data.host_builds[0].release_date;
 }
 
+/// Pick one LCID from `lcid_list`. Level 1 draws it once per run, so every
+/// CSVLC's pre-generated ePID carries the same language (C `randomPidInit`
+/// samples `lang` before its loop).
+pub fn randomLcid(rng: std.Random) u16 {
+    return lcid_list[rng.uintLessThan(usize, lcid_list.len)];
+}
+
 /// Return `lcid` when it is a member of `lcid_list`, else 0.
 pub fn isValidLcid(lcid: u16) u16 {
     for (lcid_list) |entry| {

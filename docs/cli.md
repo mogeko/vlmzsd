@@ -109,6 +109,12 @@ the port always comes from `--port`, so `--listen 0.0.0.0:1688` is rejected as a
 invalid address. The default `::` is a dual-stack socket covering IPv4 and IPv6,
 and falls back to `0.0.0.0` on a host without an IPv6 stack.
 
+`--port 0` asks the kernel for an ephemeral port, which is useful for tests and
+side-by-side instances. The startup line reports the port that was actually
+bound, and each BIND_ACK advertises the port of the socket the client reached
+(the reference reads that from the local socket with `getnameinfo`); with
+several listen sockets the log names the first one.
+
 `--max-clients` bounds the number of concurrent client connections, and with it the server's worker
 threads: the pool never reclaims an idle thread, so the threads a run holds are the main thread, the
 log writer, the shutdown reader, one accept task per `--listen` address, and one worker per client
@@ -163,8 +169,9 @@ regular files count — a symlinked `.kmd` is skipped. If no `.kmd` file is foun
 anywhere, the built-in data is used. Builds that ship without it fail to start
 instead, and tell you to point `--data` at a `.kmd` file. A `.kmd` file that is
 found but unreadable or invalid is a startup error (exit `1`), not a fallback.
-Either binary logs which file won: `loaded KMS data from <file>`, or `using
-embedded KMS data` (at `-v`).
+`vlmzsd` logs which file won: `loaded KMS data from <file>` at `info`, or
+`using embedded KMS data` at `-v`. `vlmzs` is a bare CLI tool (no timestamped
+logger) and reports the file only when it fails to load one.
 
 ### ePID
 
@@ -184,10 +191,12 @@ embedded KMS data` (at `-v`).
 | `2` | a fresh random ePID for every request |
 
 `--lcid`/`--build` pin the LCID and host build the randomized levels use;
-unset (`0`) means "pick one at random". The upper bounds (`32767` and `65535`)
-match what an ePID can carry; a larger value is rejected as a configuration
-error rather than truncated. `--epid` overrides beat every level, and any other
-`--randomize` value behaves like `0`.
+unset (`0`) means "pick one at random". A random choice is made once per run at
+level `1` (every CSVLC's ePID carries the same LCID and host build) and once per
+request at level `2`. The upper bounds (`32767` and `65535`) match what an ePID
+can carry; a larger value is rejected as a configuration error rather than
+truncated. `--epid` overrides beat every level, and any other `--randomize`
+value behaves like `0`.
 
 ### Activation policy
 
@@ -319,7 +328,7 @@ printed while nothing has been lost.
 | `--kms-id <guid>` | | from product | override KMSID |
 | `--cmid <guid>` | `-c` | random | client machine ID |
 | `--prev-cmid <guid>` | `-o` | zeroed | previous client machine ID |
-| `--workstation <name>` | `-w` | random | workstation name |
+| `--workstation <name>` | `-w` | random | workstation name (UTF-8, sent as UTF-16) |
 | `--vm` | `-m` | off | present as a virtual machine |
 | `--count <n>` | `-n` | `1` | number of requests |
 | `--virtual-clients <n>` | `-r` | from product | NCountPolicy override (derived from the selected SKU) |
@@ -336,7 +345,9 @@ printed while nothing has been lost.
 
 `--protocol` accepts only `4`, `5`, and `6`, and `--license-status` only
 `0..6`; any other value is a configuration error, as is a second positional
-argument.
+argument. `--workstation` must be valid UTF-8: the value is decoded to the
+UTF-16 the request field carries (surrogate pairs included) and truncated to 63
+code units, so a longer name is cut at a character boundary, never mid-pair.
 
 `--timeout` bounds the BIND reply and every RESPONSE read, so the client fails
 instead of blocking forever on a peer that accepted the connection and then went

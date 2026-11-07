@@ -181,37 +181,21 @@ fn resolveLogLevel(
     return .info;
 }
 
-fn resolveInt(
-    comptime T: type,
-    cli_val: ?[]const u8,
-    env: *const EnvironMap,
-    env_name: []const u8,
-    default: T,
-) !T {
+fn resolveInt(comptime T: type, cli_val: ?[]const u8, env: *const EnvironMap, name: []const u8, default: T) !T {
     if (cli_val) |v| return std.fmt.parseInt(T, v, 10);
-    if (envGet(env, env_name)) |s| return std.fmt.parseInt(T, s, 10);
+    if (envGet(env, name)) |s| return std.fmt.parseInt(T, s, 10);
     return default;
 }
 
-fn resolveStr(
-    cli_val: ?[]const u8,
-    env: *const EnvironMap,
-    env_name: []const u8,
-    default: ?[]const u8,
-) ?[]const u8 {
+fn resolveStr(cli_val: ?[]const u8, env: *const EnvironMap, name: []const u8, default: ?[]const u8) ?[]const u8 {
     if (cli_val) |v| return v;
-    if (envGet(env, env_name)) |s| return s;
+    if (envGet(env, name)) |s| return s;
     return default;
 }
 
 /// Resolve a duration option into minutes (the KMS protocol's native unit).
-fn resolveDurationMinutes(
-    cli_val: ?[]const u8,
-    env: *const EnvironMap,
-    env_name: []const u8,
-    default_str: []const u8,
-) !u32 {
-    const raw = cli_val orelse envGet(env, env_name) orelse default_str;
+fn resolveDurationMinutes(cli_val: ?[]const u8, env: *const EnvironMap, name: []const u8, default: []const u8) !u32 {
+    const raw = cli_val orelse envGet(env, name) orelse default;
     const seconds = try cli_helper.parseDurationSeconds(raw);
     return std.math.cast(u32, seconds / 60) orelse error.IntervalOutOfRange;
 }
@@ -354,10 +338,11 @@ fn buildEpidOverrides(
         try putOverride(gpa, overrides, idx, epid);
     }
 
-    // 2. Level-1 pre-randomization: one shared random build, random LCID,
-    //    per-CSVLC random key ID (only when the CSVLC has no --epid override).
+    // 2. Level-1 pre-randomization: one shared random build and one shared
+    //    random LCID, per-CSVLC random key ID (only when the CSVLC has no
+    //    --epid override).
     if (opts.randomize == 1) {
-        const lang: i16 = if (opts.lcid != 0) @intCast(opts.lcid) else 0;
+        const lang: i16 = if (opts.lcid != 0) @intCast(opts.lcid) else @intCast(kms.randomLcid(rng));
         var host_build: i32 = if (opts.build != 0) @intCast(opts.build) else 0;
         for (overrides, 0..) |*slot, i| {
             if (slot.* != null) continue;
@@ -427,7 +412,10 @@ const ClientContext = struct {
     gpa: Allocator,
     cfg: *const kms.ServerConfig,
     prng: std.Random.DefaultPrng,
+    /// Local port reported in this connection's BIND_ACK, formatted here
+    /// because `--port 0` gives every listen socket its own port.
     port_str: []const u8,
+    port_buf: [6]u8 = undefined,
     use_ndr64: bool,
     use_btfn: bool,
     disconnect_per_request: bool,
@@ -523,11 +511,7 @@ const ThreadTally = struct {
 /// The id is the OS thread id — `gettid` on Linux, so it matches `ps -L` and
 /// `/proc/<pid>/task/<tid>`, and `pthread_threadid_np` on macOS, the id
 /// `sample`/`spindump` and crash reports show.
-fn notePoolThread(
-    tally: *ThreadTally,
-    log: *cli_helper.Logger,
-    comptime serving_client: bool,
-) void {
+fn notePoolThread(tally: *ThreadTally, log: *cli_helper.Logger, comptime serving_client: bool) void {
     const new_thread = !stated_pool_thread;
     const new_client = serving_client and !stated_client_thread;
     if (!new_thread and !new_client) return;
@@ -801,7 +785,7 @@ const AcceptOutcome = union(enum) {
 /// `accept` is a task whose thread the backend can interrupt, which is why it
 /// can be one of the select's waiters.
 fn acceptTask(self: *ServerContext, server_index: usize) AcceptOutcome {
-    notePoolThread(&self.tally, self.log, false);
+    notePoolThread(self.tally, self.log, false);
     const stream = self.servers[server_index].accept(self.io) catch |err| return .{
         .failed = .{ .server = server_index, .err = err },
     };
@@ -837,9 +821,10 @@ const ServerContext = struct {
     cfg: *const kms.ServerConfig,
     servers: []Io.net.Server,
     in_flight: InFlight,
-    tally: ThreadTally,
+    /// Shared with the log writer task: a copy here would count the writer's
+    /// thread into a struct nobody reports.
+    tally: *ThreadTally,
     conn_group: *Io.Group,
-    port_str: []const u8,
     prng: std.Random,
     /// Next association group id; seeded non-zero (C `RpcAssocGroup = rand32()`).
     assoc_group: u32,
@@ -878,7 +863,7 @@ const ServerContext = struct {
         }
 
         const pipe: Io.File = shutdownPipeFile(.read);
-        const tally: *ThreadTally = &self.tally;
+        const tally: *ThreadTally = self.tally;
         select.concurrent(.shutdown, shutdownTask, .{ self.io, pipe, tally, self.log }) catch |e| {
             // Without this waiter the loop could never stop on a signal.
             self.log.err("failed to start shutdown reader: {s}", .{@errorName(e)});
@@ -902,10 +887,7 @@ const ServerContext = struct {
                 saturated = at_cap;
                 // One warn per saturation period: saturation is a property of
                 // the period, not of each wake-up.
-                if (saturated) self.log.warn(
-                    "client cap reached ({d}), deferring accept",
-                    .{self.in_flight.cap},
-                );
+                if (saturated) self.log.warn("client cap reached ({d}), deferring accept", .{self.in_flight.cap});
             }
 
             if (!saturated) {
@@ -952,7 +934,7 @@ const ServerContext = struct {
                 .client => |outcome| switch (outcome) {
                     .accepted => |client| {
                         armed &= ~armedBit(client.server);
-                        self.admit(client.stream);
+                        self.admit(client.server, client.stream);
                     },
                     .failed => |failure| {
                         armed &= ~armedBit(failure.server);
@@ -979,7 +961,7 @@ const ServerContext = struct {
     /// Apply ip-protection, take an admission slot, and dispatch one accepted
     /// connection onto the pool. Every early return closes the stream and
     /// leaves the slot count unchanged.
-    fn admit(self: *ServerContext, stream: Io.net.Stream) void {
+    fn admit(self: *ServerContext, server_index: usize, stream: Io.net.Stream) void {
         // ip-protection level 2: reject clients with a public IP.
         if (self.opts.ip_protection & ip_protect_reject_public != 0) {
             if (!network.isClientPrivate(stream.socket.handle)) {
@@ -1010,17 +992,25 @@ const ServerContext = struct {
             .gpa = self.gpa,
             .cfg = self.cfg,
             .prng = std.Random.DefaultPrng.init(self.prng.int(u64)),
-            .port_str = self.port_str,
+            .port_str = "",
             .use_ndr64 = self.opts.ndr64,
             .use_btfn = self.opts.btfn,
             .disconnect_per_request = self.opts.disconnect_per_request,
             .timeout_seconds = self.opts.timeout_seconds,
             .rpc_assoc_group = self.assoc_group,
             .in_flight = &self.in_flight,
-            .tally = &self.tally,
+            .tally = self.tally,
             .log = self.log,
             .quiet_loopback = self.opts.quiet_loopback,
         };
+        // The BIND_ACK advertises the local port the client reached. It comes
+        // from the listen socket that accepted the connection, because
+        // `--port 0` gives every socket its own ephemeral port (the reference
+        // reads it from the local socket with `getnameinfo`). Formatting after
+        // the assignment keeps `port_str` pointing at `ctx.port_buf` itself.
+        const bound_port = self.servers[server_index].socket.address.getPort();
+        ctx.port_str = std.fmt.bufPrint(&ctx.port_buf, "{d}", .{bound_port}) catch unreachable;
+
         // One association group per connection, always non-zero
         // (C `RpcAssocGroup++` in `runServer`).
         self.assoc_group +%= 1;
@@ -1208,9 +1198,6 @@ pub fn main(init: std.process.Init) !void {
         .client_lists = if (client_lists_storage != null) &client_lists else null,
     };
 
-    var port_str_buf: [6]u8 = undefined;
-    const port_str = try std.fmt.bufPrint(&port_str_buf, "{d}", .{opts.port});
-
     // Create the listening sockets. ip-protection level 1 listens only on the
     // host's private addresses; otherwise `--listen` (default ::, a dual-stack
     // socket covering both IPv4 and IPv6).
@@ -1221,7 +1208,10 @@ pub fn main(init: std.process.Init) !void {
     }
     try createListenSockets(init.gpa, init.io, &opts, &log, &servers);
 
-    log.info("vlmzsd {s} listening on port {d}", .{ version, opts.port });
+    // With `--port 0` the kernel picks the port, so report the one actually
+    // bound instead of echoing "0".
+    const bound_port: u16 = if (opts.port != 0) opts.port else servers.items[0].socket.address.getPort();
+    log.info("vlmzsd {s} listening on port {d}", .{ version, bound_port });
     if (opts.max_clients == 0) {
         log.warn("client cap disabled: concurrent client tasks are unbounded", .{});
     } else {
@@ -1275,9 +1265,8 @@ pub fn main(init: std.process.Init) !void {
         .cfg = &cfg,
         .servers = servers.items,
         .in_flight = .{ .cap = opts.max_clients },
-        .tally = tally,
+        .tally = &tally,
         .conn_group = &conn_group,
-        .port_str = port_str,
         .prng = rng,
         .assoc_group = rng.int(u32) | 1,
     };
@@ -1544,4 +1533,55 @@ test "a repeated --epid name replaces the earlier override without leaking" {
 
     try putOverride(gpa, &overrides, 0, "03612-00000-000-000000-03-1033-22631.0000-0002025");
     try std.testing.expectEqualStrings("03612-00000-000-000000-03-1033-22631.0000-0002025", overrides[0].?);
+}
+
+test "level-1 ePIDs share one LCID and one host build" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var data = try kmsdata.parse(gpa, @embedFile("vlmcsd.kmd"));
+    defer data.deinit(gpa);
+
+    var out_buf: [512]u8 = undefined;
+    var err_buf: [512]u8 = undefined;
+    var log = try cli_helper.Logger.init(gpa, io, &out_buf, &err_buf);
+    defer log.deinit(gpa);
+
+    var opts = ServerOptions{};
+    opts.randomize = 1;
+
+    var prng: std.Random.DefaultPrng = .init(0xc0f_fee1);
+    const overrides = try buildEpidOverrides(gpa, &data, &opts, prng.random(), 1_700_000_000, &log);
+    defer {
+        for (overrides) |slot| if (slot) |s| gpa.free(s);
+        gpa.free(overrides);
+    }
+
+    // Level 1 pre-fills every CSVLC: `platform-group-keyhi-keylo-03-lcid-build.0000-ydayyear`.
+    try std.testing.expectEqual(data.csvlk.len, overrides.len);
+    var shared_lcid: ?[]const u8 = null;
+    var shared_build: ?[]const u8 = null;
+    for (overrides) |slot| {
+        const pid = slot orelse return error.MissingEpid;
+        var fields = std.mem.splitScalar(u8, pid, '-');
+        var index: usize = 0;
+        var lcid: []const u8 = "";
+        var build: []const u8 = "";
+        while (fields.next()) |field| : (index += 1) {
+            switch (index) {
+                5 => lcid = field,
+                6 => build = field[0..std.mem.indexOfScalar(u8, field, '.').?],
+                else => {},
+            }
+        }
+        if (shared_lcid) |expected| {
+            // One LCID for the whole run, as `randomPidInit` samples it once.
+            try std.testing.expectEqualStrings(expected, lcid);
+            try std.testing.expectEqualStrings(shared_build.?, build);
+        } else {
+            shared_lcid = lcid;
+            shared_build = build;
+        }
+    }
+    try std.testing.expect(shared_lcid.?.len > 0);
 }
