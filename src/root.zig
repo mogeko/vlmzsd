@@ -14,6 +14,10 @@ pub const kmsdata = @import("kmsdata.zig");
 pub const kms = @import("kms.zig");
 pub const rpc = @import("rpc.zig");
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 const std = @import("std");
 const testutil = @import("testutil.zig");
 

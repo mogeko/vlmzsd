@@ -53,8 +53,8 @@ const vlmzsd_opts = [_]cli_helper.Opt{
     .{ .name = "data", .kind = .str, .hint = "file", .group = "Data", .desc = "External .kmd data file (default embedded)" },
     .{ .name = "epid", .kind = .str, .hint = "name=epid", .group = "ePID", .desc = "ePID override name=epid, repeatable", .repeatable = true },
     .{ .name = "randomize", .kind = .int, .hint = "u8", .group = "ePID", .desc = "ePID randomization level 0/1/2 (default 1)" },
-    .{ .name = "lcid", .kind = .int, .hint = "u32", .group = "ePID", .desc = "Fixed LCID for randomized ePIDs" },
-    .{ .name = "build", .kind = .int, .hint = "u32", .group = "ePID", .desc = "Fixed build number for randomized ePIDs" },
+    .{ .name = "lcid", .kind = .int, .hint = "u32", .group = "ePID", .desc = "Fixed LCID for randomized ePIDs, 0-32767 (0 = random)" },
+    .{ .name = "build", .kind = .int, .hint = "u32", .group = "ePID", .desc = "Fixed build number for randomized ePIDs, 0-65535 (0 = random)" },
     .{ .name = "activation-interval", .kind = .str, .hint = "dur", .group = "Activation policy", .desc = "VL activation interval (default 2h)" },
     .{ .name = "renewal-interval", .kind = .str, .hint = "dur", .group = "Activation policy", .desc = "VL renewal interval (default 7d)" },
     .{ .name = "whitelist", .kind = .int, .hint = "u32", .group = "Activation policy", .desc = "Whitelisting level 0-3 (default 0)" },
@@ -75,7 +75,7 @@ const vlmzsd_opts = [_]cli_helper.Opt{
 const ServerOptions = struct {
     port: u16 = default_port,
     listen: []const []const u8 = &.{"::"},
-    timeout_seconds: u64 = 30,
+    timeout_seconds: u32 = 30,
     max_clients: u32 = default_client_cap,
     data_file: ?[]const u8 = null,
     epids: []const []const u8 = &.{},
@@ -175,63 +175,56 @@ fn resolveLogLevel(
     return .info;
 }
 
-fn resolveInt(
-    comptime T: type,
-    cli_val: ?[]const u8,
-    env: *const EnvironMap,
-    env_name: []const u8,
-    default: T,
-) !T {
+fn resolveInt(comptime T: type, cli_val: ?[]const u8, env: *const EnvironMap, name: []const u8, default: T) !T {
     if (cli_val) |v| return std.fmt.parseInt(T, v, 10);
-    if (envGet(env, env_name)) |s| return std.fmt.parseInt(T, s, 10);
+    if (envGet(env, name)) |s| return std.fmt.parseInt(T, s, 10);
     return default;
 }
 
-fn resolveStr(
-    cli_val: ?[]const u8,
-    env: *const EnvironMap,
-    env_name: []const u8,
-    default: ?[]const u8,
-) ?[]const u8 {
+fn resolveStr(cli_val: ?[]const u8, env: *const EnvironMap, name: []const u8, default: ?[]const u8) ?[]const u8 {
     if (cli_val) |v| return v;
-    if (envGet(env, env_name)) |s| return s;
+    if (envGet(env, name)) |s| return s;
     return default;
 }
 
 /// Resolve a duration option into minutes (the KMS protocol's native unit).
-fn resolveDurationMinutes(
-    cli_val: ?[]const u8,
-    env: *const EnvironMap,
-    env_name: []const u8,
-    default_str: []const u8,
-) !u32 {
-    const raw = cli_val orelse envGet(env, env_name) orelse default_str;
+fn resolveDurationMinutes(cli_val: ?[]const u8, env: *const EnvironMap, name: []const u8, default: []const u8) !u32 {
+    const raw = cli_val orelse envGet(env, name) orelse default;
     const seconds = try cli_helper.parseDurationSeconds(raw);
-    return @intCast(seconds / 60);
+    return std.math.cast(u32, seconds / 60) orelse error.IntervalOutOfRange;
 }
 
-/// Split a comma-separated env-var value into a trimmed list (gpa-allocated).
+/// Split a comma-separated env-var value into a trimmed list. The returned
+/// slice is the whole allocation, so the caller can free it with the length it
+/// received. Empty and whitespace-only segments are skipped.
 fn splitList(gpa: Allocator, s: []const u8) ![]const []const u8 {
-    var count: usize = 1;
-    for (s) |c| {
-        if (c == ',') count += 1;
+    var count: usize = 0;
+    var scan = std.mem.splitScalar(u8, s, ',');
+    while (scan.next()) |item| {
+        if (std.mem.trim(u8, item, " \t").len > 0) count += 1;
     }
+
     const out = try gpa.alloc([]const u8, count);
-    errdefer gpa.free(out);
     var it = std.mem.splitScalar(u8, s, ',');
     var i: usize = 0;
     while (it.next()) |item| {
         const trimmed = std.mem.trim(u8, item, " \t");
-        if (trimmed.len > 0) {
-            out[i] = trimmed;
-            i += 1;
-        }
+        if (trimmed.len == 0) continue;
+        out[i] = trimmed;
+        i += 1;
     }
-    return out[0..i];
+    std.debug.assert(i == count);
+    return out;
 }
 
 fn resolveOptions(gpa: Allocator, env: *const EnvironMap, res: *const cli_helper.Result) !ServerOptions {
+    // `vlmzsd` takes options only; a stray word is a mistyped flag value, not
+    // something to ignore.
+    if (res.positionals.items.len > 0) return error.UnexpectedPositional;
+
     var opts = ServerOptions{};
+    // The env-var lists own memory, so every error below releases them.
+    errdefer opts.deinit(gpa);
 
     opts.port = try resolveInt(u16, res.get("port"), env, "VLMZSD_PORT", default_port);
 
@@ -241,12 +234,15 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, res: *const cli_helper
         opts.listen = listen;
     } else if (envGet(env, "VLMZSD_LISTEN")) |s| {
         opts.listen_backing = try splitList(gpa, s);
-        opts.listen = opts.listen_backing.?;
+        const split = opts.listen_backing.?;
+        // A value without a single address stays unset, so the default applies.
+        if (split.len > 0) opts.listen = split;
     }
 
     opts.timeout_seconds = blk: {
         const raw = res.get("timeout") orelse envGet(env, "VLMZSD_TIMEOUT") orelse "30s";
-        break :blk try cli_helper.parseDurationSeconds(raw);
+        const seconds = try cli_helper.parseDurationSeconds(raw);
+        break :blk std.math.cast(u32, seconds) orelse return error.TimeoutOutOfRange;
     };
 
     opts.max_clients = try resolveInt(u32, res.get("max-clients"), env, "VLMZSD_MAX_CLIENTS", default_client_cap);
@@ -262,7 +258,9 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, res: *const cli_helper
 
     opts.randomize = try resolveInt(u8, res.get("randomize"), env, "VLMZSD_RANDOMIZE", 1);
     opts.lcid = try resolveInt(u32, res.get("lcid"), env, "VLMZSD_LCID", 0);
+    if (opts.lcid > kms.max_lcid) return error.LcidOutOfRange;
     opts.build = try resolveInt(u32, res.get("build"), env, "VLMZSD_BUILD", 0);
+    if (opts.build > kms.max_build) return error.BuildOutOfRange;
 
     opts.activation_interval_minutes = try resolveDurationMinutes(res.get("activation-interval"), env, "VLMZSD_ACTIVATION_INTERVAL", "2h");
     opts.renewal_interval_minutes = try resolveDurationMinutes(res.get("renewal-interval"), env, "VLMZSD_RENEWAL_INTERVAL", "7d");
@@ -292,6 +290,14 @@ fn findCsvlkByName(data: *const kmsdata.KmsData, name: []const u8) ?usize {
     return null;
 }
 
+/// Store `epid` as the override for CSVLC `idx`, releasing the value an earlier
+/// `--epid` entry put there, so a repeated name keeps the last ePID.
+fn putOverride(gpa: Allocator, overrides: []?[]const u8, idx: usize, epid: []const u8) !void {
+    if (overrides[idx]) |previous| gpa.free(previous);
+    overrides[idx] = null;
+    overrides[idx] = try gpa.dupe(u8, epid);
+}
+
 /// Build the per-CSVLC ePID override table: `--epid` entries win, then level-1
 /// pre-randomization fills the remaining slots (mirrors C `randomPidInit`).
 fn buildEpidOverrides(
@@ -304,7 +310,10 @@ fn buildEpidOverrides(
 ) ![]const ?[]const u8 {
     const n = data.csvlk.len;
     const overrides = try gpa.alloc(?[]const u8, n);
-    errdefer gpa.free(overrides);
+    errdefer {
+        for (overrides) |slot| if (slot) |s| gpa.free(s);
+        gpa.free(overrides);
+    }
     @memset(overrides, null);
 
     // 1. `--epid <name>=<epid>` overrides.
@@ -315,23 +324,31 @@ fn buildEpidOverrides(
         };
         const name = entry[0..eq];
         const epid = entry[eq + 1 ..];
+        if (epid.len == 0) {
+            // An empty ePID would be answered to clients as a blank product
+            // key; it is a malformed entry, not an override.
+            log.warn("ignoring --epid with an empty ePID: {s}", .{name});
+            continue;
+        }
         const idx = findCsvlkByName(data, name) orelse {
             log.warn("ignoring --epid for unknown CSVLC name: {s}", .{name});
             continue;
         };
-        overrides[idx] = try gpa.dupe(u8, epid);
+        // A repeated name keeps the last ePID; the earlier one is ours to free.
+        try putOverride(gpa, overrides, idx, epid);
     }
 
-    // 2. Level-1 pre-randomization: one shared random build, random LCID,
-    //    per-CSVLC random key ID (only when the CSVLC has no --epid override).
+    // 2. Level-1 pre-randomization: one shared random build and one shared
+    //    random LCID, per-CSVLC random key ID (only when the CSVLC has no
+    //    --epid override).
     if (opts.randomize == 1) {
-        const lang: i16 = if (opts.lcid != 0) @intCast(opts.lcid) else 0;
+        const lang: i16 = if (opts.lcid != 0) @intCast(opts.lcid) else @intCast(kms.randomLcid(rng));
         var host_build: i32 = if (opts.build != 0) @intCast(opts.build) else 0;
         for (overrides, 0..) |*slot, i| {
             if (slot.* != null) continue;
-            if (host_build == 0) host_build = kms.randomHostBuild(data, rng, opts.ndr64);
+            if (host_build == 0) host_build = kms.randomHostBuild(data, rng, opts.ndr64) orelse return error.NoHostBuild;
             var buf: [kms.pid_buffer_size]u8 = undefined;
-            const pid = kms.generateRandomPid(data, i, &buf, lang, host_build, rng, opts.ndr64, now_unix);
+            const pid = try kms.generateRandomPid(data, i, &buf, lang, host_build, rng, opts.ndr64, now_unix);
             slot.* = try gpa.dupe(u8, pid);
         }
     }
@@ -395,7 +412,10 @@ const ClientContext = struct {
     gpa: Allocator,
     cfg: *const kms.ServerConfig,
     prng: std.Random.DefaultPrng,
+    /// Local port reported in this connection's BIND_ACK, formatted here
+    /// because `--port 0` gives every listen socket its own port.
     port_str: []const u8,
+    port_buf: [6]u8 = undefined,
     use_ndr64: bool,
     use_btfn: bool,
     disconnect_per_request: bool,
@@ -491,11 +511,7 @@ const ThreadTally = struct {
 /// The id is the OS thread id — `gettid` on Linux, so it matches `ps -L` and
 /// `/proc/<pid>/task/<tid>`, and `pthread_threadid_np` on macOS, the id
 /// `sample`/`spindump` and crash reports show.
-fn notePoolThread(
-    tally: *ThreadTally,
-    log: *cli_helper.Logger,
-    comptime serving_client: bool,
-) void {
+fn notePoolThread(tally: *ThreadTally, log: *cli_helper.Logger, comptime serving_client: bool) void {
     const new_thread = !stated_pool_thread;
     const new_client = serving_client and !stated_client_thread;
     if (!new_thread and !new_client) return;
@@ -516,6 +532,13 @@ fn notePoolThread(
         "pool worker {d} serving clients (client workers: {d}, pool threads: {d})",
         .{ thread_id, clients, threads },
     );
+}
+
+/// Wall clock for one connection's requests: `serveRpc` calls this before
+/// dispatching each REQUEST, so the timestamp checks see the current time.
+fn clientNowUnix(context: ?*anyopaque) i64 {
+    const ctx: *const ClientContext = @ptrCast(@alignCast(context.?));
+    return cli_helper.nowUnix(ctx.io);
 }
 
 /// Serve one connection as a pooled task (dispatched via `Group.concurrent`).
@@ -541,15 +564,16 @@ fn serveClientThread(ctx: *ClientContext) void {
     notePoolThread(ctx.tally, ctx.log, true);
     if (!ctx.quiet) ctx.log.debug("connection from {s} accepted", .{ctx.peer});
 
-    const now_unix = cli_helper.nowUnix(ctx.io);
-
     var rbuf: [4096]u8 = undefined;
     var wbuf: [4096]u8 = undefined;
     var reader = ctx.stream.reader(ctx.io, &rbuf);
     var writer = ctx.stream.writer(ctx.io, &wbuf);
 
-    const end: network.ServeEnd = network.serveRpc(ctx.gpa, &reader.interface, &writer.interface, ctx.prng.random(), now_unix, .{
+    const end: network.ServeEnd = network.serveRpc(ctx.gpa, &reader.interface, &writer.interface, ctx.prng.random(), .{
         .cfg = ctx.cfg,
+        // Sampled per request, so `--check-client-time` and level-2 ePIDs follow
+        // a keep-alive connection instead of measuring against the accept time.
+        .clock = .{ .context = ctx, .nowUnix = clientNowUnix },
         .on_event = logProtocolEvent,
         .event_context = ctx,
         .secondary_address = ctx.port_str,
@@ -761,7 +785,7 @@ const AcceptOutcome = union(enum) {
 /// `accept` is a task whose thread the backend can interrupt, which is why it
 /// can be one of the select's waiters.
 fn acceptTask(self: *ServerContext, server_index: usize) AcceptOutcome {
-    notePoolThread(&self.tally, self.log, false);
+    notePoolThread(self.tally, self.log, false);
     const stream = self.servers[server_index].accept(self.io) catch |err| return .{
         .failed = .{ .server = server_index, .err = err },
     };
@@ -797,9 +821,10 @@ const ServerContext = struct {
     cfg: *const kms.ServerConfig,
     servers: []Io.net.Server,
     in_flight: InFlight,
-    tally: ThreadTally,
+    /// Shared with the log writer task: a copy here would count the writer's
+    /// thread into a struct nobody reports.
+    tally: *ThreadTally,
     conn_group: *Io.Group,
-    port_str: []const u8,
     prng: std.Random,
     /// Next association group id; seeded non-zero (C `RpcAssocGroup = rand32()`).
     assoc_group: u32,
@@ -838,7 +863,7 @@ const ServerContext = struct {
         }
 
         const pipe: Io.File = shutdownPipeFile(.read);
-        const tally: *ThreadTally = &self.tally;
+        const tally: *ThreadTally = self.tally;
         select.concurrent(.shutdown, shutdownTask, .{ self.io, pipe, tally, self.log }) catch |e| {
             // Without this waiter the loop could never stop on a signal.
             self.log.err("failed to start shutdown reader: {s}", .{@errorName(e)});
@@ -862,10 +887,7 @@ const ServerContext = struct {
                 saturated = at_cap;
                 // One warn per saturation period: saturation is a property of
                 // the period, not of each wake-up.
-                if (saturated) self.log.warn(
-                    "client cap reached ({d}), deferring accept",
-                    .{self.in_flight.cap},
-                );
+                if (saturated) self.log.warn("client cap reached ({d}), deferring accept", .{self.in_flight.cap});
             }
 
             if (!saturated) {
@@ -912,7 +934,7 @@ const ServerContext = struct {
                 .client => |outcome| switch (outcome) {
                     .accepted => |client| {
                         armed &= ~armedBit(client.server);
-                        self.admit(client.stream);
+                        self.admit(client.server, client.stream);
                     },
                     .failed => |failure| {
                         armed &= ~armedBit(failure.server);
@@ -939,7 +961,7 @@ const ServerContext = struct {
     /// Apply ip-protection, take an admission slot, and dispatch one accepted
     /// connection onto the pool. Every early return closes the stream and
     /// leaves the slot count unchanged.
-    fn admit(self: *ServerContext, stream: Io.net.Stream) void {
+    fn admit(self: *ServerContext, server_index: usize, stream: Io.net.Stream) void {
         // ip-protection level 2: reject clients with a public IP.
         if (self.opts.ip_protection & ip_protect_reject_public != 0) {
             if (!network.isClientPrivate(stream.socket.handle)) {
@@ -970,17 +992,25 @@ const ServerContext = struct {
             .gpa = self.gpa,
             .cfg = self.cfg,
             .prng = std.Random.DefaultPrng.init(self.prng.int(u64)),
-            .port_str = self.port_str,
+            .port_str = "",
             .use_ndr64 = self.opts.ndr64,
             .use_btfn = self.opts.btfn,
             .disconnect_per_request = self.opts.disconnect_per_request,
-            .timeout_seconds = @intCast(self.opts.timeout_seconds),
+            .timeout_seconds = self.opts.timeout_seconds,
             .rpc_assoc_group = self.assoc_group,
             .in_flight = &self.in_flight,
-            .tally = &self.tally,
+            .tally = self.tally,
             .log = self.log,
             .quiet_loopback = self.opts.quiet_loopback,
         };
+        // The BIND_ACK advertises the local port the client reached. It comes
+        // from the listen socket that accepted the connection, because
+        // `--port 0` gives every socket its own ephemeral port (the reference
+        // reads it from the local socket with `getnameinfo`). Formatting after
+        // the assignment keeps `port_str` pointing at `ctx.port_buf` itself.
+        const bound_port = self.servers[server_index].socket.address.getPort();
+        ctx.port_str = std.fmt.bufPrint(&ctx.port_buf, "{d}", .{bound_port}) catch unreachable;
+
         // One association group per connection, always non-zero
         // (C `RpcAssocGroup++` in `runServer`).
         self.assoc_group +%= 1;
@@ -1053,8 +1083,13 @@ pub fn main(init: std.process.Init) !void {
         cli_helper.fatalStderr(init.io, "vlmzsd", "failed to start log writer task: {s}", .{@errorName(e)});
     };
 
-    var opts = resolveOptions(init.gpa, init.environ_map, &res) catch |e| {
-        fatal(&log, init.io, "invalid configuration: {s}", .{@errorName(e)});
+    var opts = resolveOptions(init.gpa, init.environ_map, &res) catch |e| switch (e) {
+        error.UnexpectedPositional => fatal(&log, init.io, "vlmzsd takes no positional arguments", .{}),
+        error.LcidOutOfRange => fatal(&log, init.io, "--lcid must be 0..{d} (0 = random)", .{kms.max_lcid}),
+        error.BuildOutOfRange => fatal(&log, init.io, "--build must be 0..{d} (0 = random)", .{kms.max_build}),
+        error.TimeoutOutOfRange => fatal(&log, init.io, "--timeout must be at most {d} seconds", .{std.math.maxInt(u32)}),
+        error.IntervalOutOfRange => fatal(&log, init.io, "policy interval must be at most {d} minutes", .{std.math.maxInt(u32)}),
+        else => fatal(&log, init.io, "invalid configuration: {s}", .{@errorName(e)}),
     };
     defer opts.deinit(init.gpa);
 
@@ -1114,12 +1149,28 @@ pub fn main(init: std.process.Init) !void {
     var prng: std.Random.DefaultPrng = .init(cli_helper.makeSeed(init.io));
     const rng = prng.random();
 
-    const epid_overrides = try buildEpidOverrides(init.gpa, &data, &opts, rng, cli_helper.nowUnix(init.io), &log);
+    const epid_overrides = buildEpidOverrides(init.gpa, &data, &opts, rng, cli_helper.nowUnix(init.io), &log) catch |e| {
+        fatal(&log, init.io, "cannot initialize randomized ePIDs: {s}", .{@errorName(e)});
+    };
     defer {
         for (epid_overrides) |slot| {
             if (slot) |s| init.gpa.free(s);
         }
         init.gpa.free(epid_overrides);
+    }
+
+    // Level 2 generates each ePID at request time. Reject a data file that
+    // cannot supply a host build for the negotiated transfer syntax now,
+    // instead of rejecting every request later.
+    if (opts.randomize == 2) {
+        var needs_random_pid = false;
+        for (epid_overrides) |slot| if (slot == null) {
+            needs_random_pid = true;
+            break;
+        };
+        if (needs_random_pid and opts.build == 0 and !kms.hasHostBuildForNdr64(&data, opts.ndr64)) {
+            fatal(&log, init.io, "no host build matches the NDR64 setting for randomized ePIDs", .{});
+        }
     }
 
     // Client lists (strict mode): one per app, pre-filled unless --start-empty.
@@ -1147,9 +1198,6 @@ pub fn main(init: std.process.Init) !void {
         .client_lists = if (client_lists_storage != null) &client_lists else null,
     };
 
-    var port_str_buf: [6]u8 = undefined;
-    const port_str = try std.fmt.bufPrint(&port_str_buf, "{d}", .{opts.port});
-
     // Create the listening sockets. ip-protection level 1 listens only on the
     // host's private addresses; otherwise `--listen` (default ::, a dual-stack
     // socket covering both IPv4 and IPv6).
@@ -1160,7 +1208,10 @@ pub fn main(init: std.process.Init) !void {
     }
     try createListenSockets(init.gpa, init.io, &opts, &log, &servers);
 
-    log.info("vlmzsd {s} listening on port {d}", .{ version, opts.port });
+    // With `--port 0` the kernel picks the port, so report the one actually
+    // bound instead of echoing "0".
+    const bound_port: u16 = if (opts.port != 0) opts.port else servers.items[0].socket.address.getPort();
+    log.info("vlmzsd {s} listening on port {d}", .{ version, bound_port });
     if (opts.max_clients == 0) {
         log.warn("client cap disabled: concurrent client tasks are unbounded", .{});
     } else {
@@ -1214,14 +1265,17 @@ pub fn main(init: std.process.Init) !void {
         .cfg = &cfg,
         .servers = servers.items,
         .in_flight = .{ .cap = opts.max_clients },
-        .tally = tally,
+        .tally = &tally,
         .conn_group = &conn_group,
-        .port_str = port_str,
         .prng = rng,
         .assoc_group = rng.int(u32) | 1,
     };
     try server.run();
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 test "InFlight admits up to the cap, then refuses without leaking slots" {
     const io: Io = std.testing.io;
@@ -1386,4 +1440,183 @@ test "resolveLogLevel: CLI flags, VLMZSD_LOG_LEVEL, and invalid values" {
     try std.testing.expectEqual(cli_helper.Level.debug, try resolveLogLevel(&no_flags, &env, &invalid, &legacy_verbose, &legacy_quiet));
     try std.testing.expect(legacy_verbose);
     try std.testing.expect(!legacy_quiet);
+}
+
+test "splitList returns an exactly-sized list and skips empty segments" {
+    const gpa = std.testing.allocator;
+
+    // The returned slice must be the whole allocation: `ServerOptions.deinit`
+    // frees it at the length it received, so a shorter sub-slice would free the
+    // wrong size. Empty segments make the two lengths differ.
+    const list = try splitList(gpa, " 127.0.0.1, ,::1 ,");
+    defer gpa.free(list);
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    try std.testing.expectEqualStrings("127.0.0.1", list[0]);
+    try std.testing.expectEqualStrings("::1", list[1]);
+
+    // A value with no address at all allocates nothing, so freeing it is a
+    // no-op instead of a leak.
+    const empty = try splitList(gpa, " , ");
+    defer gpa.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    const single = try splitList(gpa, " :: ");
+    defer gpa.free(single);
+    try std.testing.expectEqual(@as(usize, 1), single.len);
+    try std.testing.expectEqualStrings("::", single[0]);
+}
+
+test "resolveOptions: env lists, numeric limits, and positional arguments" {
+    const gpa = std.testing.allocator;
+    var env: EnvironMap = .init(gpa);
+    defer env.deinit();
+
+    // A list with no address leaves the default in place.
+    try env.put("VLMZSD_LISTEN", " , ");
+    var default_listen = try cli_helper.parse(gpa, &vlmzsd_opts, &.{});
+    defer default_listen.deinit();
+    {
+        var opts = try resolveOptions(gpa, &env, &default_listen);
+        defer opts.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), opts.listen.len);
+        try std.testing.expectEqualStrings("::", opts.listen[0]);
+    }
+
+    // Gaps and padding are trimmed away, and the result owns its allocation.
+    try env.put("VLMZSD_LISTEN", "127.0.0.1,, ::1");
+    {
+        var opts = try resolveOptions(gpa, &env, &default_listen);
+        defer opts.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 2), opts.listen.len);
+        try std.testing.expectEqualStrings("127.0.0.1", opts.listen[0]);
+        try std.testing.expectEqualStrings("::1", opts.listen[1]);
+    }
+    _ = env.swapRemove("VLMZSD_LISTEN");
+
+    // The documented limits are accepted ...
+    var limits = try cli_helper.parse(gpa, &vlmzsd_opts, &.{
+        "--lcid",                "32767",
+        "--build",               "65535",
+        "--timeout",             "4294967295s",
+        "--activation-interval", "4294967295m",
+    });
+    defer limits.deinit();
+    {
+        var opts = try resolveOptions(gpa, &env, &limits);
+        defer opts.deinit(gpa);
+        try std.testing.expectEqual(kms.max_lcid, opts.lcid);
+        try std.testing.expectEqual(kms.max_build, opts.build);
+        try std.testing.expectEqual(std.math.maxInt(u32), opts.timeout_seconds);
+        try std.testing.expectEqual(std.math.maxInt(u32), opts.activation_interval_minutes);
+    }
+
+    // ... and one past each is a configuration error, not a panic.
+    const Case = struct { args: []const []const u8, expected: anyerror };
+    const cases = [_]Case{
+        .{ .args = &.{ "--lcid", "32768" }, .expected = error.LcidOutOfRange },
+        .{ .args = &.{ "--build", "65536" }, .expected = error.BuildOutOfRange },
+        .{ .args = &.{ "--timeout", "4294967296s" }, .expected = error.TimeoutOutOfRange },
+        .{ .args = &.{ "--activation-interval", "71582789h" }, .expected = error.IntervalOutOfRange },
+        .{ .args = &.{ "--renewal-interval", "71582789h" }, .expected = error.IntervalOutOfRange },
+        .{ .args = &.{"stray"}, .expected = error.UnexpectedPositional },
+    };
+    for (cases) |case| {
+        var res = try cli_helper.parse(gpa, &vlmzsd_opts, case.args);
+        defer res.deinit();
+        try std.testing.expectError(case.expected, resolveOptions(gpa, &env, &res));
+    }
+}
+
+test "a repeated --epid name replaces the earlier override without leaking" {
+    const gpa = std.testing.allocator;
+    var overrides = [_]?[]const u8{null};
+    defer if (overrides[0]) |s| gpa.free(s);
+
+    try putOverride(gpa, &overrides, 0, "03612-00000-000-000000-03-1033-19045.0000-0002023");
+    try std.testing.expectEqualStrings("03612-00000-000-000000-03-1033-19045.0000-0002023", overrides[0].?);
+
+    try putOverride(gpa, &overrides, 0, "03612-00000-000-000000-03-1033-22631.0000-0002025");
+    try std.testing.expectEqualStrings("03612-00000-000-000000-03-1033-22631.0000-0002025", overrides[0].?);
+}
+
+test "level-1 ePIDs share one LCID and one host build" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var data = try kmsdata.parse(gpa, @embedFile("vlmcsd.kmd"));
+    defer data.deinit(gpa);
+
+    var out_buf: [512]u8 = undefined;
+    var err_buf: [512]u8 = undefined;
+    var log = try cli_helper.Logger.init(gpa, io, &out_buf, &err_buf);
+    defer log.deinit(gpa);
+
+    var opts = ServerOptions{};
+    opts.randomize = 1;
+
+    var prng: std.Random.DefaultPrng = .init(0xc0f_fee1);
+    const overrides = try buildEpidOverrides(gpa, &data, &opts, prng.random(), 1_700_000_000, &log);
+    defer {
+        for (overrides) |slot| if (slot) |s| gpa.free(s);
+        gpa.free(overrides);
+    }
+
+    // Level 1 pre-fills every CSVLC: `platform-group-keyhi-keylo-03-lcid-build.0000-ydayyear`.
+    try std.testing.expectEqual(data.csvlk.len, overrides.len);
+    var shared_lcid: ?[]const u8 = null;
+    var shared_build: ?[]const u8 = null;
+    for (overrides) |slot| {
+        const pid = slot orelse return error.MissingEpid;
+        var fields = std.mem.splitScalar(u8, pid, '-');
+        var index: usize = 0;
+        var lcid: []const u8 = "";
+        var build: []const u8 = "";
+        while (fields.next()) |field| : (index += 1) {
+            switch (index) {
+                5 => lcid = field,
+                6 => build = field[0..std.mem.indexOfScalar(u8, field, '.').?],
+                else => {},
+            }
+        }
+        if (shared_lcid) |expected| {
+            // One LCID for the whole run, as `randomPidInit` samples it once.
+            try std.testing.expectEqualStrings(expected, lcid);
+            try std.testing.expectEqualStrings(shared_build.?, build);
+        } else {
+            shared_lcid = lcid;
+            shared_build = build;
+        }
+    }
+    try std.testing.expect(shared_lcid.?.len > 0);
+}
+
+test "an --epid entry with an empty ePID is ignored" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var data = try kmsdata.parse(gpa, @embedFile("vlmcsd.kmd"));
+    defer data.deinit(gpa);
+
+    var out_buf: [512]u8 = undefined;
+    var err_buf: [512]u8 = undefined;
+    var log = try cli_helper.Logger.init(gpa, io, &out_buf, &err_buf);
+    defer log.deinit(gpa);
+
+    var opts = ServerOptions{};
+    opts.randomize = 0;
+    opts.epids = &.{ "Windows=", "Windows=03612-00000-000-000000-03-1033-19045.0000-0002023" };
+
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    const overrides = try buildEpidOverrides(gpa, &data, &opts, prng.random(), 1_700_000_000, &log);
+    defer {
+        for (overrides) |slot| if (slot) |s| gpa.free(s);
+        gpa.free(overrides);
+    }
+
+    // The empty value is skipped, so the later entry survives instead of being
+    // replaced by a blank product key.
+    try std.testing.expectEqualStrings(
+        "03612-00000-000-000000-03-1033-19045.0000-0002023",
+        overrides[0].?,
+    );
 }

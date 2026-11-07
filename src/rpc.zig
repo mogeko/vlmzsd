@@ -187,6 +187,21 @@ pub const BindResponseOptions = struct {
 pub const BindNegotiation = struct {
     ndr_ctx: u16 = invalid_ctx,
     ndr64_ctx: u16 = invalid_ctx,
+    /// Whether the client actually proposed each syntax. The id alone cannot
+    /// say: `invalid_ctx` (0xFFFF) is a legal value for the client to choose,
+    /// so "no id" and "id 0xFFFF" are only distinguishable here.
+    ndr32_negotiated: bool = false,
+    ndr64_negotiated: bool = false,
+
+    /// True when NDR32 carried by a request is the negotiated one.
+    pub fn hasNdr32(self: BindNegotiation) bool {
+        return self.ndr32_negotiated or self.ndr_ctx != invalid_ctx;
+    }
+
+    /// True when NDR64 carried by a request is the negotiated one.
+    pub fn hasNdr64(self: BindNegotiation) bool {
+        return self.ndr64_negotiated or self.ndr64_ctx != invalid_ctx;
+    }
 };
 
 /// Build a BIND/ALTER-CONTEXT response body (no RPC header).
@@ -213,10 +228,12 @@ pub fn buildBindResponse(
         const transfer_syntax = request_body[base + 24 .. base + 40];
         if (std.mem.eql(u8, transfer_syntax, &transfer_syntax_ndr32)) {
             negotiation.ndr_ctx = context_id;
+            negotiation.ndr32_negotiated = true;
         }
         if (options.use_ndr64 and std.mem.eql(u8, transfer_syntax, &transfer_syntax_ndr64)) {
             ndr64_possible = true;
             negotiation.ndr64_ctx = context_id;
+            negotiation.ndr64_negotiated = true;
         }
     }
 
@@ -323,9 +340,12 @@ pub fn dispatchKmsRequest(
 ) !DispatchResult {
     if (request_body.len < request32_fixed_size) return error.InvalidRequest;
 
+    // An unnegotiated context must not match by coincidence: `invalid_ctx`
+    // (0xFFFF) is also a legal id for the client to have proposed, so validity
+    // is tracked separately from the id value.
     const context_id = readLe(u16, request_body, 4);
-    const is_ndr64 = context_id == negotiation.ndr64_ctx;
-    const is_ndr32 = context_id == negotiation.ndr_ctx;
+    const is_ndr64 = negotiation.hasNdr64() and context_id == negotiation.ndr64_ctx;
+    const is_ndr32 = negotiation.hasNdr32() and context_id == negotiation.ndr_ctx;
     if (!is_ndr32 and !is_ndr64) return .{ .kind = .{ .fault = nca_unk_if } };
 
     const data_offset: usize = if (is_ndr64) request64_fixed_size else request32_fixed_size;
@@ -340,24 +360,31 @@ pub fn dispatchKmsRequest(
     var response_size: i32 = e_invalid_arg;
     var major_ver: u16 = 0;
 
-    // Mirror `checkRpcRequestSize` (rpc.c): only KMS v4.0/v5.0/v6.0 are
-    // supported. `major_index` wraps for major < 4 exactly like the C
-    // `uint16_t` arithmetic, so the `<= 2` test rejects those too.
+    // Only KMS v4.0/v5.0/v6.0 are supported (C `checkRpcRequestSize`). The
+    // reference subtracts 4 in 16-bit arithmetic and rejects the wrapped index
+    // (`majorIndex >= countof(_Versions)`); the same subtraction in Zig traps
+    // on underflow, so the range is compared directly instead.
     if (request_body.len >= data_offset + 4) {
         const version = readLe(u32, request_body, data_offset);
-        const major_index: u32 = (version >> 16) - 4;
+        const major = version >> 16;
         const minor: u32 = version & 0xffff;
-        if (major_index <= 2 and minor == 0) {
-            major_ver = @intCast(version >> 16);
+        if (major >= 4 and major <= 6 and minor == 0) {
+            major_ver = @intCast(major);
             const kms_request_size: usize = if (major_ver == 4) kms_request_v4_size else kms_request_v6_size;
             if (request_body.len >= data_offset + kms_request_size) {
                 if (major_ver == 4) {
                     var request_v4: kms.RequestV4 = undefined;
-                    @memcpy(std.mem.asBytes(&request_v4)[0..kms_request_size], request_body[data_offset..][0..kms_request_size]);
+                    @memcpy(
+                        std.mem.asBytes(&request_v4)[0..kms_request_size],
+                        request_body[data_offset..][0..kms_request_size],
+                    );
                     response_size = kms.createResponseV4(&request_v4, &kms_response_buf, cfg, rng, now_unix);
                 } else {
                     var request_v6: kms.RequestV6 = undefined;
-                    @memcpy(std.mem.asBytes(&request_v6)[0..kms_request_size], request_body[data_offset..][0..kms_request_size]);
+                    @memcpy(
+                        std.mem.asBytes(&request_v6)[0..kms_request_size],
+                        request_body[data_offset..][0..kms_request_size],
+                    );
                     response_size = kms.createResponseV6(&request_v6, &kms_response_buf, cfg, rng, now_unix);
                 }
             }
@@ -536,6 +563,9 @@ pub fn wrapKmsRequest(
     const ndr_size: usize = if (use_ndr64) request64_fixed_size else request32_fixed_size;
     const ndr_tail: usize = if (use_ndr64) 16 else 8; // DataLength + DataSizeIs
     const total = header_size + ndr_size + kms_request.len;
+    // `frag_length` is 16-bit, and the NDR header carries the payload length as
+    // u32: a request that fits neither cannot be framed.
+    if (total > std.math.maxInt(u16)) return error.PacketTooLarge;
 
     const buf = try allocator.alloc(u8, total);
     @memset(buf, 0);
@@ -579,12 +609,18 @@ pub fn parseKmsResponse(response_body: []const u8, use_ndr64: bool) KmsResponseP
         if (response_body.len < 24) return .{ .data = "", .status = nca_proto_error };
         const data_length = readLe(u64, response_body, 8);
         const data_size_max = readLe(u64, response_body, 16);
-        const response_size: usize = @intCast(data_length);
+        // A length that does not fit the address space cannot describe this
+        // body; treat it like the overrun it is instead of narrowing blindly.
+        const response_size = std.math.cast(usize, data_length) orelse
+            return .{ .data = "", .status = nca_proto_error };
         if (data_size_max == 0) {
             if (response_body.len < 28) return .{ .data = "", .status = nca_proto_error };
             return .{ .data = "", .status = readLe(i32, response_body, 24) };
         }
-        if (response_body.len < data_offset + response_size + 4) return .{ .data = "", .status = nca_proto_error };
+        // Compare against the room that is actually left: adding the length to
+        // the offset first would overflow for an adversarial DataLength.
+        if (response_body.len < data_offset + 4) return .{ .data = "", .status = nca_proto_error };
+        if (response_size > response_body.len - data_offset - 4) return .{ .data = "", .status = nca_proto_error };
         return .{
             .data = response_body[data_offset..][0..response_size],
             .status = readLe(i32, response_body, data_offset + response_size),
@@ -596,9 +632,13 @@ pub fn parseKmsResponse(response_body: []const u8, use_ndr64: bool) KmsResponseP
     const data_size_max = readLe(u32, response_body, 12);
     const response_size: usize = data_length;
     if (data_size_max == 0) {
+        // A rejected body carries the status where `DataSizeIs` would be; a
+        // short body has no status to read, so it cannot report success.
+        if (response_body.len < 20) return .{ .data = "", .status = nca_proto_error };
         return .{ .data = "", .status = readLe(i32, response_body, 16) };
     }
-    if (response_body.len < data_offset + response_size + 4) return .{ .data = "", .status = nca_proto_error };
+    if (response_body.len < data_offset + 4) return .{ .data = "", .status = nca_proto_error };
+    if (response_size > response_body.len - data_offset - 4) return .{ .data = "", .status = nca_proto_error };
     return .{
         .data = response_body[data_offset..][0..response_size],
         .status = readLe(i32, response_body, data_offset + response_size),
@@ -813,6 +853,43 @@ test "dispatch unsupported KMS version returns HRESULT" {
     }
 }
 
+test "dispatch rejects every unsupported major version without trapping" {
+    // Pin the rejection contract for every major outside 4..6: a RESPONSE with
+    // 0x8007000D and no payload, never a trap. `major - 4` in unsigned
+    // arithmetic traps on underflow, so the values below 4 are the ones that
+    // need the range compared instead of the difference.
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = kms.ServerConfig{ .data = &td.data };
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
+    const rng = prng.random();
+    var negotiation = BindNegotiation{ .ndr_ctx = 0, .ndr64_ctx = 1 };
+    const e_invalid_arg: i32 = @bitCast(@as(u32, 0x8007000D));
+
+    for ([_]u32{ 0, 1, 2, 3, 7, 0x7FFF, 0xFFFF }) |major| {
+        var base = makeBase(&td.data);
+        base.version = major << 16;
+        var request_v6: kms.RequestV6 = undefined;
+        kms.createRequestV6(&request_v6, &base, rng);
+
+        const rpc_request = try wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), false, 2);
+        defer alloc.free(rpc_request);
+        const dispatch = try dispatchKmsRequest(alloc, rpc_request[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
+        const resp_body = switch (dispatch.kind) {
+            .fault => return error.TestUnexpectedResult,
+            .response => |body| body,
+        };
+        defer alloc.free(resp_body);
+        const parsed = parseKmsResponse(resp_body, false);
+        try std.testing.expectEqual(e_invalid_arg, parsed.status);
+        try std.testing.expectEqual(@as(usize, 0), parsed.data.len);
+        // The version is reported as 0 for an unparseable request.
+        try std.testing.expectEqual(@as(u16, 0), dispatch.major_version);
+    }
+}
+
 test "rejected response wire bytes (NDR64)" {
     const alloc = std.testing.allocator;
     var td = try loadTestData(alloc);
@@ -879,6 +956,46 @@ test "dispatch non-zero minor version returns HRESULT" {
     try std.testing.expectEqual(e_invalid_arg, parsed.status);
 }
 
+test "dispatch rejects oversized N_Policy without wrapping" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = kms.ServerConfig{ .data = &td.data };
+    var negotiation = BindNegotiation{ .ndr_ctx = 0, .ndr64_ctx = 1 };
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
+    const rng = prng.random();
+    const e_invalid_arg: i32 = @bitCast(@as(u32, 0x8007000D));
+
+    // `required_clients = n_policy * 2` is checked before the multiplication:
+    // a u32 wrap would turn 0x80000000 into 0 and 0x80000002 into 4, bypassing
+    // the > 2000 rule — docs/migration.md §5.
+    const rejected = [_]u32{ 1001, 0x8000_0000, 0x8000_0002, 0xFFFF_FFFF };
+    for (rejected) |n_policy| {
+        var base = makeBase(&td.data);
+        base.n_policy = n_policy;
+
+        var request_v6: kms.RequestV6 = undefined;
+        kms.createRequestV6(&request_v6, &base, rng);
+        const rpc_request = try wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), true, 2);
+        defer alloc.free(rpc_request);
+
+        const dispatch = try dispatchKmsRequest(alloc, rpc_request[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
+        try std.testing.expectEqual(@as(u16, 6), dispatch.major_version);
+        try std.testing.expect(dispatch.response_size < 0);
+
+        const resp_body = switch (dispatch.kind) {
+            .fault => return error.TestUnexpectedResult,
+            .response => |body| body,
+        };
+        defer alloc.free(resp_body);
+
+        const parsed = parseKmsResponse(resp_body, true);
+        try std.testing.expectEqual(e_invalid_arg, parsed.status);
+        try std.testing.expectEqual(@as(usize, 0), parsed.data.len);
+    }
+}
+
 test "too-short request disconnects" {
     const alloc = std.testing.allocator;
     var td = try loadTestData(alloc);
@@ -913,6 +1030,26 @@ test "unknown context returns FAULT" {
     std.mem.writeInt(u16, body[4..6], 0xEEEE, .little);
     const dispatch = try dispatchKmsRequest(alloc, &body, &negotiation, &cfg, prng.random(), 1_700_000_000);
     switch (dispatch.kind) {
+        .fault => |nca| try std.testing.expectEqual(nca_unk_if, nca),
+        .response => return error.TestUnexpectedResult,
+    }
+
+    // `invalid_ctx` means "nothing negotiated under this id", so a request that
+    // uses 0xFFFF itself must not be dispatched as NDR64 when only NDR32 was
+    // bound: `BindNegotiation` leaves the other id at `invalid_ctx`.
+    var ndr32_only = BindNegotiation{};
+    ndr32_only.ndr_ctx = 0;
+    std.mem.writeInt(u16, body[4..6], invalid_ctx, .little);
+    const unnegotiated = try dispatchKmsRequest(alloc, &body, &ndr32_only, &cfg, prng.random(), 1_700_000_000);
+    switch (unnegotiated.kind) {
+        .fault => |nca| try std.testing.expectEqual(nca_unk_if, nca),
+        .response => return error.TestUnexpectedResult,
+    }
+
+    // With nothing negotiated at all, every context id is unknown.
+    const nothing = BindNegotiation{};
+    const none = try dispatchKmsRequest(alloc, &body, &nothing, &cfg, prng.random(), 1_700_000_000);
+    switch (none.kind) {
         .fault => |nca| try std.testing.expectEqual(nca_unk_if, nca),
         .response => return error.TestUnexpectedResult,
     }
@@ -968,4 +1105,103 @@ test "BTFN declined when disabled" {
     try std.testing.expect(result.has_ndr32);
     try std.testing.expect(!result.has_ndr64);
     try std.testing.expect(!result.has_btfn);
+}
+
+test "parseKmsResponse treats a short body as a protocol error" {
+    // A peer can answer with fewer bytes than the fixed fields. A short body
+    // must not report success: the status field it would be read from is
+    // absent, and an empty payload must not reach the decrypt step.
+    var buf: [32]u8 = undefined;
+
+    for ([_]usize{ 0, 4, 8, 12, 16, 19 }) |size| {
+        @memset(buf[0..size], 0);
+        const ndr32 = parseKmsResponse(buf[0..size], false);
+        try std.testing.expectEqual(@as(usize, 0), ndr32.data.len);
+        try std.testing.expectEqual(@as(i32, @bitCast(nca_proto_error)), ndr32.status);
+
+        const ndr64 = parseKmsResponse(buf[0..size], true);
+        try std.testing.expectEqual(@as(usize, 0), ndr64.data.len);
+        try std.testing.expectEqual(@as(i32, @bitCast(nca_proto_error)), ndr64.status);
+    }
+
+    // A DataLength that points past the body is the same kind of lie.
+    @memset(buf[0..32], 0);
+    std.mem.writeInt(u32, buf[8..12], 1000, .little);
+    std.mem.writeInt(u32, buf[12..16], 0x0002_0000, .little);
+    const oversize = parseKmsResponse(buf[0..32], false);
+    try std.testing.expectEqual(@as(usize, 0), oversize.data.len);
+    try std.testing.expectEqual(@as(i32, @bitCast(nca_proto_error)), oversize.status);
+
+    // NDR64: a DataLength above the address space must be reported, not
+    // narrowed into `usize`.
+    @memset(buf[0..32], 0);
+    std.mem.writeInt(u64, buf[8..16], 0xFFFF_FFFF_FFFF_FFFF, .little);
+    std.mem.writeInt(u64, buf[16..24], 0x0002_0000, .little);
+    const wide = parseKmsResponse(buf[0..32], true);
+    try std.testing.expectEqual(@as(usize, 0), wide.data.len);
+    try std.testing.expectEqual(@as(i32, @bitCast(nca_proto_error)), wide.status);
+}
+
+test "wrapKmsRequest rejects a request that does not fit the 16-bit fragment length" {
+    const alloc = std.testing.allocator;
+
+    // The largest payload that still frames: header + NDR header + payload must
+    // stay within `frag_length`.
+    const max_payload = std.math.maxInt(u16) - header_size - request32_fixed_size;
+    const fit = try alloc.alloc(u8, max_payload);
+    defer alloc.free(fit);
+    @memset(fit, 0);
+    const packet = try wrapKmsRequest(alloc, fit, false, 2);
+    defer alloc.free(packet);
+    try std.testing.expectEqual(@as(u16, std.math.maxInt(u16)), std.mem.readInt(u16, packet[8..10], .little));
+
+    // One byte more cannot be framed at all; it must be an error, not a trap.
+    const too_big = try alloc.alloc(u8, max_payload + 1);
+    defer alloc.free(too_big);
+    @memset(too_big, 0);
+    try std.testing.expectError(error.PacketTooLarge, wrapKmsRequest(alloc, too_big, false, 2));
+    try std.testing.expectError(error.PacketTooLarge, wrapKmsRequest(alloc, too_big, true, 2));
+}
+
+test "a client may negotiate any 16-bit context id, including the sentinel" {
+    // `invalid_ctx` (0xFFFF) is a value the client may legitimately propose. The
+    // negotiation must remember that the id *was* negotiated, so the sentinel
+    // cannot be used as "nothing negotiated" without also tracking validity.
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    const bind_packet = try buildBindRequest(alloc, packet_type.bind_req, 2, .{ .use_ndr64 = false });
+    defer alloc.free(bind_packet);
+    const bind_body = try alloc.dupe(u8, bind_packet[header_size..]);
+    defer alloc.free(bind_body);
+    // Move the single NDR32 CtxItem to the sentinel id.
+    std.mem.writeInt(u16, bind_body[bind_request_fixed_size..][0..2], invalid_ctx, .little);
+
+    var negotiation = BindNegotiation{};
+    const ack = try buildBindResponse(alloc, bind_body, 7, .{ .use_ndr64 = false }, &negotiation);
+    defer alloc.free(ack);
+    try std.testing.expectEqual(invalid_ctx, negotiation.ndr_ctx);
+
+    var cfg = kms.ServerConfig{ .data = &td.data };
+    var prng: std.Random.DefaultPrng = .init(0x0c0f_fee1);
+    const rng = prng.random();
+    var request_v6: kms.RequestV6 = undefined;
+    kms.createRequestV6(&request_v6, &makeBase(&td.data), rng);
+    const wrapped = try wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), false, 3);
+    defer alloc.free(wrapped);
+    std.mem.writeInt(u16, wrapped[header_size + 4 ..][0..2], invalid_ctx, .little);
+
+    const dispatch = try dispatchKmsRequest(alloc, wrapped[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
+    switch (dispatch.kind) {
+        .fault => |nca| {
+            std.debug.print("negotiated ctx 0xFFFF was rejected with FAULT 0x{X:0>8}\n", .{nca});
+            return error.TestUnexpectedResult;
+        },
+        .response => |body| {
+            defer alloc.free(body);
+            const parsed = parseKmsResponse(body, false);
+            try std.testing.expectEqual(@as(i32, 0), parsed.status);
+        },
+    }
 }

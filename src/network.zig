@@ -78,8 +78,19 @@ pub const Event = union(enum) {
     response: struct { major: u32, size: usize },
 };
 
+/// Wall clock for the per-request timestamp check (`--check-client-time`) and
+/// for level-2 ePID generation. `serveRpc` samples it once before each REQUEST:
+/// sampling it per connection would keep comparing against the moment the
+/// connection was accepted, which a keep-alive client can hold open for hours.
+pub const Clock = struct {
+    context: ?*anyopaque = null,
+    nowUnix: *const fn (context: ?*anyopaque) i64,
+};
+
 pub const ServeOptions = struct {
     cfg: *const kms.ServerConfig,
+    /// Request clock (see `Clock`); required, so a caller cannot forget it.
+    clock: Clock,
     /// Association group id echoed in BIND/ALTER-CONTEXT responses. The
     /// reference assigns a random non-zero value at startup and increments it
     /// per client (`network.c` `runServer`); callers should do the same.
@@ -100,15 +111,13 @@ pub const ServeOptions = struct {
 };
 
 /// Write one RPC packet (header + body).
-fn writePacket(
-    writer: *Io.Writer,
-    packet_type: u8,
-    call_id: u32,
-    body: []const u8,
-    flags: u8,
-) !void {
+fn writePacket(writer: *Io.Writer, packet_type: u8, call_id: u32, body: []const u8, flags: u8) !void {
+    // Every body this server sends is bounded by a request or a response struct,
+    // so the fragment length always fits its 16-bit field.
+    const frag_len = rpc.header_size + body.len;
+    std.debug.assert(frag_len <= std.math.maxInt(u16));
     var header: rpc.RpcHeader = undefined;
-    rpc.createRpcHeader(&header, packet_type, @intCast(rpc.header_size + body.len), call_id, flags);
+    rpc.createRpcHeader(&header, packet_type, @intCast(frag_len), call_id, flags);
     try writeAll(writer, std.mem.asBytes(&header));
     try writeAll(writer, body);
 }
@@ -156,7 +165,9 @@ fn readSome(idle: ReadOptions, reader: *Io.Reader, buf: []u8) !usize {
     // `net_receive` is message oriented: one call copies at most one message
     // (never more than `buf.len` bytes) straight into `buf`, and reports EOF as
     // a zero-length message rather than as an error.
-    var messages = [1]Io.net.IncomingMessage{.{ .from = undefined, .data = undefined, .control = &.{}, .flags = undefined }};
+    var messages = [1]Io.net.IncomingMessage{
+        .{ .from = undefined, .data = undefined, .control = &.{}, .flags = undefined },
+    };
     const result = try peer.io.operateTimeout(.{ .net_receive = .{
         .socket_handle = peer.handle,
         .message_buffer = &messages,
@@ -198,7 +209,6 @@ pub fn serveRpc(
     reader: *Io.Reader,
     writer: *Io.Writer,
     rng: std.Random,
-    now_unix: i64,
     options: ServeOptions,
 ) !ServeEnd {
     var negotiation = rpc.BindNegotiation{};
@@ -255,7 +265,7 @@ pub fn serveRpc(
 
             if (action == 0) {
                 if (options.on_event) |cb| {
-                    cb(options.event_context, .{ .bind_negotiated = negotiation.ndr64_ctx != rpc.invalid_ctx });
+                    cb(options.event_context, .{ .bind_negotiated = negotiation.hasNdr64() });
                 }
             }
 
@@ -265,6 +275,7 @@ pub fn serveRpc(
             const resp_flags: u8 = if (action == 0) header.packet_flags else rpc.packet_flags.first | rpc.packet_flags.last;
             try writePacket(writer, resp_packet, header.call_id, resp_body, resp_flags);
         } else {
+            const now_unix = options.clock.nowUnix(options.clock.context);
             const dispatch = try rpc.dispatchKmsRequest(allocator, request_body, &negotiation, options.cfg, rng, now_unix);
             switch (dispatch.kind) {
                 .fault => |nca| {
@@ -690,6 +701,17 @@ fn loadTestData(allocator: Allocator) !TestData {
     return .{ .data = data };
 }
 
+/// Request time used by the wire tests: the same instant `makeBase` stamps into
+/// `client_time`, so a clock-dependent check behaves deterministically.
+const test_now_unix: i64 = 1_700_000_000;
+
+fn fixedNowUnix(context: ?*anyopaque) i64 {
+    _ = context;
+    return test_now_unix;
+}
+
+const fixed_clock: Clock = .{ .nowUnix = fixedNowUnix };
+
 fn makeBase(data: *const kmsdata.KmsData) kms.Request {
     var base: kms.Request = std.mem.zeroes(kms.Request);
     base.version = 6 << 16;
@@ -699,7 +721,7 @@ fn makeBase(data: *const kmsdata.KmsData) kms.Request {
     base.act_id = data.kms()[0].guid;
     base.cmid = [16]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
     base.n_policy = 25;
-    base.client_time = kms.u64ToFileTime(kms.unixTimeToFileTime(1_700_000_000));
+    base.client_time = kms.u64ToFileTime(kms.unixTimeToFileTime(test_now_unix));
     for ("test-host", 0..) |c, i| base.workstation_name[i] = c;
     return base;
 }
@@ -872,7 +894,7 @@ test "serveRpc end-to-end (bind + v6 request)" {
     var writer = Io.Writer.fixed(&output_buf);
 
     // The stream ends after the request: `serveRpc` reports the peer close.
-    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, rng, 1_700_000_000, .{ .cfg = &cfg });
+    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, rng, .{ .cfg = &cfg, .clock = fixed_clock });
     try std.testing.expectEqual(ServeEnd.peer_closed, end);
 
     const output = writer.buffered();
@@ -915,8 +937,9 @@ test "ALTER-CONTEXT response carries no secondary address" {
     var output_buf: [4096]u8 align(4) = undefined;
     var writer = Io.Writer.fixed(&output_buf);
 
-    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, prng.random(), 1_700_000_000, .{
+    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, prng.random(), .{
         .cfg = &cfg,
+        .clock = fixed_clock,
         .secondary_address = "1688",
     });
     try std.testing.expectEqual(ServeEnd.peer_closed, end); // the trailing close
@@ -993,8 +1016,9 @@ test "disconnect-per-request ends the loop after the response" {
     var output_buf: [8192]u8 align(4) = undefined;
     var writer = Io.Writer.fixed(&output_buf);
 
-    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, rng, 1_700_000_000, .{
+    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, rng, .{
         .cfg = &cfg,
+        .clock = fixed_clock,
         .disconnect_per_request = true,
     });
     // The loop stops after the RESPONSE instead of waiting for another request,
@@ -1009,6 +1033,85 @@ test "disconnect-per-request ends the loop after the response" {
     try std.testing.expectEqual(rpc.packet_type.response, resp_header.packet_type);
     // Exactly those two packets, and nothing was awaited afterwards.
     try std.testing.expectEqual(output.len, @as(usize, ack_header.frag_length) + @as(usize, resp_header.frag_length));
+}
+
+test "the request clock is sampled per request, not per connection" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    // `--check-client-time` compares each request's timestamp with the clock.
+    var cfg = kms.ServerConfig{ .data = &td.data, .check_client_time = true };
+
+    var prng: std.Random.DefaultPrng = .init(0x7a1d_b00c);
+    const rng = prng.random();
+    const bind_req = try rpc.buildBindRequest(alloc, rpc.packet_type.bind_req, 2, .{ .use_ndr64 = false });
+    defer alloc.free(bind_req);
+
+    // Two requests on one connection, five hours apart — beyond the 4-hour
+    // tolerance, so both can only be accepted if the clock advances with them.
+    const later = test_now_unix + 5 * 60 * 60;
+
+    var base1 = makeBase(&td.data);
+    base1.client_time = kms.u64ToFileTime(kms.unixTimeToFileTime(test_now_unix));
+    var request1: kms.RequestV6 = undefined;
+    kms.createRequestV6(&request1, &base1, rng);
+    const rpc_req1 = try rpc.wrapKmsRequest(alloc, std.mem.asBytes(&request1), false, 3);
+    defer alloc.free(rpc_req1);
+
+    var base2 = makeBase(&td.data);
+    base2.client_time = kms.u64ToFileTime(kms.unixTimeToFileTime(later));
+    var request2: kms.RequestV6 = undefined;
+    kms.createRequestV6(&request2, &base2, rng);
+    const rpc_req2 = try rpc.wrapKmsRequest(alloc, std.mem.asBytes(&request2), false, 4);
+    defer alloc.free(rpc_req2);
+
+    const input = try std.mem.concat(alloc, u8, &.{ bind_req, rpc_req1, rpc_req2 });
+    defer alloc.free(input);
+
+    var reader = Io.Reader.fixed(input);
+    var output_buf: [8192]u8 align(4) = undefined;
+    var writer = Io.Writer.fixed(&output_buf);
+
+    const Sink = struct {
+        samples: u32 = 0,
+        responses: u32 = 0,
+        rejections: u32 = 0,
+
+        /// Advances five hours per sample, so each request is compared against
+        /// its own instant. The first sample is the first request's time.
+        fn now(context: ?*anyopaque) i64 {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            const sample = test_now_unix + @as(i64, self.samples) * 5 * 60 * 60;
+            self.samples += 1;
+            return sample;
+        }
+
+        fn onEvent(context: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            switch (event) {
+                .response => self.responses += 1,
+                .request_rejected => self.rejections += 1,
+                else => {},
+            }
+        }
+    };
+    var sink: Sink = .{};
+
+    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, rng, .{
+        .cfg = &cfg,
+        .clock = .{ .context = &sink, .nowUnix = Sink.now },
+        .on_event = Sink.onEvent,
+        .event_context = &sink,
+    });
+    try std.testing.expectEqual(ServeEnd.peer_closed, end);
+
+    // One sample per REQUEST (BIND is not one), and both accepted: a clock
+    // sampled once per connection would compare request 2 against request 1's
+    // instant and reject it with 0xC004F06C.
+    try std.testing.expectEqual(@as(u32, 2), sink.samples);
+    try std.testing.expectEqual(@as(u32, 2), sink.responses);
+    try std.testing.expectEqual(@as(u32, 0), sink.rejections);
 }
 
 test "ALTER-CONTEXT lets an NDR32 request follow a NDR64-only BIND" {
@@ -1041,8 +1144,9 @@ test "ALTER-CONTEXT lets an NDR32 request follow a NDR64-only BIND" {
     var output_buf: [8192]u8 align(4) = undefined;
     var writer = Io.Writer.fixed(&output_buf);
 
-    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, rng, 1_700_000_000, .{
+    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, rng, .{
         .cfg = &cfg,
+        .clock = fixed_clock,
         .use_ndr64 = true,
         .secondary_address = "1688",
     });
