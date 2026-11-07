@@ -1104,6 +1104,10 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 test "request syntax follows the reference first-packet policy" {
     const both: rpc.BindResult = .{ .has_ndr32 = true, .has_ndr64 = true };
     try std.testing.expect(!requestUseNdr64(both, true, true)); // first: NDR32

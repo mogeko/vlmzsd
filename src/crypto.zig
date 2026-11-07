@@ -398,6 +398,10 @@ pub fn sha256(data: []const u8, out: *[32]u8) void {
     std.crypto.hash.sha2.Sha256.hash(data, out, .{});
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 test "v4 CMAC reference vectors" {
     const alloc = std.testing.allocator;
 

@@ -1273,6 +1273,10 @@ pub fn main(init: std.process.Init) !void {
     try server.run();
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 test "InFlight admits up to the cap, then refuses without leaking slots" {
     const io: Io = std.testing.io;
     var gate: InFlight = .{ .cap = 2 };

@@ -741,6 +741,10 @@ fn loadKmdFrom(io: Io, gpa: Allocator, dir_path: []const u8, name: []const u8) !
     return .{ .path = full_path, .data = data };
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 test "parseDurationSeconds" {
     try std.testing.expectEqual(@as(u64, 30), try parseDurationSeconds("30s"));
     try std.testing.expectEqual(@as(u64, 7200), try parseDurationSeconds("2h"));

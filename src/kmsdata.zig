@@ -359,6 +359,10 @@ pub fn write(allocator: Allocator, data: *const KmsData) ![]u8 {
     return buf;
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 test "kmd write round-trip" {
     const alloc = std.testing.allocator;
     const raw: []const u8 = @embedFile("vlmcsd.kmd");
