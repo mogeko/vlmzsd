@@ -499,14 +499,20 @@ pub const Logger = struct {
             std.debug.assert(line.buffered().len == slot_size - timestamp_len);
             slot.bytes[slot_size - 1] = '\n';
             slot.len = slot_size;
-            _ = self.truncated.fetchAdd(1, .monotonic);
         } else {
             slot.len = @intCast(timestamp_len + line.buffered().len);
         }
 
         // The queue counts refusals itself, as a monotonic total the writer
-        // turns into period deltas.
-        _ = self.queue.tryPush(self.io, slot);
+        // turns into period deltas. Truncation is counted only for a line the
+        // ring accepted: a refused line is already reported as dropped, and
+        // counting it twice would make one long line read as two lost ones.
+        switch (self.queue.tryPush(self.io, slot)) {
+            .accepted => if (full) {
+                _ = self.truncated.fetchAdd(1, .monotonic);
+            },
+            .full, .closed => {},
+        }
     }
 
     pub fn trace(self: *Logger, comptime fmt: []const u8, args: anytype) void {
@@ -1106,6 +1112,34 @@ test "an overlong line becomes one truncated line" {
     try std.testing.expectEqual(@as(usize, 1), log.queue.popBatch(&batch));
     try std.testing.expectEqual(@as(u16, slot_size), batch[0].len);
     try std.testing.expectEqual(@as(u8, '\n'), batch[0].bytes[slot_size - 1]);
+    try std.testing.expectEqual(@as(u64, 1), log.truncated.load(.monotonic));
+}
+
+test "a truncated line is counted as truncated only when the ring takes it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out_buffer: [4096]u8 = undefined;
+    var err_buffer: [4096]u8 = undefined;
+    var log = try Logger.init(gpa, io, &out_buffer, &err_buffer);
+    defer log.deinit(gpa);
+    log.min_level = .debug;
+
+    // Fill the ring, then offer an overlong line: it is refused, so the only
+    // loss the operator should hear about is the drop. Counting it as truncated
+    // too would report two lost lines for one.
+    var i: usize = 0;
+    while (i < capacity) : (i += 1) log.info("line {d}", .{i});
+    try std.testing.expectEqual(@as(u64, 0), log.queue.droppedCount());
+
+    log.info("{d:>300}", .{1});
+    try std.testing.expectEqual(@as(u64, 1), log.queue.droppedCount());
+    try std.testing.expectEqual(@as(u64, 0), log.truncated.load(.monotonic));
+
+    // Once a slot is free the same line is accepted, and then it is truncated.
+    var batch: [Logger.batch_size]Slot = undefined;
+    try std.testing.expect(log.queue.popBatch(&batch) > 0);
+    log.info("{d:>300}", .{2});
+    try std.testing.expectEqual(@as(u64, 1), log.queue.droppedCount());
     try std.testing.expectEqual(@as(u64, 1), log.truncated.load(.monotonic));
 }
 
