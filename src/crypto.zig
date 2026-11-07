@@ -6,6 +6,11 @@
 //!   * v6 XORs 0x73/0x09/0xE4 into the first byte of round keys 4/6/8 after a
 //!     standard 128-bit key expansion.
 //! SHA-256 and HMAC-SHA256 are standard and use `std.crypto`.
+//!
+//! `Key` carries the whole key schedule: its variant fixes both the width
+//! (160-bit v4, 128-bit v5/v6) and the derivation, so a cipher call cannot pair
+//! a key with the wrong parameters. CBC takes its plaintext length from the
+//! slice, so "encrypt past the buffer" cannot be written either.
 
 const std = @import("std");
 const testutil = @import("testutil.zig");
@@ -54,15 +59,27 @@ const sbox_inv = [256]u8{
 
 const rcon = [11]u8{ 0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36 };
 
-const aes_key_v4 = [20]u8{ 0x05, 0x3d, 0x83, 0x07, 0xf9, 0xe5, 0xf0, 0x88, 0xeb, 0x5e, 0xa6, 0x68, 0x6c, 0xf0, 0x37, 0xc7, 0xe4, 0xef, 0xd2, 0xd6 };
-pub const aes_key_v5 = [16]u8{ 0xcd, 0x7e, 0x79, 0x6f, 0x2a, 0xb2, 0x5d, 0xcb, 0x55, 0xff, 0xc8, 0xef, 0x83, 0x64, 0xc4, 0x70 };
-pub const aes_key_v6 = [16]u8{ 0xa9, 0x4a, 0x41, 0x95, 0xe2, 0x01, 0x43, 0x2d, 0x9b, 0xcb, 0x46, 0x04, 0x05, 0xd8, 0x4a, 0x21 };
+/// A KMS AES key: the variant fixes the key width and the key expansion, so
+/// the two cannot be paired wrongly (only `v6` applies the extra round-key
+/// XOR, and only `v4` uses a 160-bit key).
+pub const Key = union(enum) {
+    /// 160-bit Rijndael key (Nk=5, 11 rounds) — the v4 MAC.
+    v4: [20]u8,
+    /// Plain 128-bit schedule — v5 CBC.
+    v5: [16]u8,
+    /// 128-bit schedule with the v6 round-key XOR — v6 CBC.
+    v6: [16]u8,
+};
+
+pub const aes_key_v4: Key = .{ .v4 = .{ 0x05, 0x3d, 0x83, 0x07, 0xf9, 0xe5, 0xf0, 0x88, 0xeb, 0x5e, 0xa6, 0x68, 0x6c, 0xf0, 0x37, 0xc7, 0xe4, 0xef, 0xd2, 0xd6 } };
+pub const aes_key_v5: Key = .{ .v5 = .{ 0xcd, 0x7e, 0x79, 0x6f, 0x2a, 0xb2, 0x5d, 0xcb, 0x55, 0xff, 0xc8, 0xef, 0x83, 0x64, 0xc4, 0x70 } };
+pub const aes_key_v6: Key = .{ .v6 = .{ 0xa9, 0x4a, 0x41, 0x95, 0xe2, 0x01, 0x43, 0x2d, 0x9b, 0xcb, 0x46, 0x04, 0x05, 0xd8, 0x4a, 0x21 } };
 
 comptime {
     // Key bytes pinned to `AesKeyV4`/`AesKeyV5`/`AesKeyV6` — docs/migration.md §3.2.
-    std.debug.assert(std.mem.eql(u8, &aes_key_v4, &[_]u8{ 0x05, 0x3d, 0x83, 0x07, 0xf9, 0xe5, 0xf0, 0x88, 0xeb, 0x5e, 0xa6, 0x68, 0x6c, 0xf0, 0x37, 0xc7, 0xe4, 0xef, 0xd2, 0xd6 }));
-    std.debug.assert(std.mem.eql(u8, &aes_key_v5, &[_]u8{ 0xcd, 0x7e, 0x79, 0x6f, 0x2a, 0xb2, 0x5d, 0xcb, 0x55, 0xff, 0xc8, 0xef, 0x83, 0x64, 0xc4, 0x70 }));
-    std.debug.assert(std.mem.eql(u8, &aes_key_v6, &[_]u8{ 0xa9, 0x4a, 0x41, 0x95, 0xe2, 0x01, 0x43, 0x2d, 0x9b, 0xcb, 0x46, 0x04, 0x05, 0xd8, 0x4a, 0x21 }));
+    std.debug.assert(std.mem.eql(u8, &aes_key_v4.v4, &[_]u8{ 0x05, 0x3d, 0x83, 0x07, 0xf9, 0xe5, 0xf0, 0x88, 0xeb, 0x5e, 0xa6, 0x68, 0x6c, 0xf0, 0x37, 0xc7, 0xe4, 0xef, 0xd2, 0xd6 }));
+    std.debug.assert(std.mem.eql(u8, &aes_key_v5.v5, &[_]u8{ 0xcd, 0x7e, 0x79, 0x6f, 0x2a, 0xb2, 0x5d, 0xcb, 0x55, 0xff, 0xc8, 0xef, 0x83, 0x64, 0xc4, 0x70 }));
+    std.debug.assert(std.mem.eql(u8, &aes_key_v6.v6, &[_]u8{ 0xa9, 0x4a, 0x41, 0x95, 0xe2, 0x01, 0x43, 0x2d, 0x9b, 0xcb, 0x46, 0x04, 0x05, 0xd8, 0x4a, 0x21 }));
 }
 
 fn beWord(b: []const u8) u32 {
@@ -252,7 +269,7 @@ fn aesDecrypt(comptime nk: usize, block: Block, rk: []const u8) Block {
 /// reference (`AesCmacV4` in crypto.c) appends 0x80 followed by zeros up to
 /// the next block boundary (a full padding block when already aligned).
 pub fn aesCmacV4(message: []const u8, out: *Block) void {
-    const rk = expandKey(5, &aes_key_v4, false);
+    const rk = expandKey(5, &aes_key_v4.v4, false);
     var mac: Block = @splat(0);
 
     // Absorb every full 16-byte block.
@@ -275,43 +292,40 @@ pub fn aesCmacV4(message: []const u8, out: *Block) void {
     out.* = mac;
 }
 
-/// AES-encrypt one block. `key` must be 16 or 20 bytes (anything else has no
-/// AES key schedule); `is_v6` selects the non-standard v6 key-schedule
-/// modification (16-byte keys only).
-pub fn aesEncryptBlock(key: []const u8, is_v6: bool, block: Block) Block {
-    return switch (key.len) {
-        16 => blk: {
-            const rk = expandKey(4, key, is_v6);
-            break :blk aesEncrypt(4, block, &rk);
-        },
-        20 => blk: {
-            const rk = expandKey(5, key, false);
-            break :blk aesEncrypt(5, block, &rk);
-        },
-        else => unreachable,
+/// Encrypt one block under `key`'s schedule. `nk` (the key width in 32-bit
+/// words) and `is_v6` (the round-key modification) are supplied by the
+/// `Key` variant, so neither appears in a public signature.
+fn encryptBlock(comptime nk: usize, is_v6: bool, key: *const [nk * 4]u8, block: Block) Block {
+    const rk = expandKey(nk, key, is_v6);
+    return aesEncrypt(nk, block, &rk);
+}
+
+fn decryptBlock(comptime nk: usize, is_v6: bool, key: *const [nk * 4]u8, block: Block) Block {
+    const rk = expandKey(nk, key, is_v6);
+    return aesDecrypt(nk, block, &rk);
+}
+
+/// AES-encrypt one block.
+pub fn aesEncryptBlock(key: *const Key, block: Block) Block {
+    return switch (key.*) {
+        .v4 => |*k| encryptBlock(5, false, k, block),
+        .v5 => |*k| encryptBlock(4, false, k, block),
+        .v6 => |*k| encryptBlock(4, true, k, block),
     };
 }
 
-/// AES-decrypt one block (inverse of `aesEncryptBlock`). `key` must be 16 or
-/// 20 bytes.
-pub fn aesDecryptBlock(key: []const u8, is_v6: bool, block: Block) Block {
-    return switch (key.len) {
-        16 => blk: {
-            const rk = expandKey(4, key, is_v6);
-            break :blk aesDecrypt(4, block, &rk);
-        },
-        20 => blk: {
-            const rk = expandKey(5, key, false);
-            break :blk aesDecrypt(5, block, &rk);
-        },
-        else => unreachable,
+/// AES-decrypt one block (inverse of `aesEncryptBlock`).
+pub fn aesDecryptBlock(key: *const Key, block: Block) Block {
+    return switch (key.*) {
+        .v4 => |*k| decryptBlock(5, false, k, block),
+        .v5 => |*k| decryptBlock(4, false, k, block),
+        .v6 => |*k| decryptBlock(4, true, k, block),
     };
 }
 
-/// v6 AES: encrypt one block under `AesKeyV6` with the non-standard v6 key
-/// schedule modification.
+/// v6 AES: encrypt one block under the v6 key.
 pub fn aesV6EncryptBlock(block: *const Block) Block {
-    return aesEncryptBlock(&aes_key_v6, true, block.*);
+    return aesEncryptBlock(&aes_key_v6, block.*);
 }
 
 fn cbcEncrypt(comptime nk: usize, rk: []const u8, iv: ?*const Block, data: []u8) void {
@@ -354,41 +368,49 @@ fn cbcDecrypt(comptime nk: usize, rk: []const u8, iv: ?*const Block, data: []u8)
     }
 }
 
-/// CBC-encrypt `data[0..len]` in place with PKCS#7 padding (always pads).
-/// `key` must be 16 or 20 bytes; `data` must hold the padded length. Returns the
-/// padded length.
-pub fn aesCbcEncrypt(key: []const u8, is_v6: bool, iv: ?*const Block, data: []u8, len: usize) usize {
-    const pad: usize = if (len % 16 == 0) 16 else 16 - (len % 16);
-    const new_len = len + pad;
-    std.debug.assert(data.len >= new_len);
-    @memset(data[len..new_len], @intCast(pad));
-    switch (key.len) {
-        16 => {
-            const rk = expandKey(4, key, is_v6);
-            cbcEncrypt(4, &rk, iv, data[0..new_len]);
-        },
-        20 => {
-            const rk = expandKey(5, key, false);
-            cbcEncrypt(5, &rk, iv, data[0..new_len]);
-        },
-        else => unreachable,
+fn cbcEncryptWith(comptime nk: usize, is_v6: bool, key: *const [nk * 4]u8, iv: ?*const Block, data: []u8) void {
+    const rk = expandKey(nk, key, is_v6);
+    cbcEncrypt(nk, &rk, iv, data);
+}
+
+fn cbcDecryptWith(comptime nk: usize, is_v6: bool, key: *const [nk * 4]u8, iv: ?*const Block, data: []u8) void {
+    const rk = expandKey(nk, key, is_v6);
+    cbcDecrypt(nk, &rk, iv, data);
+}
+
+/// CBC-encrypt `plaintext` with PKCS#7 padding (always pads) and write the
+/// ciphertext to `out`, which must hold `plaintext.len` plus a whole padding
+/// block. For an in-place encryption `plaintext` is `out[0..plaintext.len]` —
+/// the same buffer and the same start. A `null` `iv` starts from a zero block,
+/// which is the KMS wire convention. Returns the ciphertext length.
+pub fn aesCbcEncrypt(key: *const Key, iv: ?*const Block, plaintext: []const u8, out: []u8) usize {
+    const pad: usize = if (plaintext.len % 16 == 0) 16 else 16 - (plaintext.len % 16);
+    const new_len = plaintext.len + pad;
+    std.debug.assert(out.len >= new_len);
+    const ciphertext = out[0..new_len];
+
+    if (@intFromPtr(plaintext.ptr) != @intFromPtr(ciphertext.ptr)) {
+        // Separate buffers: copy the plaintext in, then pad after it.
+        @memcpy(ciphertext[0..plaintext.len], plaintext);
+    }
+    @memset(ciphertext[plaintext.len..], @intCast(pad));
+
+    switch (key.*) {
+        .v4 => |*k| cbcEncryptWith(5, false, k, iv, ciphertext),
+        .v5 => |*k| cbcEncryptWith(4, false, k, iv, ciphertext),
+        .v6 => |*k| cbcEncryptWith(4, true, k, iv, ciphertext),
     }
     return new_len;
 }
 
-/// CBC-decrypt `data[0..len]` in place. `key` must be 16 or 20 bytes and `len`
-/// a multiple of 16 no longer than `data`.
-pub fn aesCbcDecrypt(key: []const u8, is_v6: bool, iv: ?*const Block, data: []u8, len: usize) void {
-    switch (key.len) {
-        16 => {
-            const rk = expandKey(4, key, is_v6);
-            cbcDecrypt(4, &rk, iv, data[0..len]);
-        },
-        20 => {
-            const rk = expandKey(5, key, false);
-            cbcDecrypt(5, &rk, iv, data[0..len]);
-        },
-        else => unreachable,
+/// CBC-decrypt `data` in place. `data.len` must be a whole number of blocks; a
+/// `null` `iv` is a zero block.
+pub fn aesCbcDecrypt(key: *const Key, iv: ?*const Block, data: []u8) void {
+    std.debug.assert(data.len % 16 == 0);
+    switch (key.*) {
+        .v4 => |*k| cbcDecryptWith(5, false, k, iv, data),
+        .v5 => |*k| cbcDecryptWith(4, false, k, iv, data),
+        .v6 => |*k| cbcDecryptWith(4, true, k, iv, data),
     }
 }
 
@@ -436,8 +458,8 @@ test "v6 AES reference vector" {
 test "v6 key schedule XOR" {
     // After the standard 128-bit expansion, v6 XORs 0x73/0x09/0xE4 into the
     // first byte of round keys 4/6/8 (rk offsets 64/96/128) — docs/migration.md §3.2.
-    const std_rk = expandKey(4, &aes_key_v6, false);
-    const v6_rk = expandKey(4, &aes_key_v6, true);
+    const std_rk = expandKey(4, &aes_key_v6.v6, false);
+    const v6_rk = expandKey(4, &aes_key_v6.v6, true);
 
     for (0..std_rk.len) |i| {
         const expected_diff: u8 = switch (i) {
@@ -462,15 +484,15 @@ test "HMAC-SHA256 reference vector" {
 test "v5 AES reference vector" {
     const alloc = std.testing.allocator;
     const zero: [16]u8 = @splat(0);
-    const enc = aesEncryptBlock(&aes_key_v5, false, zero);
+    const enc = aesEncryptBlock(&aes_key_v5, zero);
     try testutil.expectHex(alloc, &enc, "ec7c7e75b1923978eac4b2d2260235d5"); // from upstream C dump_vectors
 }
 
 test "v6 AES decrypt reference vector" {
     const alloc = std.testing.allocator;
     const zero: [16]u8 = @splat(0);
-    const enc = aesEncryptBlock(&aes_key_v6, true, zero);
-    const dec = aesDecryptBlock(&aes_key_v6, true, enc);
+    const enc = aesEncryptBlock(&aes_key_v6, zero);
+    const dec = aesDecryptBlock(&aes_key_v6, enc);
     try testutil.expectHex(alloc, &dec, "00000000000000000000000000000000"); // round-trip, not a wire vector
 }
 
@@ -480,12 +502,12 @@ test "v6 CBC reference vectors" {
     var data: [64]u8 = @splat(0);
     const iv: [16]u8 = @splat(0);
 
-    const new_len = aesCbcEncrypt(&aes_key_v6, true, &iv, data[0..], 32);
+    const new_len = aesCbcEncrypt(&aes_key_v6, &iv, data[0..32], data[0..]);
     try std.testing.expectEqual(@as(usize, 48), new_len);
 
     try testutil.expectHex(alloc, data[0..48], "8ca59de0c483c04aa7026a22d6dd208e43abf3a9a6b76d992a2c6b1732e80c8ca39d3d0e063cefedecf8cc6e09d14eac"); // from upstream C dump_vectors
 
-    aesCbcDecrypt(&aes_key_v6, true, &iv, data[0..48], 48);
+    aesCbcDecrypt(&aes_key_v6, &iv, data[0..48]);
     try testutil.expectHex(alloc, data[0..48], "000000000000000000000000000000000000000000000000000000000000000010101010101010101010101010101010"); // from upstream C dump_vectors
 }
 
@@ -497,4 +519,54 @@ test "AesCmacV4 leaves input unchanged" {
     var mac: Block = undefined;
     aesCmacV4(&msg, &mac);
     try std.testing.expectEqualSlices(u8, &original, &msg);
+}
+
+test "the key width is part of the type" {
+    // Each `Key` variant holds a fixed-size array, so a key of another width cannot be
+    // passed to the cipher at all — the misuse the C reference turns into a
+    // key-schedule overflow.
+    comptime std.debug.assert(@FieldType(Key, "v4") == [20]u8);
+    comptime std.debug.assert(@FieldType(Key, "v5") == [16]u8);
+    comptime std.debug.assert(@FieldType(Key, "v6") == [16]u8);
+
+    // Every variant round-trips a block, which also exercises each (nk, is_v6)
+    // pair the switch in `aesEncryptBlock` can select.
+    const zero: Block = @splat(0);
+    for ([_]Key{ aes_key_v4, aes_key_v5, aes_key_v6 }) |key| {
+        const enc = aesEncryptBlock(&key, zero);
+        try std.testing.expectEqual(zero, aesDecryptBlock(&key, enc));
+    }
+
+    // The same plaintext under v5 and v6 keys must differ, i.e. the variant is
+    // not being ignored.
+    try std.testing.expect(!std.mem.eql(u8, &aesEncryptBlock(&aes_key_v5, zero), &aesEncryptBlock(&aes_key_v6, zero)));
+}
+
+test "in-place and separate-buffer CBC encryption agree" {
+    const iv: Block = @splat(0x5a);
+    for ([_]usize{ 0, 1, 15, 16, 17, 32 }) |n| {
+        var plain: [64]u8 = undefined;
+        for (&plain, 0..) |*b, i| b.* = @intCast(i);
+        const prefix = plain[0..n];
+
+        var in_place: [64]u8 = @splat(0);
+        @memcpy(in_place[0..n], prefix);
+        const in_place_len = aesCbcEncrypt(&aes_key_v6, &iv, in_place[0..n], &in_place);
+
+        var separate: [64]u8 = @splat(0);
+        const separate_len = aesCbcEncrypt(&aes_key_v6, &iv, prefix, separate[0..]);
+
+        try std.testing.expectEqual(in_place_len, separate_len);
+        try std.testing.expectEqualSlices(u8, in_place[0..in_place_len], separate[0..separate_len]);
+        try std.testing.expectEqual((n / 16 + 1) * 16, in_place_len);
+    }
+}
+
+test "CBC decrypt of an empty slice is a no-op" {
+    // The C reference computes `data + len - 16` here and touches memory before
+    // the buffer; an empty slice must simply do nothing.
+    var data: [16]u8 = @splat(0xAA);
+    const before = data;
+    aesCbcDecrypt(&aes_key_v6, null, data[0..0]);
+    try std.testing.expectEqualSlices(u8, &before, &data);
 }

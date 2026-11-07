@@ -212,7 +212,16 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 
 - AES implemented per FIPS-197 (S-box / inverse S-box / key expansion / MixColumns, etc.), supporting Nk=4 and Nk=5.
 - `expandKey(comptime nk, key, is_v6)`: after standard expansion, v6 applies the `rk[64]/rk[96]/rk[128]` XOR.
-- `aesCmacV4`, `aesCbcEncrypt/Decrypt` (PKCS#7), `hmacSha256`/`sha256` (`std.crypto`).
+- `crypto.Key` is a tagged union that carries the key bytes *and* the schedule they belong to: `v4` is the 160-bit
+  Rijndael key (Nk=5, 11 rounds), `v5` a plain 128-bit key, `v6` the 128-bit key with the extra round-key XOR. The
+  variant's payload type is the key width, so a key of any other length does not type-check, and the C combination
+  "160-bit key + v6 XOR" cannot be written — C instead takes the byte count as a runtime argument and fills
+  `AesCtx.Key[48]` without checking it, which overruns the context for 24-byte and longer keys.
+- `aesCmacV4`, `aesCbcEncrypt/Decrypt` (PKCS#7), `hmacSha256`/`sha256` (`std.crypto`). A `null` CBC IV is a zero
+  block, which is what every KMS message uses; only the client's v6 request chains from a random IV.
+- CBC takes the plaintext length from the slice (`plaintext`, `out`) rather than a separate count, so "encrypt more
+  bytes than the buffer holds" cannot be expressed. C's `AesEncryptCbc` writes the padding past `data + *len` with no
+  bounds check, and `AesDecryptCbc` computes `data + len - 16`, which is a wild pointer for `len < 16`.
 - Golden vectors: hard-coded hex constants in `src/crypto.zig` tests (derived from the upstream C `dump_vectors`).
 
 ### 4.4 `src/kmsdata.zig` (← `helpers.c loadKmsData`)

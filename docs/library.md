@@ -13,7 +13,7 @@ The `network`, `cli_helper` and `mpsc_queue` modules are internal to the
 
 | Module    | Contents                                                                                   |
 | --------- | ------------------------------------------------------------------------------------------ |
-| `crypto`  | From-scratch AES (v4 160-bit key, v6 key-schedule XOR), CMAC, HMAC-SHA256                  |
+| `crypto`  | From-scratch AES (`Key` selects a 160-bit v4 or 128-bit v5/v6 schedule), CMAC, HMAC-SHA256  |
 | `kmsdata` | `.kmd` binary data parsing and serialization ([`docs/kmd-format.md`](./kmd-format.md))     |
 | `kms`     | KMS v4/v5/v6 protocol: request/response structs, ePID generation, response build & decrypt |
 | `rpc`     | Hand-written DCE/RPC: BIND, NDR32/NDR64, FAULT framing                                     |
@@ -66,7 +66,9 @@ signatures and semantics live in the source doc comments — read them with your
 editor's autocomplete rather than expecting this page to enumerate the API.
 
 - `crypto` — the KMS crypto primitives (AES / CMAC / HMAC-SHA256). Start from
-  `aesCmacV4` (v4 CMAC) or `aesCbcEncrypt` (v5/v6 CBC).
+  `aesCmacV4` (v4 CMAC) or `aesCbcEncrypt` (v5/v6 CBC). Every cipher takes a
+  `Key`, a tagged union that pairs the key bytes with the schedule they belong
+  to, so the width and the v6 round-key XOR cannot be passed wrongly.
 - `kmsdata` — parse and serialize `.kmd` binary data. Start from `parse` and
   `write`.
 - `kms` — the KMS v4/v5/v6 protocol itself. Start from `createResponseV6`
@@ -172,7 +174,7 @@ tracked here; the CLI surface is specified in [`docs/cli.md`](./cli.md).
 
 | Version | Change |
 |---|---|
-| `0.6.0` | `kms` makes two ePID helpers nullable/error-returning and adds two, and `kmsdata`/`kms`/`rpc` tighten input validation — details below. |
+| `0.6.0` | `crypto` moves the key width and the v6 round-key XOR into the tagged `Key` type, `kms`'s two ePID helpers become nullable/error-returning and gain two siblings, and `kmsdata`/`kms`/`rpc` reject invalid input with errors instead of traps. |
 | `0.2.4` | `kms` adds the strict-mode limits `max_required_clients`, `client_time_tolerance_seconds`, `whitelist_retail`, `whitelist_app_guid`. |
 | `0.2.3` | `kmsdata` adds `write`, the inverse of `parse`. |
 | `0.1.0` | `rpc.DispatchResult` becomes a struct carrying `major_version` and `response_size` around the `kind` union. |
@@ -182,8 +184,13 @@ tracked here; the CLI surface is specified in [`docs/cli.md`](./cli.md).
 
 | Item | Kind | Change |
 |---|---|---|
+| `crypto.aesEncryptBlock`, `crypto.aesDecryptBlock` | **breaking** | `(key: []const u8, is_v6, block)` → `(key: *const Key, block)`; the key width and the v6 XOR come from the key itself |
+| `crypto.aesCbcEncrypt` | **breaking** | `(key, is_v6, iv, data: []u8, len)` → `(key: *const Key, iv, plaintext: []const u8, out: []u8)`; the length comes from the slice, and `out` may differ from the plaintext (in-place is `plaintext = out[0..plaintext.len]`) |
+| `crypto.aesCbcDecrypt` | **breaking** | `(key, is_v6, iv, data: []u8, len)` → `(key: *const Key, iv, data: []u8)`; the slice is exactly the ciphertext |
+| `crypto.aes_key_v5`, `crypto.aes_key_v6`, and the now-public `crypto.aes_key_v4` | **breaking** | typed `[16]u8`/`[20]u8` → `Key`; the raw bytes are the variant payload (`aes_key_v5.v5`, …) |
 | `kms.randomHostBuild` | **breaking** | `i32` → `?i32`; `null` means no host build advertises the requested NDR64 capability |
 | `kms.generateRandomPid` | **breaking** | `[]u8` → `BuildError![]u8`; `BuildError` gains `NoHostBuild` and `InvalidCsvlk` (empty host-build table, CSVLC index out of range, `MaxKeyId <= MinKeyId`, platform id above `u32`) |
+| `crypto.Key` | added | the tagged key type: `.v4` is `[20]u8` (160-bit), `.v5`/`.v6` are `[16]u8`, and the variant also selects the key schedule |
 | `kms.hasHostBuildForNdr64` | added | whether the data can supply a host build for the negotiated transfer syntax |
 | `kms.randomLcid` | added | one LCID from the internal list; level-1 pre-generation draws it once per run, level 2 still draws per request |
 | `kms.max_lcid`, `kms.max_build` | added | the largest `ServerConfig.lcid` (32767) and `build` (65535) the ePID generator can represent |
@@ -192,10 +199,15 @@ tracked here; the CLI surface is specified in [`docs/cli.md`](./cli.md).
 | `kmsdata.parse`, `kmsdata.write` | behavior | structurally invalid data → `error.InvalidFormat` (offsets not the contiguous layout of [`docs/kmd-format.md`](./kmd-format.md) §2, counts overflowing or past the file, an empty CSVLC/App/KMS/SKU/HostBuild array, an item index outside its array, `MaxKeyId <= MinKeyId`, a negative `BuildNumber`/`PlatformId`) |
 | `kms.createResponseBase` | behavior | `n_policy > 1000`, `KmsData` counts that do not describe `items`, `lcid`/`build` above `kms.max_lcid`/`kms.max_build`, or an unusable CSVLC/ePID → `hresult.invalid_arg` (`0x8007000D`), still as a normal RESPONSE |
 | `kms.decryptResponseV4`, `decryptResponseV6` | behavior | truncated or misaligned payload → `ResponseResult.decrypt_success = false` (`ok()` is false); nothing is read past the buffer |
-| `rpc.dispatchKmsRequest` | behavior | major outside 4..6 (including 0..3) → `0x8007000D`; an unnegotiated context (`invalid_ctx`, `0xFFFF`) → FAULT `nca_unk_if` |
-| `rpc.parseKmsResponse` | behavior | body too short for the field it must read, or `DataLength` past the body → `nca_proto_error` |
-| `rpc.wrapKmsRequest` | behavior | a request too large for the 16-bit `frag_length` → `error.PacketTooLarge` |
 | `kms.unixTimeToFileTime` | behavior | a date before the FILETIME epoch saturates to `0` instead of trapping |
 | `kms.isValidHostBuild` | behavior | a negative `BuildNumber` in a hand-built `KmsData` is "no match", not a trap |
 | `kms.getPlatformId`, `kms.getReleaseDate` | behavior | a `KmsData` with no host builds returns `0` instead of indexing the empty table |
 | `kms.initClientLists` | behavior | a `lists` slice longer than `data.apps()` leaves the extra slots empty instead of indexing past the app table |
+| `rpc.dispatchKmsRequest` | behavior | major outside 4..6 (including 0..3) → `0x8007000D`; an unnegotiated context (`invalid_ctx`, `0xFFFF`) → FAULT `nca_unk_if` |
+| `rpc.parseKmsResponse` | behavior | body too short for the field it must read, or `DataLength` past the body → `nca_proto_error` |
+| `rpc.wrapKmsRequest` | behavior | a request too large for the 16-bit `frag_length` → `error.PacketTooLarge` |
+
+Every wire struct, packed layout, and algorithm constant is unchanged: `0.6.0`
+tightens validation and error reporting, not the bytes. The `crypto` changes are
+API shape only — for a valid key and buffer the ciphertext is byte-identical, so
+the golden vectors are unchanged.

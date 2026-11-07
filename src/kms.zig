@@ -246,6 +246,22 @@ comptime {
     std.debug.assert(response_v5_size == 240);
     std.debug.assert(response_v6_size == 280);
     std.debug.assert(version_size == 4);
+
+    // The ePID is the only variable-length response field, and it is written
+    // into `Response.kms_pid`; `utf8ToUcs2` keeps one unit for the terminator,
+    // so this is its largest possible size.
+    const max_pid_size = (pid_buffer_size - 1) * @sizeOf(u16);
+    std.debug.assert(max_pid_size == 126);
+
+    // Worst case for the ciphertext buffer: the largest ePID plus a whole
+    // PKCS#7 padding block must fit `out[version_size..]`, which is what
+    // `aesCbcEncrypt` asserts before it pads.
+    std.debug.assert(v6_pre_epid_size - version_size + max_pid_size +
+        v6_post_epid_size + @sizeOf([16]u8) <= max_response_size - version_size);
+
+    // v4 has no padding; the CMAC covers the whole response body.
+    std.debug.assert(v4_pre_epid_size + v4_post_epid_size + max_pid_size <=
+        max_response_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -838,10 +854,12 @@ pub fn createResponseV6(
     now_unix: i64,
 ) i32 {
     const is_v6 = majorVersion(request.version) > 5;
-    const key: []const u8 = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
+    // v5 and v6 share the 128-bit key width; the `Key` variant also selects the
+    // v6 round-key modification.
+    const key: *const crypto.Key = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
 
     // 1. Decrypt the request in place (IV + base + pad, zero IV).
-    crypto.aesCbcDecrypt(key, is_v6, null, std.mem.asBytes(request)[4..], v6_decrypt_size);
+    crypto.aesCbcDecrypt(key, null, std.mem.asBytes(request)[4..][0..v6_decrypt_size]);
 
     const response: *ResponseV6 = @ptrCast(out);
     @memset(out[0..@sizeOf(ResponseV6)], 0);
@@ -879,7 +897,7 @@ pub fn createResponseV6(
 
     if (is_v6) createV6Hmac(out[version_size..], encrypt_size, 0);
 
-    encrypt_size = crypto.aesCbcEncrypt(key, is_v6, null, out[version_size..], encrypt_size);
+    encrypt_size = crypto.aesCbcEncrypt(key, null, out[version_size..][0..encrypt_size], out[version_size..]);
 
     return @intCast(encrypt_size + version_size);
 }
@@ -901,8 +919,9 @@ pub fn createRequestV6(out: *RequestV6, base: *const Request, rng: std.Random) v
     out.base = base.*;
 
     const is_v6 = majorVersion(base.version) > 5;
-    const key: []const u8 = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
-    _ = crypto.aesCbcEncrypt(key, is_v6, &out.iv, std.mem.asBytes(out)[20..], @sizeOf(Request));
+    const key: *const crypto.Key = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
+    const region = std.mem.asBytes(out)[20..];
+    _ = crypto.aesCbcEncrypt(key, &out.iv, region[0..@sizeOf(Request)], region);
 }
 
 fn checkPidLength(base: *const Response) bool {
@@ -1054,10 +1073,10 @@ pub fn decryptResponseV6(
     result.effective_response_size = @intCast(response_size);
 
     const is_v6 = majorVersion(readLe(u32, response, 0)) > 5;
-    const key: []const u8 = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
+    const key: *const crypto.Key = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
 
     // Decrypt everything after the unencrypted Version field.
-    crypto.aesCbcDecrypt(key, is_v6, null, response[version_size..], response_size - version_size);
+    crypto.aesCbcDecrypt(key, null, response[version_size..response_size]);
 
     // PKCS#7 padding must be 1..16 and uniform.
     const last_pad = response[response_size - 1];
@@ -1098,7 +1117,7 @@ pub fn decryptResponseV6(
     );
 
     // Decrypt the request in place so its base fields are readable.
-    crypto.aesCbcDecrypt(key, is_v6, null, std.mem.asBytes(raw_request)[4..], v6_decrypt_size);
+    crypto.aesCbcDecrypt(key, null, std.mem.asBytes(raw_request)[4..][0..v6_decrypt_size]);
 
     result.version_ok =
         raw_request.version == out.base.version and
@@ -1627,7 +1646,7 @@ test "a truncated v5/v6 response is rejected, never read past" {
         writeLe(u32, block[0..4], 0, 6 << 16);
         // `len = 0` pads a whole block of 0x10, so the plaintext is exactly the
         // padding a 16-byte body would need.
-        const written = crypto.aesCbcEncrypt(&crypto.aes_key_v6, true, null, block[4..20], 0);
+        const written = crypto.aesCbcEncrypt(&crypto.aes_key_v6, null, block[4..4], block[4..20]);
         try std.testing.expectEqual(@as(usize, 16), written);
         const result = decryptResponseV6(&resp, block.len, &block, &request, null);
         try std.testing.expect(!result.decrypt_success);
