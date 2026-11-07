@@ -446,3 +446,151 @@ fn getStr(obj: Json.ObjectMap, key: []const u8) ![]const u8 {
         else => error.TypeMismatch,
     };
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+test "JSON round-trip reproduces the embedded .kmd byte for byte" {
+    // The converter's contract: `.kmd` → JSON → `.kmd` reproduces the input.
+    // The string pool is rebuilt without deduplication, so this also pins that
+    // the embedded data needs none for a byte-identical result.
+    const gpa = std.testing.allocator;
+    const raw: []const u8 = @embedFile("vlmcsd.kmd");
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+
+    const data = try kmsdata.parse(arena.allocator(), raw);
+    const json = try kmsDataToJson(&data, gpa);
+    defer gpa.free(json);
+
+    const converted = try jsonToKmsData(arena.allocator(), json);
+    const bytes = try kmsdata.write(gpa, &converted);
+    defer gpa.free(bytes);
+
+    try std.testing.expectEqualSlices(u8, raw, bytes);
+}
+
+test "the JSON document names every field the writer needs" {
+    const gpa = std.testing.allocator;
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+
+    const data = try kmsdata.parse(arena.allocator(), @embedFile("vlmcsd.kmd"));
+    const json = try kmsDataToJson(&data, gpa);
+    defer gpa.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{ .parse_numbers = true });
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try std.testing.expectEqual(@as(i64, data.major_ver), obj.get("major_ver").?.integer);
+    try std.testing.expectEqual(@as(i64, data.minor_ver), obj.get("minor_ver").?.integer);
+    try std.testing.expectEqual(@as(i64, data.flags), obj.get("flags").?.integer);
+
+    try std.testing.expectEqual(data.csvlk.len, obj.get("csvlk").?.array.items.len);
+    try std.testing.expectEqual(data.app_count, obj.get("apps").?.array.items.len);
+    try std.testing.expectEqual(data.kms_count, obj.get("kms").?.array.items.len);
+    try std.testing.expectEqual(data.sku_count, obj.get("skus").?.array.items.len);
+    try std.testing.expectEqual(data.host_builds.len, obj.get("hostbuilds").?.array.items.len);
+
+    // Every per-record key the reverse direction reads back.
+    const csvlk = obj.get("csvlk").?.array.items[0].object;
+    try std.testing.expectEqualStrings(data.csvlk[0].epid, csvlk.get("epid").?.string);
+    try std.testing.expectEqualStrings(data.csvlk[0].name, csvlk.get("name").?.string);
+    try std.testing.expectEqual(@as(i64, data.csvlk[0].group_id), csvlk.get("group_id").?.integer);
+    try std.testing.expectEqual(@as(i64, data.csvlk[0].max_key_id), csvlk.get("max_key_id").?.integer);
+
+    const item = obj.get("apps").?.array.items[0].object;
+    try std.testing.expectEqualStrings(data.apps()[0].name, item.get("name").?.string);
+    try std.testing.expectEqual(@as(usize, 32), item.get("guid").?.string.len);
+
+    const host_build = obj.get("hostbuilds").?.array.items[0].object;
+    try std.testing.expectEqualStrings(data.host_builds[0].display_name, host_build.get("display_name").?.string);
+    try std.testing.expectEqual(@as(i64, data.host_builds[0].build_number), host_build.get("build_number").?.integer);
+}
+
+test "jsonToKmsData rejects malformed input" {
+    const gpa = std.testing.allocator;
+    // Every case is a self-contained document: the first field that fails is
+    // the one named in the expectation.
+    const Case = struct { json: []const u8, expected: anyerror };
+    const cases = [_]Case{
+        .{
+            .json = "[]",
+            .expected = error.InvalidJson,
+        },
+        .{
+            // `apps`/`kms`/`skus` are required.
+            .json = "{\"minor_ver\":0,\"major_ver\":2,\"flags\":1}",
+            .expected = error.MissingField,
+        },
+        .{
+            .json = "{\"apps\":[],\"kms\":[],\"skus\":[],\"csvlk\":[],\"hostbuilds\":[],\"minor_ver\":0,\"major_ver\":2,\"flags\":\"x\"}",
+            .expected = error.TypeMismatch,
+        },
+        .{
+            .json = "{\"apps\":[],\"kms\":[],\"skus\":[],\"csvlk\":[],\"hostbuilds\":[],\"minor_ver\":70000,\"major_ver\":2,\"flags\":1}",
+            .expected = error.Overflow,
+        },
+        .{
+            // A GUID is exactly 32 hex digits.
+            .json = "{\"apps\":[{\"guid\":\"00112233445566778899aabbccddee\",\"name\":\"X\",\"app_index\":0,\"kms_index\":0}],\"kms\":[],\"skus\":[],\"csvlk\":[],\"hostbuilds\":[],\"minor_ver\":0,\"major_ver\":2,\"flags\":1}",
+            .expected = error.InvalidGuid,
+        },
+        .{
+            .json = "{\"apps\":[],\"kms\":[],\"skus\":[],\"csvlk\":[],\"hostbuilds\":[],\"minor_ver\":0,\"major_ver\":2,\"flags\":1,\"extra\":0,,}",
+            .expected = error.SyntaxError,
+        },
+    };
+
+    for (cases) |case| {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        try std.testing.expectError(case.expected, jsonToKmsData(arena.allocator(), case.json));
+    }
+}
+
+test "empty record arrays convert but are rejected by the writer" {
+    // docs/kmdconv.md: every array must be non-empty. The JSON parser accepts
+    // the document; `kmsdata.write` is where the format rule is enforced.
+    const gpa = std.testing.allocator;
+    const json = "{\"apps\":[],\"kms\":[],\"skus\":[],\"csvlk\":[],\"hostbuilds\":[],\"minor_ver\":0,\"major_ver\":2,\"flags\":1}";
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const data = try jsonToKmsData(arena.allocator(), json);
+    try std.testing.expectError(error.InvalidFormat, kmsdata.write(gpa, &data));
+}
+
+test "parseGuid accepts 32 hex digits and nothing else" {
+    const lower = try parseGuid("00112233445566778899aabbccddeeff");
+    try std.testing.expectEqualSlices(u8, &.{
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    }, &lower);
+    const upper = try parseGuid("00112233445566778899AABBCCDDEEFF");
+    try std.testing.expectEqualSlices(u8, &lower, &upper);
+
+    try std.testing.expectError(error.InvalidGuid, parseGuid("00112233445566778899aabbccddee"));
+    try std.testing.expectError(error.InvalidGuid, parseGuid("00112233445566778899aabbccddeeff00"));
+    try std.testing.expectError(error.InvalidGuid, parseGuid("00112233445566778899aabbccddeeg"));
+}
+
+test "the default output path keeps the stem and swaps the suffix" {
+    const gpa = std.testing.allocator;
+
+    const cases = [_]struct { input: []const u8, reverse: bool, want: []const u8 }{
+        .{ .input = "data.json", .reverse = false, .want = "data.kmd" },
+        .{ .input = "dir/sub/data.json", .reverse = false, .want = "data.kmd" },
+        .{ .input = "data.kmd", .reverse = true, .want = "data.json" },
+        .{ .input = "src/vlmcsd.kmd", .reverse = true, .want = "vlmcsd.json" },
+    };
+    for (cases) |case| {
+        const got = try deriveOutputPath(gpa, case.input, case.reverse);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(case.want, got);
+    }
+}
