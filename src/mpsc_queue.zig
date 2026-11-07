@@ -105,8 +105,7 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
         wake: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
         /// Set while the consumer is parked or about to be. `signal` clears it to
         /// claim the wake, so a burst of pushes behind one park wakes once, and
-        /// the common push only *loads* it. An optimization, not a correctness
-        /// requirement: `wake` alone ends the park.
+        /// the common push only *loads* it.
         waiting: std.atomic.Value(bool) = .init(false),
         /// Set by `close`; producers then refuse instead of pushing.
         closed: std.atomic.Value(bool) = .init(false),
@@ -561,6 +560,94 @@ test "a parked consumer is woken by a push and by close" {
     // refuses values that it then re-pushes, and the queue counts a refusal
     // when it happens because it cannot know the caller will retry.
     try testing.expect(!queue.hasWork());
+}
+
+test "every park is ended by the push that arrives during it" {
+    // The `waiting` fast path in isolation: one value per cycle, each pushed
+    // only after the consumer has armed its park, so every cycle is one park and
+    // one wake. A skipped kernel wakeup is the one failure mode the flag could
+    // introduce, and it leaves the consumer asleep with the value still in the
+    // ring: the watchdog notices and `cons_group.cancel` releases it, so the
+    // case fails an assertion instead of hanging the suite.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var queue = try TestQueue.init(alloc);
+    defer queue.deinit(alloc);
+
+    const cycles: u32 = 100;
+    // Spin budget for one handshake step. Only a lost wakeup can exhaust it.
+    const watchdog_spins: usize = 200_000_000;
+
+    const Consumer = struct {
+        queue: *TestQueue,
+        io: Io,
+        /// Incremented after each pop; the producer waits for it, which is what
+        /// sends the consumer back to a park.
+        seen: std.atomic.Value(u32) = .init(0),
+
+        fn run(self: *@This()) void {
+            var out: u32 = undefined;
+            while (true) {
+                const wake = self.queue.awaitWork(self.io) catch return;
+                if (wake == .closed) return;
+                while (self.queue.popCopy(&out)) _ = self.seen.fetchAdd(1, .release);
+            }
+        }
+    };
+
+    var cons_group: Io.Group = .init;
+    var consumer: Consumer = .{ .queue = &queue, .io = io };
+    try cons_group.concurrent(io, Consumer.run, .{&consumer});
+
+    var lost_wakeup = false;
+    var i: u32 = 0;
+    while (i < cycles) : (i += 1) {
+        // Parked: only then does the push need a kernel wakeup. Waiting for the
+        // flag is not enough — it is set one instruction *before* the wait — so
+        // give the consumer time to reach the futex. The delay only makes the
+        // parked case likely; it can never fail the test on its own, because a
+        // push that lands earlier is covered by the wake counter.
+        var spins: usize = 0;
+        while (!queue.waiting.load(.acquire)) {
+            std.atomic.spinLoopHint();
+            spins += 1;
+            if (spins > watchdog_spins) break;
+        }
+        if (spins > watchdog_spins) {
+            lost_wakeup = true;
+            break;
+        }
+        io.sleep(.{ .nanoseconds = 5 * 1_000_000 }, .awake) catch {};
+        _ = queue.tryPush(io, i);
+        // Consumed before the next cycle, so the consumer has to park again.
+        spins = 0;
+        while (consumer.seen.load(.acquire) <= i) {
+            std.atomic.spinLoopHint();
+            spins += 1;
+            if (spins > watchdog_spins) {
+                lost_wakeup = true;
+                break;
+            }
+        }
+        if (lost_wakeup) break;
+    }
+
+    if (lost_wakeup) {
+        // Release the consumer through cancelation: the failure being tested is
+        // a missing wakeup, so `close` cannot be relied on to reach it.
+        cons_group.cancel(io);
+    } else {
+        queue.close(io);
+    }
+    try cons_group.await(io);
+
+    try testing.expect(!lost_wakeup);
+    try testing.expectEqual(cycles, consumer.seen.load(.acquire));
 }
 
 test "concurrent producers keep per-producer order and account for every push" {
