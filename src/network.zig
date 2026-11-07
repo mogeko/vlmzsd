@@ -111,15 +111,13 @@ pub const ServeOptions = struct {
 };
 
 /// Write one RPC packet (header + body).
-fn writePacket(
-    writer: *Io.Writer,
-    packet_type: u8,
-    call_id: u32,
-    body: []const u8,
-    flags: u8,
-) !void {
+fn writePacket(writer: *Io.Writer, packet_type: u8, call_id: u32, body: []const u8, flags: u8) !void {
+    // Every body this server sends is bounded by a request or a response struct,
+    // so the fragment length always fits its 16-bit field.
+    const frag_len = rpc.header_size + body.len;
+    std.debug.assert(frag_len <= std.math.maxInt(u16));
     var header: rpc.RpcHeader = undefined;
-    rpc.createRpcHeader(&header, packet_type, @intCast(rpc.header_size + body.len), call_id, flags);
+    rpc.createRpcHeader(&header, packet_type, @intCast(frag_len), call_id, flags);
     try writeAll(writer, std.mem.asBytes(&header));
     try writeAll(writer, body);
 }

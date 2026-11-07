@@ -545,6 +545,9 @@ pub fn wrapKmsRequest(
     const ndr_size: usize = if (use_ndr64) request64_fixed_size else request32_fixed_size;
     const ndr_tail: usize = if (use_ndr64) 16 else 8; // DataLength + DataSizeIs
     const total = header_size + ndr_size + kms_request.len;
+    // `frag_length` is 16-bit, and the NDR header carries the payload length as
+    // u32: a request that fits neither cannot be framed.
+    if (total > std.math.maxInt(u16)) return error.PacketTooLarge;
 
     const buf = try allocator.alloc(u8, total);
     @memset(buf, 0);
@@ -588,12 +591,18 @@ pub fn parseKmsResponse(response_body: []const u8, use_ndr64: bool) KmsResponseP
         if (response_body.len < 24) return .{ .data = "", .status = nca_proto_error };
         const data_length = readLe(u64, response_body, 8);
         const data_size_max = readLe(u64, response_body, 16);
-        const response_size: usize = @intCast(data_length);
+        // A length that does not fit the address space cannot describe this
+        // body; treat it like the overrun it is instead of narrowing blindly.
+        const response_size = std.math.cast(usize, data_length) orelse
+            return .{ .data = "", .status = nca_proto_error };
         if (data_size_max == 0) {
             if (response_body.len < 28) return .{ .data = "", .status = nca_proto_error };
             return .{ .data = "", .status = readLe(i32, response_body, 24) };
         }
-        if (response_body.len < data_offset + response_size + 4) return .{ .data = "", .status = nca_proto_error };
+        // Compare against the room that is actually left: adding the length to
+        // the offset first would overflow for an adversarial DataLength.
+        if (response_body.len < data_offset + 4) return .{ .data = "", .status = nca_proto_error };
+        if (response_size > response_body.len - data_offset - 4) return .{ .data = "", .status = nca_proto_error };
         return .{
             .data = response_body[data_offset..][0..response_size],
             .status = readLe(i32, response_body, data_offset + response_size),
@@ -610,7 +619,8 @@ pub fn parseKmsResponse(response_body: []const u8, use_ndr64: bool) KmsResponseP
         if (response_body.len < 20) return .{ .data = "", .status = nca_proto_error };
         return .{ .data = "", .status = readLe(i32, response_body, 16) };
     }
-    if (response_body.len < data_offset + response_size + 4) return .{ .data = "", .status = nca_proto_error };
+    if (response_body.len < data_offset + 4) return .{ .data = "", .status = nca_proto_error };
+    if (response_size > response_body.len - data_offset - 4) return .{ .data = "", .status = nca_proto_error };
     return .{
         .data = response_body[data_offset..][0..response_size],
         .status = readLe(i32, response_body, data_offset + response_size),
@@ -1103,4 +1113,34 @@ test "parseKmsResponse treats a short body as a protocol error" {
     const oversize = parseKmsResponse(buf[0..32], false);
     try std.testing.expectEqual(@as(usize, 0), oversize.data.len);
     try std.testing.expectEqual(@as(i32, @bitCast(nca_proto_error)), oversize.status);
+
+    // NDR64: a DataLength above the address space must be reported, not
+    // narrowed into `usize`.
+    @memset(buf[0..32], 0);
+    std.mem.writeInt(u64, buf[8..16], 0xFFFF_FFFF_FFFF_FFFF, .little);
+    std.mem.writeInt(u64, buf[16..24], 0x0002_0000, .little);
+    const wide = parseKmsResponse(buf[0..32], true);
+    try std.testing.expectEqual(@as(usize, 0), wide.data.len);
+    try std.testing.expectEqual(@as(i32, @bitCast(nca_proto_error)), wide.status);
+}
+
+test "wrapKmsRequest rejects a request that does not fit the 16-bit fragment length" {
+    const alloc = std.testing.allocator;
+
+    // The largest payload that still frames: header + NDR header + payload must
+    // stay within `frag_length`.
+    const max_payload = std.math.maxInt(u16) - header_size - request32_fixed_size;
+    const fit = try alloc.alloc(u8, max_payload);
+    defer alloc.free(fit);
+    @memset(fit, 0);
+    const packet = try wrapKmsRequest(alloc, fit, false, 2);
+    defer alloc.free(packet);
+    try std.testing.expectEqual(@as(u16, std.math.maxInt(u16)), std.mem.readInt(u16, packet[8..10], .little));
+
+    // One byte more cannot be framed at all; it must be an error, not a trap.
+    const too_big = try alloc.alloc(u8, max_payload + 1);
+    defer alloc.free(too_big);
+    @memset(too_big, 0);
+    try std.testing.expectError(error.PacketTooLarge, wrapKmsRequest(alloc, too_big, false, 2));
+    try std.testing.expectError(error.PacketTooLarge, wrapKmsRequest(alloc, too_big, true, 2));
 }

@@ -222,7 +222,9 @@ fn rejectionReason(status: u32) ?[]const u8 {
 
 /// Format a Unix timestamp as `YYYY-MM-DD HH:MM:SS` in UTC.
 fn formatUtc(unix: i64, buf: []u8) []const u8 {
-    const secs: u64 = @intCast(unix);
+    // A FILETIME before 1970 yields a negative second count; print the epoch
+    // instead of trapping.
+    const secs: u64 = std.math.cast(u64, unix) orelse 0;
     const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
     const yad = epoch.getEpochDay().calculateYearDay();
     const mad = yad.calculateMonthDay();
@@ -1618,4 +1620,12 @@ test "an invalid UTF-8 workstation name is a configuration error" {
     var res = try cli_helper.parse(gpa, &vlmzs_opts, &.{ "--workstation", "\xff\xfe" });
     defer res.deinit();
     try std.testing.expectError(error.InvalidWorkstation, resolveOptions(&res));
+}
+
+test "a timestamp before the Unix epoch prints as the epoch" {
+    // `formatUtc` takes a FILETIME-derived second count, which a response can
+    // put before 1970; the narrowing cast must not trap.
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("1970-01-01 00:00:00", formatUtc(-1, &buf));
+    try std.testing.expectEqualStrings("1970-01-01 00:00:00", formatUtc(-11_644_473_600, &buf));
 }

@@ -36,12 +36,6 @@ const pid_str_buffer_size = 16;
 /// "unlimited" (docs/cli.md §5).
 const default_client_cap: u32 = 1024;
 
-/// `--lcid` and `--build` bounds for randomized ePIDs (docs/cli.md §5). The
-/// generator takes the LCID as a non-negative `i16`, and Windows build numbers
-/// fit in 16 bits; `0` means "pick one at random".
-const max_lcid: u32 = 32767;
-const max_build: u32 = 65535;
-
 /// Embedded default `.kmd` data, unless built with `-Dno-embedded-data`
 /// (then `--data <file>` is required at runtime).
 const embedded_kmd: []const u8 = if (build_options.embedded_data) @embedFile("vlmcsd.kmd") else &.{};
@@ -264,9 +258,9 @@ fn resolveOptions(gpa: Allocator, env: *const EnvironMap, res: *const cli_helper
 
     opts.randomize = try resolveInt(u8, res.get("randomize"), env, "VLMZSD_RANDOMIZE", 1);
     opts.lcid = try resolveInt(u32, res.get("lcid"), env, "VLMZSD_LCID", 0);
-    if (opts.lcid > max_lcid) return error.LcidOutOfRange;
+    if (opts.lcid > kms.max_lcid) return error.LcidOutOfRange;
     opts.build = try resolveInt(u32, res.get("build"), env, "VLMZSD_BUILD", 0);
-    if (opts.build > max_build) return error.BuildOutOfRange;
+    if (opts.build > kms.max_build) return error.BuildOutOfRange;
 
     opts.activation_interval_minutes = try resolveDurationMinutes(res.get("activation-interval"), env, "VLMZSD_ACTIVATION_INTERVAL", "2h");
     opts.renewal_interval_minutes = try resolveDurationMinutes(res.get("renewal-interval"), env, "VLMZSD_RENEWAL_INTERVAL", "7d");
@@ -1085,8 +1079,8 @@ pub fn main(init: std.process.Init) !void {
 
     var opts = resolveOptions(init.gpa, init.environ_map, &res) catch |e| switch (e) {
         error.UnexpectedPositional => fatal(&log, init.io, "vlmzsd takes no positional arguments", .{}),
-        error.LcidOutOfRange => fatal(&log, init.io, "--lcid must be 0..{d} (0 = random)", .{max_lcid}),
-        error.BuildOutOfRange => fatal(&log, init.io, "--build must be 0..{d} (0 = random)", .{max_build}),
+        error.LcidOutOfRange => fatal(&log, init.io, "--lcid must be 0..{d} (0 = random)", .{kms.max_lcid}),
+        error.BuildOutOfRange => fatal(&log, init.io, "--build must be 0..{d} (0 = random)", .{kms.max_build}),
         error.TimeoutOutOfRange => fatal(&log, init.io, "--timeout must be at most {d} seconds", .{std.math.maxInt(u32)}),
         error.IntervalOutOfRange => fatal(&log, init.io, "policy interval must be at most {d} minutes", .{std.math.maxInt(u32)}),
         else => fatal(&log, init.io, "invalid configuration: {s}", .{@errorName(e)}),
@@ -1504,8 +1498,8 @@ test "resolveOptions: env lists, numeric limits, and positional arguments" {
     {
         var opts = try resolveOptions(gpa, &env, &limits);
         defer opts.deinit(gpa);
-        try std.testing.expectEqual(max_lcid, opts.lcid);
-        try std.testing.expectEqual(max_build, opts.build);
+        try std.testing.expectEqual(kms.max_lcid, opts.lcid);
+        try std.testing.expectEqual(kms.max_build, opts.build);
         try std.testing.expectEqual(std.math.maxInt(u32), opts.timeout_seconds);
         try std.testing.expectEqual(std.math.maxInt(u32), opts.activation_interval_minutes);
     }

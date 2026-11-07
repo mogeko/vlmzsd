@@ -118,6 +118,12 @@ pub const max_clients = 671;
 pub const max_required_clients = 2000;
 /// Reject requests whose client time is off by more than 4 hours — §5.
 pub const client_time_tolerance_seconds = 4 * 60 * 60;
+/// Largest `ServerConfig.lcid` the ePID generator accepts: it takes the LCID as
+/// a non-negative `i16`.
+pub const max_lcid: u16 = 32767;
+/// Largest `ServerConfig.build` the ePID generator accepts: Windows build
+/// numbers fit in 16 bits.
+pub const max_build: u32 = 65535;
 
 /// Fixed (max-ePID) sizes of the response structs.
 pub const request_size: usize = @sizeOf(Request);
@@ -278,8 +284,12 @@ pub fn u64ToFileTime(v: u64) FileTime {
 }
 
 /// Seconds since 1970-01-01 → FILETIME ticks (100 ns since 1601-01-01).
+/// A date outside the FILETIME range (before 1601) saturates to 0 rather than
+/// trapping on the narrowed arithmetic.
 pub fn unixTimeToFileTime(unix: i64) u64 {
-    return @intCast((unix + filetime_epoch_offset) * ticks_per_second);
+    const shifted = std.math.add(i64, unix, filetime_epoch_offset) catch return 0;
+    const ticks = std.math.mul(i64, shifted, ticks_per_second) catch return 0;
+    return std.math.cast(u64, ticks) orelse 0;
 }
 
 /// FILETIME ticks → seconds since 1970-01-01.
@@ -366,7 +376,8 @@ pub fn isValidLcid(lcid: u16) u16 {
 /// Return `build` when it matches a known host build, else 0.
 pub fn isValidHostBuild(data: *const kmsdata.KmsData, build: u32) u32 {
     for (data.host_builds) |hb| {
-        if (build == @as(u32, @intCast(hb.build_number))) return build;
+        const number = std.math.cast(u32, hb.build_number) orelse continue;
+        if (build == number) return build;
     }
     return 0;
 }
@@ -610,6 +621,10 @@ pub fn createResponseBase(
     const items_after_app = cfg.data.items.len - cfg.data.app_count;
     if (cfg.data.kms_count > items_after_app) return hresult.invalid_arg;
     if (cfg.data.sku_count != items_after_app - cfg.data.kms_count) return hresult.invalid_arg;
+
+    // The generator takes these as `i16`/`i32`; a wider setting has no ePID
+    // representation, so reject it instead of narrowing here.
+    if (cfg.lcid > max_lcid or cfg.build > max_build) return hresult.invalid_arg;
 
     // Reject N_Policy values that would exceed the protocol limit before
     // multiplying: a u32 wrap would turn 0x80000000 into 0 and 0x80000002
@@ -930,14 +945,18 @@ pub fn decryptResponseV4(
     raw_request: *const RequestV4,
 ) ResponseResult {
     var result = ResponseResult{};
-    result.effective_response_size = @intCast(response_size);
 
     // The peer chooses the size: refuse anything shorter than the fixed fields
-    // plus a one-unit ePID rather than reading past the payload.
-    if (response_size < v4_pre_epid_size + v4_post_epid_size or response_size > response.len) {
+    // plus a one-unit ePID, or longer than the reported-size field, rather than
+    // reading past the payload or narrowing the count.
+    if (response_size < v4_pre_epid_size + v4_post_epid_size or
+        response_size > response.len or
+        response_size > std.math.maxInt(u16))
+    {
         result.decrypt_success = false;
         return result;
     }
+    result.effective_response_size = @intCast(response_size);
 
     const pid_size_raw = readLe(u32, response, 4);
     const pid_size: usize = @min(pid_size_raw, pid_buffer_size * 2);
@@ -1015,17 +1034,19 @@ pub fn decryptResponseV6(
     hwid: ?*[8]u8,
 ) ResponseResult {
     var result = ResponseResult{};
-    result.effective_response_size = @intCast(response_size);
 
     // The peer chooses the size: the payload must hold the unencrypted Version
-    // field and a whole number of AES blocks after it (CBC with PKCS#7).
+    // field, a whole number of AES blocks after it (CBC with PKCS#7), and fit
+    // the field the result reports it in.
     if (response_size < version_size + 16 or
         response_size > response.len or
+        response_size > std.math.maxInt(u16) or
         (response_size - version_size) % 16 != 0)
     {
         result.decrypt_success = false;
         return result;
     }
+    result.effective_response_size = @intCast(response_size);
 
     const is_v6 = majorVersion(readLe(u32, response, 0)) > 5;
     const key: []const u8 = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
@@ -1626,4 +1647,84 @@ test "a truncated v4 response is rejected, never read past" {
     writeLe(u32, buf[4..8], 0, 0xFFFF_FFFF);
     const result = decryptResponseV4(&resp, 64, buf[0..64], &request);
     try std.testing.expect(!result.ok());
+}
+
+test "a pinned LCID or build the generator cannot represent is rejected, not narrowed" {
+    // `ServerConfig.lcid` is u16 and `build` is u32, but the generator takes an
+    // i16/i32: a wider setting must answer with an HRESULT instead of trapping
+    // in `@intCast`. The CLI enforces the same bounds, so this is the library
+    // caller's path.
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var prng: std.Random.DefaultPrng = .init(0x1c1d);
+    const rng = prng.random();
+    const base = makeBase(&td.data, 6 << 16);
+    var resp: Response = undefined;
+
+    // A representative request that would otherwise be served.
+    {
+        var cfg = ServerConfig{ .data = &td.data };
+        cfg.randomization_level = 2;
+        try std.testing.expectEqual(hresult.ok, createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
+    }
+    {
+        var cfg = ServerConfig{ .data = &td.data };
+        cfg.randomization_level = 2;
+        cfg.lcid = max_lcid + 1;
+        try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
+    }
+    {
+        var cfg = ServerConfig{ .data = &td.data };
+        cfg.randomization_level = 2;
+        cfg.build = max_build + 1;
+        try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
+    }
+    // The documented maxima are still accepted.
+    {
+        var cfg = ServerConfig{ .data = &td.data };
+        cfg.randomization_level = 2;
+        cfg.lcid = max_lcid;
+        cfg.build = max_build;
+        try std.testing.expectEqual(hresult.ok, createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
+    }
+}
+
+test "isValidHostBuild treats a negative build number as no match" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 17763), isValidHostBuild(&td.data, 17763));
+    try std.testing.expectEqual(@as(u32, 0), isValidHostBuild(&td.data, 0));
+
+    // `parse` rejects negative numbers, but a hand-built `KmsData` can hold one.
+    td.data.host_builds[0].build_number = -1;
+    try std.testing.expectEqual(@as(u32, 0), isValidHostBuild(&td.data, 0xFFFF_FFFF));
+}
+
+test "unixTimeToFileTime saturates instead of trapping" {
+    try std.testing.expectEqual(@as(u64, 0), unixTimeToFileTime(-filetime_epoch_offset - 1));
+    try std.testing.expectEqual(@as(u64, 0), unixTimeToFileTime(std.math.minInt(i64)));
+    // The epoch itself is the FILETIME offset, unchanged by the guard.
+    try std.testing.expectEqual(@as(u64, filetime_epoch_offset * ticks_per_second), unixTimeToFileTime(0));
+}
+
+test "a response larger than the reported size field is rejected" {
+    // `ResponseResult` reports the size as u16, so a longer payload must fail
+    // verification instead of trapping in the narrowing cast.
+    var resp: ResponseV6 = undefined;
+    var request: RequestV6 = std.mem.zeroes(RequestV6);
+    var buf: [70_000]u8 = undefined;
+    @memset(buf[0..], 0);
+    writeLe(u32, buf[0..], 0, 6 << 16);
+
+    const v6 = decryptResponseV6(&resp, buf.len, &buf, &request, null);
+    try std.testing.expect(!v6.decrypt_success);
+
+    var resp4: ResponseV4 = undefined;
+    var request4: RequestV4 = std.mem.zeroes(RequestV4);
+    const v4 = decryptResponseV4(&resp4, buf.len, &buf, &request4);
+    try std.testing.expect(!v4.ok());
 }

@@ -630,7 +630,10 @@ fn writeCounterLine(w: *std.Io.Writer, io: Io, loss: Loss, scope: []const u8) vo
 /// Write a UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp followed by a space. Its length
 /// is fixed, so it can be formatted straight into the line it belongs to.
 fn writeTimestampPrefix(buf: *[timestamp_len]u8, io: Io) void {
-    const secs: u64 = @intCast(@divTrunc(Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_s));
+    // A clock set before 1970 makes the seconds negative; format 0 (the epoch)
+    // instead of trapping on the narrowing cast.
+    const now_ns = Io.Clock.now(.real, io).nanoseconds;
+    const secs: u64 = std.math.cast(u64, @divTrunc(now_ns, std.time.ns_per_s)) orelse 0;
     const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
     const yad = epoch.getEpochDay().calculateYearDay();
     const mad = yad.calculateMonthDay();
