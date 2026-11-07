@@ -27,8 +27,10 @@ comptime {
 // Types
 // ---------------------------------------------------------------------------
 
-/// A 16-byte GUID. Treated as opaque bytes (never parsed into scalar fields
-/// here); the C reference only ever compares or copies GUIDs wholesale.
+/// A 16-byte GUID in serialized order: Data1/Data2/Data3 little-endian, then
+/// the 8-byte tail in canonical string order (docs/migration.md §3.3). `.kmd`
+/// GUIDs use the same layout, so request fields can be filled straight from
+/// `KmsData`; only canonical GUID text needs converting.
 pub const Guid = [16]u8;
 
 /// Windows FILETIME: 100-ns ticks since 1601-01-01, little-endian u64.

@@ -395,7 +395,9 @@ fn validateKmsData(data: *const kmsdata.KmsData) error{IncompleteKmsData}!void {
 fn randomCmid(rng: std.Random) [16]u8 {
     var g: [16]u8 = undefined;
     rng.bytes(&g);
-    g[6] = (g[6] & 0x0F) | 0x40; // UUID version 4
+    // Serialized order: Data3 is bytes 6..8 little-endian, so its high byte —
+    // where the version nibble lives — is byte 7 (docs/migration.md §3.3).
+    g[7] = (g[7] & 0x0F) | 0x40; // UUID version 4
     g[8] = (g[8] & 0x3F) | 0x80; // RFC 4122 variant
     return g;
 }
@@ -485,7 +487,7 @@ fn printRejection(status: i32, out: *Report) void {
 }
 
 /// Print the activation answer to stdout (C `displayResponse`, non-verbose).
-/// `hwid` is only present for v5+ responses.
+/// `hwid` is only present for v6 responses.
 fn printResultSummary(base: *const kms.Response, hwid: ?*const [8]u8, out: *Report) void {
     var epid_buf: [64]u8 = undefined;
     const epid = ucs2ToAscii(&base.kms_pid, &epid_buf);
@@ -693,12 +695,17 @@ fn sendRequestOn(
             return;
         }
         var resp: kms.ResponseV6 = undefined;
-        const result = kms.decryptResponseV6(&resp, sent.data.len, sent.data, &req, null);
+        // Only a v6 response carries a HwId, and only then does the decrypt
+        // copy one out; a v5 response has no field to print.
+        const is_v6 = proto > 5;
+        var hwid: [8]u8 = @splat(0);
+        const result = kms.decryptResponseV6(&resp, sent.data.len, sent.data, &req, if (is_v6) &hwid else null);
         if (!result.ok()) {
             reportVerificationErrors(result, &report);
             return;
         }
-        if (verbose) printResponseVerbose(&resp.base, &resp.hwid, result, &report) else printResultSummary(&resp.base, &resp.hwid, &report);
+        const hwid_or_null: ?*const [8]u8 = if (is_v6) &hwid else null;
+        if (verbose) printResponseVerbose(&resp.base, hwid_or_null, result, &report) else printResultSummary(&resp.base, hwid_or_null, &report);
     }
 }
 
@@ -1219,4 +1226,62 @@ test "resolveOptions accepts the documented selection limits" {
     const opts = try resolveOptions(&res);
     try std.testing.expectEqual(@as(u32, 6), opts.license_status);
     try std.testing.expectEqual(@as(u16, 1689), opts.port);
+}
+
+test "GUID text parses to the serialized order and formats back" {
+    // `--app-id`/`--kms-id`/`--cmid` are compared against `.kmd` GUIDs, which
+    // are stored in serialized order (docs/migration.md §3.3). Parsing must
+    // therefore reverse Data1..Data3, and `formatGuid` (what the request dump
+    // prints) must undo it.
+    const text = "51C82175-844E-4750-B0D8-EC255555BC06";
+    const wire = try cli_helper.parseGuid(text);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x75, 0x21, 0xc8, 0x51, 0x4e, 0x84, 0x50, 0x47,
+        0xb0, 0xd8, 0xec, 0x25, 0x55, 0x55, 0xbc, 0x06,
+    }, &wire);
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(text, formatGuid(&wire, &buf));
+}
+
+test "the random CMID carries the version and variant bits" {
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    const rng = prng.random();
+    for (0..32) |_| {
+        const cmid = randomCmid(rng);
+        // Serialized order: the Data3 high byte is byte 7 and the variant bits
+        // start the 8-byte tail at byte 8 (docs/migration.md §3.3).
+        try std.testing.expectEqual(@as(u8, 0x4), cmid[7] >> 4);
+        try std.testing.expectEqual(@as(u8, 0b10), cmid[8] >> 6);
+    }
+}
+
+test "the answer line carries the HwId only for v6" {
+    const io = std.testing.io;
+
+    const printOne = struct {
+        fn call(io_: Io, hwid: ?*const [8]u8, sink_buffer: []u8) []const u8 {
+            var unused_out: [64]u8 = undefined;
+            var unused_err: [64]u8 = undefined;
+            var output = Output.init(io_, &unused_out, &unused_err);
+            var sink: std.Io.Writer = .fixed(sink_buffer);
+            output.test_out = &sink;
+
+            var report_out_buffer: [report_buffer_size]u8 = undefined;
+            var report_err_buffer: [report_buffer_size]u8 = undefined;
+            var report = Report.init(&output, &report_out_buffer, &report_err_buffer);
+            var base: kms.Response = std.mem.zeroes(kms.Response);
+            printResultSummary(&base, hwid, &report);
+            output.writeBlock(report.out.buffered(), report.err.buffered());
+            return sink.buffered();
+        }
+    }.call;
+
+    var v6_buffer: [128]u8 = undefined;
+    const v6_line = printOne(io, &kms.default_hwid, &v6_buffer);
+    try std.testing.expect(std.mem.indexOf(u8, v6_line, "(3A1C049600B60076)") != null);
+
+    var v5_buffer: [128]u8 = undefined;
+    const v5_line = printOne(io, null, &v5_buffer);
+    try std.testing.expect(std.mem.indexOf(u8, v5_line, "(") == null);
 }

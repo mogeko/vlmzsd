@@ -72,7 +72,10 @@ policy intervals) is a configuration error, not a truncated value.
 ### GUID
 
 Standard hyphenated hex: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
-(case-insensitive).
+(case-insensitive). The text is converted to the serialized order the protocol
+uses (Data1/Data2/Data3 little-endian, then the 8-byte tail in string order), so
+`--cmid` echoes back exactly what you typed and `--app-id`/`--kms-id` compare
+equal to the GUIDs stored in the `.kmd` data.
 
 ### ePID override
 

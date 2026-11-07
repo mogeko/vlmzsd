@@ -126,7 +126,7 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 
 | Name | Canonical form | Bytes |
 |---|---|---|
-| interface | `51C82175-4E84-4750-B0D8-EC255555BC06` | `75 21 c8 51 4e 84 50 47 b0 d8 ec 25 55 55 bc 06` |
+| interface | `51C82175-844E-4750-B0D8-EC255555BC06` | `75 21 c8 51 4e 84 50 47 b0 d8 ec 25 55 55 bc 06` |
 | ndr32 | `8A885D04-1CEB-11C9-9FE8-08002B104860` | `04 5d 88 8a eb 1c c9 11 9f e8 08 00 2b 10 48 60` |
 | ndr64 | `71710533-BEBA-4937-8319-B5DBEF9CCC36` | `33 05 71 71 ba be 37 49 83 19 b5 db ef 9c cc 36` |
 | btfn | `6CB71C2C-9812-4540-0300-000000000000` | `2c 1c b7 6c 12 98 40 45 03 00 00 00 00 00 00 00` |
