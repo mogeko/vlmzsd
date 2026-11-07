@@ -121,10 +121,13 @@ Stored consecutively starting at `HostBuildOffset`.
 
 All `*Offset` fields point into the string pool, which follows the HostBuild
 array and runs to the end of the file. Strings are NUL-terminated C strings
-(ASCII). The **last byte of the file must be `0`** — this is checked by the
-parser unless unsafe data loading is enabled.
+(ASCII). The **last byte of the file must be `0`**, which the parser checks.
 
 ## 8. Legality constraints
+
+Strings are NUL-terminated, so a name or ePID must not contain a NUL of its own:
+the reader stops at the first one, and a writer that is handed such a string
+round-trips it truncated.
 
 The parser (`kmsdata.parse`) rejects a file with `error.InvalidFormat` when any
 of these hold:
@@ -133,9 +136,20 @@ of these hold:
 - `Magic[0..4] != "KMD\0"`.
 - `MajorVer != 2`.
 - The last byte is not `0`.
-- A record array extends past the end of the file.
+- `AppItemOffset != 72 + CsvlkCount * 32`, or
+  `HostBuildOffset != AppItemOffset + (AppItemCount + KmsItemCount +
+  SkuItemCount) * 32` — the records must be contiguous.
+- `CsvlkCount`, `AppItemCount`, `KmsItemCount`, `SkuItemCount`, or
+  `HostBuildCount` is zero.
+- A record array extends past the end of the file, or offset arithmetic
+  overflows.
 - Any string offset points outside the file or to a region with no NUL
   terminator.
+- An item's `EPidIndex` is not a valid CSVLC index.
+- A KMS item's `AppIndex` is not a valid App index, or a SKU item's
+  `AppIndex` / `KmsIndex` is not a valid index.
+- A CSVLC record has `MaxKeyId <= MinKeyId`.
+- A HostBuild record has a negative `BuildNumber` or `PlatformId`.
 
 Use `zig build test` as the authoritative check — the `parse embedded .kmd data`
 and `kmd header fields` tests pin the current data exactly. When upgrading the

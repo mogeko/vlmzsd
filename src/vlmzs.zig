@@ -18,6 +18,8 @@ const build_options = @import("build_options");
 const version_display = build_options.version_display;
 const default_port: u16 = 1688;
 const default_grace_minutes: u32 = 43200;
+/// Largest `--license-status` value (docs/cli.md §6).
+const max_license_status: u32 = 6;
 /// Idle timeout for the BIND reply and every RESPONSE read, mirroring the
 /// server's `--timeout` default.
 const default_timeout_seconds: u32 = 30;
@@ -102,6 +104,12 @@ const Output = struct {
         }
     }
 };
+
+/// Report a configuration error and exit. The client has no log queue to drain.
+fn fatal(out: *Output, comptime fmt: []const u8, args: anytype) noreturn {
+    out.eprint(fmt, args);
+    std.process.exit(1);
+}
 
 /// One request's staged output. A request emits many fragments — a `--verbose`
 /// request+response dump is ~25 lines — and they are *mid-line* fragments: the
@@ -212,17 +220,18 @@ fn rejectionReason(status: u32) ?[]const u8 {
     };
 }
 
-/// Format a Unix timestamp as UTC `YYYY-MM-DD HH:MM:SS` (C verbose dumps use
-/// `strftime("%Y-%m-%d %X", gmtime(...))`).
+/// Format a Unix timestamp as `YYYY-MM-DD HH:MM:SS` in UTC.
 fn formatUtc(unix: i64, buf: []u8) []const u8 {
-    const secs: u64 = @intCast(unix);
+    // A FILETIME before 1970 yields a negative second count; print the epoch
+    // instead of trapping.
+    const secs: u64 = std.math.cast(u64, unix) orelse 0;
     const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
     const yad = epoch.getEpochDay().calculateYearDay();
     const mad = yad.calculateMonthDay();
     const day_secs: u64 = secs % 86400;
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
         @as(u32, yad.year),
-        @as(u32, @backingInt(mad.month)) + 1,
+        @as(u32, mad.month.numeric()),
         @as(u32, mad.day_index) + 1,
         @as(u32, @intCast(day_secs / 3600)),
         @as(u32, @intCast((day_secs % 3600) / 60)),
@@ -244,7 +253,7 @@ const vlmzs_opts = [_]cli_helper.Opt{
     .{ .name = "kms-id", .kind = .guid, .group = "Request", .desc = "Override KMSID (GUID)" },
     .{ .name = "cmid", .short = 'c', .kind = .guid, .group = "Request", .desc = "Client machine ID (GUID, default random)" },
     .{ .name = "prev-cmid", .short = 'o', .kind = .guid, .group = "Request", .desc = "Previous client machine ID (GUID)" },
-    .{ .name = "workstation", .short = 'w', .kind = .str, .hint = "name", .group = "Request", .desc = "Workstation name" },
+    .{ .name = "workstation", .short = 'w', .kind = .str, .hint = "name", .group = "Request", .desc = "Workstation name (UTF-8, sent as UTF-16)" },
     .{ .name = "vm", .short = 'm', .group = "Request", .desc = "Present as a virtual machine" },
     .{ .name = "count", .short = 'n', .kind = .int, .hint = "u32", .group = "Request", .desc = "Number of requests (default 1)" },
     .{ .name = "virtual-clients", .short = 'r', .kind = .int, .hint = "u32", .group = "Request", .desc = "NCountPolicy override" },
@@ -313,7 +322,8 @@ fn parseHostPort(host_arg: []const u8) !struct { host: []const u8, port: u16 } {
 fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
     var opts = ClientOptions{};
 
-    // Positional HOST[:PORT].
+    // Positional HOST[:PORT]; a second word is a mistyped flag value.
+    if (res.positionals.items.len > 1) return error.UnexpectedPositional;
     if (res.positionals.items.len > 0) {
         const hp = try parseHostPort(res.positionals.items[0]);
         opts.host = hp.host;
@@ -322,13 +332,22 @@ fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
 
     opts.product = res.get("product");
     opts.data_file = res.get("data");
-    opts.protocol = if (res.get("protocol")) |s| try std.fmt.parseInt(u16, s, 10) else 0;
+    opts.protocol = if (res.get("protocol")) |s| blk: {
+        const version = try std.fmt.parseInt(u16, s, 10);
+        if (version != 4 and version != 5 and version != 6) return error.InvalidProtocol;
+        break :blk version;
+    } else 0;
     if (res.get("app-id")) |s| opts.app_id = try cli_helper.parseGuid(s);
     if (res.get("sku-id")) |s| opts.sku_id = try cli_helper.parseGuid(s);
     if (res.get("kms-id")) |s| opts.kms_id = try cli_helper.parseGuid(s);
     if (res.get("cmid")) |s| opts.cmid = try cli_helper.parseGuid(s);
     if (res.get("prev-cmid")) |s| opts.prev_cmid = try cli_helper.parseGuid(s);
     opts.workstation = res.get("workstation");
+    if (opts.workstation) |name| {
+        // The request field is UTF-16; the option is UTF-8. Reject a name that
+        // cannot be decoded instead of sending replacement bytes.
+        if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidWorkstation;
+    }
     opts.vm = res.hasFlag("vm");
     opts.count = if (res.get("count")) |s| try std.fmt.parseInt(u32, s, 10) else 1;
     opts.virtual_clients = if (res.get("virtual-clients")) |s| try std.fmt.parseInt(u32, s, 10) else 0;
@@ -339,6 +358,7 @@ fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
     }
     opts.list_products = res.hasFlag("list-products");
     opts.license_status = if (res.get("license-status")) |s| try std.fmt.parseInt(u32, s, 10) else 1;
+    if (opts.license_status > max_license_status) return error.InvalidLicenseStatus;
     opts.reconnect_per_request = res.hasFlag("reconnect-per-request");
     opts.timeout_seconds = if (res.get("timeout")) |s|
         std.math.cast(u32, try cli_helper.parseDurationSeconds(s)) orelse return error.InvalidTimeout
@@ -369,22 +389,56 @@ fn findSku(data: *const kmsdata.KmsData, product: ?[]const u8) !usize {
     }
 }
 
+/// The client needs an App/KMS/SKU entry for every activation request.
+/// `kmsdata.parse` already rejects empty arrays; this keeps the client's
+/// contract explicit.
+fn validateKmsData(data: *const kmsdata.KmsData) error{IncompleteKmsData}!void {
+    if (data.app_count == 0 or data.kms_count == 0 or data.sku_count == 0) {
+        return error.IncompleteKmsData;
+    }
+}
+
 fn randomCmid(rng: std.Random) [16]u8 {
     var g: [16]u8 = undefined;
     rng.bytes(&g);
-    g[6] = (g[6] & 0x0F) | 0x40; // UUID version 4
+    // Serialized order: Data3 is bytes 6..8 little-endian, so its high byte —
+    // where the version nibble lives — is byte 7 (docs/migration.md §3.3).
+    g[7] = (g[7] & 0x0F) | 0x40; // UUID version 4
     g[8] = (g[8] & 0x3F) | 0x80; // RFC 4122 variant
     return g;
 }
 
+/// Fill the request's workstation name, a 64-code-unit UTF-16 field that must
+/// end with a NUL when it fits (C `utf8_to_ucs2`).
+///
+/// The option value is UTF-8, so it is decoded rather than copied byte by byte:
+/// a non-ASCII name would otherwise be sent as mojibake. Names longer than 63
+/// code units are truncated, never splitting a surrogate pair.
 fn setWorkstationName(base: *kms.Request, name: ?[]const u8, rng: std.Random) void {
+    const dst = base.workstation_name[0 .. kms.workstation_name_buffer - 1];
     if (name) |n| {
-        var i: usize = 0;
-        while (i < n.len and i < 63) : (i += 1) base.workstation_name[i] = n[i];
-        base.workstation_name[i] = 0;
+        // `resolveOptions` rejected invalid UTF-8, so the view cannot fail here.
+        var view = std.unicode.Utf8View.initUnchecked(n);
+        var it = view.iterator();
+        var len: usize = 0;
+        while (it.nextCodepoint()) |codepoint| {
+            if (codepoint < 0x10000) {
+                if (len == dst.len) break;
+                dst[len] = @intCast(codepoint);
+                len += 1;
+            } else {
+                // Surrogate pairs take two code units, or none.
+                if (dst.len - len < 2) break;
+                const offset = codepoint - 0x10000;
+                dst[len] = 0xD800 + @as(u16, @intCast(offset >> 10));
+                dst[len + 1] = 0xDC00 + @as(u16, @intCast(offset & 0x3FF));
+                len += 2;
+            }
+        }
+        base.workstation_name[len] = 0;
     } else {
         const len: usize = 1 + rng.uintLessThan(u8, 14);
-        for (0..len) |i| base.workstation_name[i] = 'A' + rng.uintLessThan(u8, 26);
+        for (0..len) |i| dst[i] = 'A' + rng.uintLessThan(u8, 26);
         base.workstation_name[len] = 0;
     }
 }
@@ -420,12 +474,24 @@ fn buildRequestBase(
     return base;
 }
 
+/// Narrow a NUL-terminated UTF-16 field to ASCII bytes. Valid for the ePID,
+/// whose characters are ASCII by construction.
 fn ucs2ToAscii(pid: *const [64]u16, out: []u8) []const u8 {
     var i: usize = 0;
     while (i < pid.len and pid[i] != 0 and i < out.len) : (i += 1) {
         out[i] = @truncate(pid[i]);
     }
     return out[0..i];
+}
+
+/// Decode a NUL-terminated UTF-16 field (`workstation_name`) as UTF-8. `out`
+/// must hold three bytes per code unit. An unpaired surrogate has no UTF-8
+/// form, so such a field prints as empty rather than as mojibake.
+fn utf16FieldToUtf8(field: *const [64]u16, out: []u8) []const u8 {
+    var len: usize = 0;
+    while (len < field.len and field[len] != 0) len += 1;
+    const written = std.unicode.utf16LeToUtf8(out, field[0..len]) catch return out[0..0];
+    return out[0..written];
 }
 
 /// Report each failed response-verification check to stderr (C `displayResponse`).
@@ -462,7 +528,7 @@ fn printRejection(status: i32, out: *Report) void {
 }
 
 /// Print the activation answer to stdout (C `displayResponse`, non-verbose).
-/// `hwid` is only present for v5+ responses.
+/// `hwid` is only present for v6 responses.
 fn printResultSummary(base: *const kms.Response, hwid: ?*const [8]u8, out: *Report) void {
     var epid_buf: [64]u8 = undefined;
     const epid = ucs2ToAscii(&base.kms_pid, &epid_buf);
@@ -486,7 +552,8 @@ fn printRequestVerbose(req: *const kms.Request, data: *const kmsdata.KmsData, ou
     const minor: u16 = @truncate(req.version);
     var guid_buf: [64]u8 = undefined;
     var time_buf: [64]u8 = undefined;
-    var ws_buf: [64]u8 = undefined;
+    // Three UTF-8 bytes per UTF-16 code unit (63 units at most).
+    var ws_buf: [3 * kms.workstation_name_buffer]u8 = undefined;
 
     out.print("\nRequest Parameters\n==================\n\n", .{});
     out.print("Protocol version                : {d}.{d}\n", .{ major, minor });
@@ -499,7 +566,7 @@ fn printRequestVerbose(req: *const kms.Request, data: *const kmsdata.KmsData, ou
     out.print("Client machine ID               : {s}\n", .{formatGuid(&req.cmid, &guid_buf)});
     out.print("Previous client machine ID      : {s}\n", .{formatGuid(&req.cmid_prev, &guid_buf)});
     out.print("Client request timestamp (UTC)  : {s}\n", .{formatUtc(kms.fileTimeToUnixTime(kms.fileTimeToU64(req.client_time)), &time_buf)});
-    out.print("Workstation name                : {s}\n", .{ucs2ToAscii(&req.workstation_name, &ws_buf)});
+    out.print("Workstation name                : {s}\n", .{utf16FieldToUtf8(&req.workstation_name, &ws_buf)});
     out.print("N count policy (minimum clients): {d}\n", .{req.n_policy});
     out.print("\n", .{});
 }
@@ -539,6 +606,10 @@ const Conn = struct {
     call_id: u32 = 2,
     /// Applied to the BIND reply and to every RESPONSE read.
     idle: network.ReadOptions,
+    /// The owner reconnects and resends when the peer closed the connection, so
+    /// this attempt's report is dropped instead of printing a header the retry
+    /// would print again.
+    retry_on_close: bool = false,
 };
 
 /// Transfer syntax for a request: the reference client sends the first request
@@ -583,6 +654,60 @@ fn bindContexts(
     return bind;
 }
 
+/// One client connection that outlives a single request: the socket, its
+/// buffers, and the negotiated transfer syntax.
+///
+/// `Io.Reader`/`Io.Writer` find their owning struct with `@fieldParentPtr`, so a
+/// session must never be copied after `open` — it stays in the caller's frame as
+/// a single `var`, which is also what lets `reopen` re-address `conn` after a
+/// reconnection.
+const Session = struct {
+    io: Io,
+    stream: Io.net.Stream,
+    reader: Io.net.Stream.Reader,
+    writer: Io.net.Stream.Writer,
+    conn: Conn,
+    /// BIND/ALTER-CONTEXT outcome, kept so later requests can widen to NDR64.
+    bind: rpc.BindResult,
+    rbuf: [4096]u8,
+    wbuf: [4096]u8,
+
+    /// Connect and BIND, leaving `conn` ready to carry one REQUEST.
+    fn open(self: *Session, gpa: Allocator, opts: *const ClientOptions) !void {
+        const io = self.io;
+        self.stream = try network.connect(io, opts.host.?, opts.port, opts.address_family);
+        self.reader = self.stream.reader(io, &self.rbuf);
+        self.writer = self.stream.writer(io, &self.wbuf);
+        self.conn = .{
+            .reader = &self.reader.interface,
+            .writer = &self.writer.interface,
+            .use_ndr64 = false,
+            .call_id = 2,
+            .idle = .{ .peer = .{
+                .io = io,
+                .handle = self.stream.socket.handle,
+                .timeout = network.timeoutSeconds(opts.timeout_seconds),
+            } },
+            // A reused session reconnects when the peer closed; a one-shot
+            // connection (`--reconnect-per-request`) has nothing to retry.
+            .retry_on_close = true,
+        };
+        self.bind = try bindContexts(gpa, &self.reader.interface, &self.writer.interface, &self.conn.call_id, opts, self.conn.idle);
+        self.conn.use_ndr64 = requestUseNdr64(self.bind, true, opts.ndr64);
+    }
+
+    fn close(self: *Session) void {
+        self.stream.close(self.io);
+    }
+
+    /// Replace a connection the peer closed (`--disconnect-per-request` on the
+    /// server, or any keep-alive timeout) with a fresh one.
+    fn reopen(self: *Session, gpa: Allocator, opts: *const ClientOptions) !void {
+        self.close();
+        try self.open(gpa, opts);
+    }
+};
+
 fn sendRequest(
     gpa: Allocator,
     io: Io,
@@ -591,32 +716,40 @@ fn sendRequest(
     rng: std.Random,
     out: *Output,
     data: *const kmsdata.KmsData,
-) !void {
-    var stream = try network.connect(io, opts.host.?, opts.port, opts.address_family);
-    defer stream.close(io);
-
-    var rbuf: [4096]u8 = undefined;
-    var wbuf: [4096]u8 = undefined;
-    var reader = stream.reader(io, &rbuf);
-    var writer = stream.writer(io, &wbuf);
-
-    const idle: network.ReadOptions = .{ .peer = .{
+) !Outcome {
+    var session: Session = .{
         .io = io,
-        .handle = stream.socket.handle,
-        .timeout = network.timeoutSeconds(opts.timeout_seconds),
-    } };
-    var call_id: u32 = 2;
-    const bind = try bindContexts(gpa, &reader.interface, &writer.interface, &call_id, opts, idle);
-
-    var conn = Conn{
-        .reader = &reader.interface,
-        .writer = &writer.interface,
-        .use_ndr64 = requestUseNdr64(bind, true, opts.ndr64),
-        .call_id = call_id,
-        .idle = idle,
+        .stream = undefined,
+        .reader = undefined,
+        .writer = undefined,
+        .conn = undefined,
+        .bind = undefined,
+        .rbuf = undefined,
+        .wbuf = undefined,
     };
+    try session.open(gpa, opts);
+    defer session.close();
 
-    try sendRequestOn(gpa, &conn, base, rng, out, data, opts.verbose);
+    return sendRequestOn(gpa, &session.conn, base, rng, out, data, opts.verbose);
+}
+
+/// What one activation attempt produced. A server rejection and a failed
+/// response verification are both `failed`: the client did reach the server, but
+/// the activation did not succeed, which is what the exit status reports.
+/// Transport failures stay Zig errors and propagate to the caller.
+const Outcome = enum { activated, failed };
+
+/// Flag a send failure the caller will retry on a fresh connection, so the
+/// attempt's staged report is dropped instead of printing a request header the
+/// retry would print again. Returns the error unchanged.
+fn markRetryableSend(conn: *const Conn, discard_report: *bool, err: anyerror) anyerror {
+    switch (err) {
+        error.EndOfStream, error.ConnectionResetByPeer, error.SocketUnconnected => {
+            if (conn.retry_on_close) discard_report.* = true;
+        },
+        else => {},
+    }
+    return err;
 }
 
 /// Send one KMS request over an already-established connection (BIND done).
@@ -628,17 +761,20 @@ fn sendRequestOn(
     out: *Output,
     data: *const kmsdata.KmsData,
     verbose: bool,
-) !void {
+) !Outcome {
     // One request = one lock acquisition: stage the report here and flush it on
     // every exit path, including the early rejection/verification returns.
     var report_out_buffer: [report_buffer_size]u8 = undefined;
     var report_err_buffer: [report_buffer_size]u8 = undefined;
     var report = Report.init(out, &report_out_buffer, &report_err_buffer);
-    defer out.writeBlock(report.out.buffered(), report.err.buffered());
+    // Set when the connection turns out to be closed and the caller will resend
+    // on a fresh one: the nothing-happened attempt leaves no output behind.
+    var discard_report = false;
+    defer if (!discard_report) out.writeBlock(report.out.buffered(), report.err.buffered());
     // A network failure below returns with the request prefix still unline-
     // terminated; close the line before the flush above, so the caller's
     // stderr diagnostic does not continue it.
-    errdefer report.endLine();
+    errdefer if (!discard_report) report.endLine();
 
     const proto: u16 = @intCast(base.version >> 16);
     if (verbose) printRequestVerbose(&base, data, &report);
@@ -647,36 +783,74 @@ fn sendRequestOn(
     if (proto == 4) {
         var req: kms.RequestV4 = undefined;
         kms.createRequestV4(&req, &base);
-        const sent = try network.clientSendRequest(gpa, conn.reader, conn.writer, &conn.call_id, std.mem.asBytes(&req), conn.use_ndr64, conn.idle);
+        const sent = network.clientSendRequest(
+            gpa,
+            conn.reader,
+            conn.writer,
+            &conn.call_id,
+            std.mem.asBytes(&req),
+            conn.use_ndr64,
+            conn.idle,
+        ) catch |err| return markRetryableSend(conn, &discard_report, err);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
             printRejection(sent.status, &report);
-            return;
+            return .failed;
         }
         var resp: kms.ResponseV4 = undefined;
         const result = kms.decryptResponseV4(&resp, sent.data.len, sent.data, &req);
         if (!result.ok()) {
             reportVerificationErrors(result, &report);
-            return;
+            return .failed;
         }
-        if (verbose) printResponseVerbose(&resp.base, null, result, &report) else printResultSummary(&resp.base, null, &report);
+        if (verbose) {
+            printResponseVerbose(&resp.base, null, result, &report);
+        } else {
+            printResultSummary(&resp.base, null, &report);
+        }
     } else {
         var req: kms.RequestV6 = undefined;
         kms.createRequestV6(&req, &base, rng);
-        const sent = try network.clientSendRequest(gpa, conn.reader, conn.writer, &conn.call_id, std.mem.asBytes(&req), conn.use_ndr64, conn.idle);
+        const sent = network.clientSendRequest(
+            gpa,
+            conn.reader,
+            conn.writer,
+            &conn.call_id,
+            std.mem.asBytes(&req),
+            conn.use_ndr64,
+            conn.idle,
+        ) catch |err| return markRetryableSend(conn, &discard_report, err);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
             printRejection(sent.status, &report);
-            return;
+            return .failed;
         }
         var resp: kms.ResponseV6 = undefined;
-        const result = kms.decryptResponseV6(&resp, sent.data.len, sent.data, &req, null);
+        // Only a v6 response carries a HwId, and only then does the decrypt
+        // copy one out; a v5 response has no field to print.
+        const is_v6 = proto > 5;
+        var hwid: [8]u8 = @splat(0);
+        const result = kms.decryptResponseV6(&resp, sent.data.len, sent.data, &req, if (is_v6) &hwid else null);
         if (!result.ok()) {
             reportVerificationErrors(result, &report);
-            return;
+            return .failed;
         }
-        if (verbose) printResponseVerbose(&resp.base, &resp.hwid, result, &report) else printResultSummary(&resp.base, &resp.hwid, &report);
+        const hwid_or_null: ?*const [8]u8 = if (is_v6) &hwid else null;
+        if (verbose) {
+            printResponseVerbose(&resp.base, hwid_or_null, result, &report);
+        } else {
+            printResultSummary(&resp.base, hwid_or_null, &report);
+        }
     }
+    return .activated;
+}
+
+/// Exit non-zero when any request did not activate. The per-request diagnostics
+/// are already on stderr; this is the summary the exit status refers to.
+fn exitOnFailures(out: *Output, failures: u32, total: u32) void {
+    if (failures == 0) return;
+    out.eprint("{d} of {d} request(s) failed\n", .{ failures, total });
+    std.process.exit(1);
 }
 
 /// A dispatch failure is fatal for a one-shot client, but the requests already
@@ -704,15 +878,21 @@ fn sendRequestTask(
     out: *Output,
     data: *const kmsdata.KmsData,
     permits: *Io.Semaphore,
+    failures: *std.atomic.Value(u32),
 ) void {
     defer permits.post(io);
     var prng: std.Random.DefaultPrng = .init(seed);
-    sendRequest(gpa, io, opts, base, prng.random(), out, data) catch |e| switch (e) {
+    const outcome = sendRequest(gpa, io, opts, base, prng.random(), out, data) catch |e| switch (e) {
         // Aborted, not failed: this is `dispatchFailed`'s cancel, and the
         // dispatch error it is already reporting says why.
-        error.Canceled => {},
-        else => out.eprint("request failed: {s}\n", .{@errorName(e)}),
+        error.Canceled => return,
+        else => {
+            out.eprint("request failed: {s}\n", .{@errorName(e)});
+            _ = failures.fetchAdd(1, .monotonic);
+            return;
+        },
     };
+    if (outcome == .failed) _ = failures.fetchAdd(1, .monotonic);
 }
 
 /// How many `--reconnect-per-request` requests may be in flight at once.
@@ -733,8 +913,34 @@ fn parallelism() usize {
 /// Window used when the platform cannot report a CPU count.
 const fallback_parallelism: usize = 8;
 
+/// Send one request over `session`, reconnecting once when the peer has closed
+/// the connection.
+///
+/// A server run with `--disconnect-per-request` closes after every RESPONSE, so
+/// the next request on a keep-alive connection meets a closed socket. The failed
+/// attempt never reached a live connection, so it is safe to send again: one
+/// reopen per request, no retry loop.
+fn sendOnSession(
+    gpa: Allocator,
+    opts: *const ClientOptions,
+    session: *Session,
+    base: kms.Request,
+    rng: std.Random,
+    out: *Output,
+    data: *const kmsdata.KmsData,
+) !Outcome {
+    return sendRequestOn(gpa, &session.conn, base, rng, out, data, opts.verbose) catch |err| switch (err) {
+        error.EndOfStream, error.ConnectionResetByPeer, error.SocketUnconnected => {
+            try session.reopen(gpa, opts);
+            return sendRequestOn(gpa, &session.conn, base, rng, out, data, opts.verbose);
+        },
+        else => |e| return e,
+    };
+}
+
 /// Send `--count` requests over a single reused connection (keep-alive).
 /// Requests are sequential because one connection carries one in-flight RPC.
+/// Returns how many of them did not activate.
 fn sendRequestsReused(
     gpa: Allocator,
     io: Io,
@@ -743,39 +949,31 @@ fn sendRequestsReused(
     sku_index: usize,
     rng: std.Random,
     out: *Output,
-) !void {
-    var stream = try network.connect(io, opts.host.?, opts.port, opts.address_family);
-    defer stream.close(io);
-
-    var rbuf: [4096]u8 = undefined;
-    var wbuf: [4096]u8 = undefined;
-    var reader = stream.reader(io, &rbuf);
-    var writer = stream.writer(io, &wbuf);
-
-    const idle: network.ReadOptions = .{ .peer = .{
+) !u32 {
+    var session: Session = .{
         .io = io,
-        .handle = stream.socket.handle,
-        .timeout = network.timeoutSeconds(opts.timeout_seconds),
-    } };
-    var call_id: u32 = 2;
-    const bind = try bindContexts(gpa, &reader.interface, &writer.interface, &call_id, opts, idle);
-
-    var conn = Conn{
-        .reader = &reader.interface,
-        .writer = &writer.interface,
-        .use_ndr64 = requestUseNdr64(bind, true, opts.ndr64),
-        .call_id = call_id,
-        .idle = idle,
+        .stream = undefined,
+        .reader = undefined,
+        .writer = undefined,
+        .conn = undefined,
+        .bind = undefined,
+        .rbuf = undefined,
+        .wbuf = undefined,
     };
+    try session.open(gpa, opts);
+    defer session.close();
 
+    var failures: u32 = 0;
     var i: usize = 0;
     while (i < opts.count) : (i += 1) {
         const base = buildRequestBase(opts, data, sku_index, rng, io);
-        try sendRequestOn(gpa, &conn, base, rng, out, data, opts.verbose);
+        const outcome = try sendOnSession(gpa, opts, &session, base, rng, out, data);
+        if (outcome == .failed) failures += 1;
         // Later requests on the same association use NDR64 when the server
         // supports it (C `firstPacketSent` in `rpcSendRequest`).
-        conn.use_ndr64 = requestUseNdr64(bind, false, opts.ndr64);
+        session.conn.use_ndr64 = requestUseNdr64(session.bind, false, opts.ndr64);
     }
+    return failures;
 }
 
 fn listProducts(data: *const kmsdata.KmsData, out: *Output) void {
@@ -820,9 +1018,12 @@ pub fn main(init: std.process.Init) !void {
     var err_buf: [4096]u8 = undefined;
     var out: Output = .init(init.io, &out_buf, &err_buf);
 
-    var opts = resolveOptions(&res) catch |e| {
-        out.eprint("error: {s}\n", .{@errorName(e)});
-        std.process.exit(1);
+    var opts = resolveOptions(&res) catch |e| switch (e) {
+        error.UnexpectedPositional => fatal(&out, "error: at most one HOST[:PORT] argument is accepted\n", .{}),
+        error.InvalidProtocol => fatal(&out, "error: --protocol must be 4, 5, or 6\n", .{}),
+        error.InvalidLicenseStatus => fatal(&out, "error: --license-status must be 0..{d}\n", .{max_license_status}),
+        error.InvalidWorkstation => fatal(&out, "error: --workstation must be valid UTF-8\n", .{}),
+        else => fatal(&out, "error: {s}\n", .{@errorName(e)}),
     };
 
     // Load the KMS data: explicit path (--data) → FHS/XDG search → embedded
@@ -862,6 +1063,11 @@ pub fn main(init: std.process.Init) !void {
     };
     defer data.deinit(init.gpa);
 
+    validateKmsData(&data) catch {
+        out.eprint("error: incomplete KMS data file\n", .{});
+        std.process.exit(1);
+    };
+
     if (opts.list_products) {
         listProducts(&data, &out);
         return;
@@ -893,6 +1099,7 @@ pub fn main(init: std.process.Init) !void {
         // `async_limit`); the dispatcher blocks on it, so the bound is ours.
         var group: Io.Group = .init;
         var permits: Io.Semaphore = .{ .permits = parallelism() };
+        var failures: std.atomic.Value(u32) = .init(0);
         var i: usize = 0;
         while (i < opts.count) : (i += 1) {
             const seed = prng.random().int(u64);
@@ -902,7 +1109,7 @@ pub fn main(init: std.process.Init) !void {
                 dispatchFailed(&out, init.io, &group, e);
             };
             group.concurrent(init.io, sendRequestTask, .{
-                init.gpa, init.io, &opts, base, seed, &out, &data, &permits,
+                init.gpa, init.io, &opts, base, seed, &out, &data, &permits, &failures,
             }) catch |e| {
                 permits.post(init.io);
                 dispatchFailed(&out, init.io, &group, e);
@@ -912,14 +1119,20 @@ pub fn main(init: std.process.Init) !void {
             out.eprint("request failed: {s}\n", .{@errorName(e)});
             std.process.exit(1);
         };
+        exitOnFailures(&out, failures.load(.monotonic), opts.count);
     } else {
         // Reuse one connection for all requests (keep-alive), sent sequentially.
-        sendRequestsReused(init.gpa, init.io, &opts, &data, sku_index, prng.random(), &out) catch |e| {
+        const failures = sendRequestsReused(init.gpa, init.io, &opts, &data, sku_index, prng.random(), &out) catch |e| {
             out.eprint("request failed: {s}\n", .{@errorName(e)});
             std.process.exit(1);
         };
+        exitOnFailures(&out, failures, opts.count);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 test "request syntax follows the reference first-packet policy" {
     const both: rpc.BindResult = .{ .has_ndr32 = true, .has_ndr64 = true };
@@ -1139,4 +1352,280 @@ test "--timeout bounds a peer that never answers" {
             .timeout = network.timeoutSeconds(1),
         } } },
     ));
+}
+
+test "incomplete KMS data is rejected by the client" {
+    const alloc = std.testing.allocator;
+    var data = try kmsdata.parse(alloc, @embedFile("vlmcsd.kmd"));
+    defer data.deinit(alloc);
+
+    try validateKmsData(&data);
+    data.app_count = 0;
+    try std.testing.expectError(error.IncompleteKmsData, validateKmsData(&data));
+}
+
+test "resolveOptions rejects out-of-range selections" {
+    const gpa = std.testing.allocator;
+
+    const Case = struct { args: []const []const u8, expected: anyerror };
+    const cases = [_]Case{
+        // `--protocol` selects the wire struct set; only 4/5/6 exist, and an
+        // explicit `0` must not fall back to "derive from the product".
+        .{ .args = &.{ "--protocol", "0" }, .expected = error.InvalidProtocol },
+        .{ .args = &.{ "--protocol", "3" }, .expected = error.InvalidProtocol },
+        .{ .args = &.{ "--protocol", "7" }, .expected = error.InvalidProtocol },
+        .{ .args = &.{ "--license-status", "7" }, .expected = error.InvalidLicenseStatus },
+        .{ .args = &.{ "127.0.0.1", "127.0.0.2" }, .expected = error.UnexpectedPositional },
+    };
+    for (cases) |case| {
+        var res = try cli_helper.parse(gpa, &vlmzs_opts, case.args);
+        defer res.deinit();
+        try std.testing.expectError(case.expected, resolveOptions(&res));
+    }
+}
+
+test "resolveOptions accepts the documented selection limits" {
+    const gpa = std.testing.allocator;
+
+    const accepted = [_][]const u8{ "4", "5", "6" };
+    for (accepted) |version| {
+        var res = try cli_helper.parse(gpa, &vlmzs_opts, &.{ "--protocol", version });
+        defer res.deinit();
+        const opts = try resolveOptions(&res);
+        try std.testing.expectEqual(try std.fmt.parseInt(u16, version, 10), opts.protocol);
+    }
+
+    var res = try cli_helper.parse(gpa, &vlmzs_opts, &.{
+        "--protocol", "6", "--license-status", "6", "127.0.0.1:1689",
+    });
+    defer res.deinit();
+    const opts = try resolveOptions(&res);
+    try std.testing.expectEqual(@as(u32, 6), opts.license_status);
+    try std.testing.expectEqual(@as(u16, 1689), opts.port);
+}
+
+test "GUID text parses to the serialized order and formats back" {
+    // `--app-id`/`--kms-id`/`--cmid` are compared against `.kmd` GUIDs, which
+    // are stored in serialized order (docs/migration.md §3.3). Parsing must
+    // therefore reverse Data1..Data3, and `formatGuid` (what the request dump
+    // prints) must undo it.
+    const text = "51C82175-844E-4750-B0D8-EC255555BC06";
+    const wire = try cli_helper.parseGuid(text);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x75, 0x21, 0xc8, 0x51, 0x4e, 0x84, 0x50, 0x47,
+        0xb0, 0xd8, 0xec, 0x25, 0x55, 0x55, 0xbc, 0x06,
+    }, &wire);
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(text, formatGuid(&wire, &buf));
+}
+
+test "the random CMID carries the version and variant bits" {
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    const rng = prng.random();
+    for (0..32) |_| {
+        const cmid = randomCmid(rng);
+        // Serialized order: the Data3 high byte is byte 7 and the variant bits
+        // start the 8-byte tail at byte 8 (docs/migration.md §3.3).
+        try std.testing.expectEqual(@as(u8, 0x4), cmid[7] >> 4);
+        try std.testing.expectEqual(@as(u8, 0b10), cmid[8] >> 6);
+    }
+}
+
+test "the answer line carries the HwId only for v6" {
+    const io = std.testing.io;
+
+    const printOne = struct {
+        fn call(io_: Io, hwid: ?*const [8]u8, sink_buffer: []u8) []const u8 {
+            var unused_out: [64]u8 = undefined;
+            var unused_err: [64]u8 = undefined;
+            var output = Output.init(io_, &unused_out, &unused_err);
+            var sink: std.Io.Writer = .fixed(sink_buffer);
+            output.test_out = &sink;
+
+            var report_out_buffer: [report_buffer_size]u8 = undefined;
+            var report_err_buffer: [report_buffer_size]u8 = undefined;
+            var report = Report.init(&output, &report_out_buffer, &report_err_buffer);
+            var base: kms.Response = std.mem.zeroes(kms.Response);
+            printResultSummary(&base, hwid, &report);
+            output.writeBlock(report.out.buffered(), report.err.buffered());
+            return sink.buffered();
+        }
+    }.call;
+
+    var v6_buffer: [128]u8 = undefined;
+    const v6_line = printOne(io, &kms.default_hwid, &v6_buffer);
+    try std.testing.expect(std.mem.indexOf(u8, v6_line, "(3A1C049600B60076)") != null);
+
+    var v5_buffer: [128]u8 = undefined;
+    const v5_line = printOne(io, null, &v5_buffer);
+    try std.testing.expect(std.mem.indexOf(u8, v5_line, "(") == null);
+}
+
+test "a server that closes after each request is reconnected" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var data = try kmsdata.parse(alloc, @embedFile("vlmcsd.kmd"));
+    defer data.deinit(alloc);
+
+    // A real loopback server, so `sendRequestsReused` exercises its actual
+    // socket path instead of a stub.
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try Io.net.IpAddress.listen(&addr, io, .{ .mode = .stream });
+    defer listener.deinit(io);
+
+    var cfg = kms.ServerConfig{ .data = &data };
+
+    const Server = struct {
+        fn nowUnix(context: ?*anyopaque) i64 {
+            _ = context;
+            return 1_700_000_000;
+        }
+
+        /// Serve every connection until the group is canceled. Each one answers
+        /// BIND plus one request and then closes — the `--disconnect-per-request`
+        /// shape the client has to reconnect through.
+        fn run(
+            io_: Io,
+            listener_: *Io.net.Server,
+            alloc_: Allocator,
+            cfg_: *const kms.ServerConfig,
+        ) void {
+            var prng: std.Random.DefaultPrng = .init(0x9e37_79b9);
+            while (true) {
+                const stream = listener_.accept(io_) catch return;
+                defer stream.close(io_);
+                var rbuf: [4096]u8 = undefined;
+                var wbuf: [4096]u8 = undefined;
+                var reader = stream.reader(io_, &rbuf);
+                var writer = stream.writer(io_, &wbuf);
+                _ = network.serveRpc(alloc_, &reader.interface, &writer.interface, prng.random(), .{
+                    .cfg = cfg_,
+                    .clock = .{ .nowUnix = nowUnix },
+                    .disconnect_per_request = true,
+                    .idle = .{ .peer = .{
+                        .io = io_,
+                        .handle = stream.socket.handle,
+                        .timeout = network.timeoutSeconds(5),
+                    } },
+                }) catch {};
+            }
+        }
+    };
+
+    var group: Io.Group = .init;
+    group.concurrent(io, Server.run, .{ io, &listener, alloc, &cfg }) catch |e| return e;
+    defer group.cancel(io);
+
+    var opts = ClientOptions{};
+    opts.host = "127.0.0.1";
+    opts.port = listener.socket.address.getPort();
+    opts.count = 3;
+    opts.timeout_seconds = default_timeout_seconds;
+
+    var unused_out: [64]u8 = undefined;
+    var unused_err: [64]u8 = undefined;
+    var output = Output.init(io, &unused_out, &unused_err);
+    var sink_buffer: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buffer);
+    output.test_out = &sink;
+
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
+    const failures = try sendRequestsReused(alloc, io, &opts, &data, 0, prng.random(), &output);
+
+    // Every request activated, on its own connection: no failure, and one
+    // answer line per request (the dropped attempt leaves no output behind).
+    try std.testing.expectEqual(@as(u32, 0), failures);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, sink.buffered(), "\n"));
+}
+
+test "the UTC timestamp uses the calendar month" {
+    // `std.time.epoch.Month` is backed by its calendar number (jan = 1), so a
+    // stray `+ 1` prints December for November.
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("2026-11-07 13:57:17", formatUtc(1_794_059_837, &buf));
+    try std.testing.expectEqualStrings("1970-01-01 00:00:00", formatUtc(0, &buf));
+    try std.testing.expectEqualStrings("2024-02-29 00:00:00", formatUtc(1_709_164_800, &buf));
+    try std.testing.expectEqualStrings("2038-01-19 03:14:07", formatUtc(std.math.maxInt(i32), &buf));
+}
+
+test "the workstation name is UTF-16, not raw UTF-8 bytes" {
+    const gpa = std.testing.allocator;
+    var data = try kmsdata.parse(gpa, @embedFile("vlmcsd.kmd"));
+    defer data.deinit(gpa);
+
+    var prng: std.Random.DefaultPrng = .init(0xabc);
+    const rng = prng.random();
+    var out_buf: [8192]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    var output = Output.init(std.testing.io, &out_buf, &err_buf);
+
+    // ASCII: one code unit per byte.
+    {
+        var opts = ClientOptions{};
+        opts.workstation = "wks-01";
+        const base = buildRequestBase(&opts, &data, 0, rng, std.testing.io);
+        try std.testing.expectEqual(@as(u16, 'w'), base.workstation_name[0]);
+        try std.testing.expectEqual(@as(u16, 0), base.workstation_name[6]);
+    }
+
+    // BMP text: two bytes in UTF-8 ("中") become one code unit.
+    {
+        var opts = ClientOptions{};
+        opts.workstation = "中文";
+        const base = buildRequestBase(&opts, &data, 0, rng, std.testing.io);
+        try std.testing.expectEqual(@as(u16, 0x4E2D), base.workstation_name[0]);
+        try std.testing.expectEqual(@as(u16, 0x6587), base.workstation_name[1]);
+        try std.testing.expectEqual(@as(u16, 0), base.workstation_name[2]);
+
+        // ... and the verbose dump prints it back as UTF-8.
+        var report_out: [4096]u8 = undefined;
+        var report_err: [64]u8 = undefined;
+        var report = Report.init(&output, &report_out, &report_err);
+        printRequestVerbose(&base, &data, &report);
+        try std.testing.expect(std.mem.indexOf(u8, report.out.buffered(), "Workstation name                : 中文") != null);
+    }
+
+    // Astral text: one code point, two UTF-16 code units.
+    {
+        var opts = ClientOptions{};
+        opts.workstation = "𐐷";
+        const base = buildRequestBase(&opts, &data, 0, rng, std.testing.io);
+        try std.testing.expectEqual(@as(u16, 0xD801), base.workstation_name[0]);
+        try std.testing.expectEqual(@as(u16, 0xDC37), base.workstation_name[1]);
+        try std.testing.expectEqual(@as(u16, 0), base.workstation_name[2]);
+    }
+
+    // Truncation keeps whole code points: 40 astral characters are 80 units,
+    // but the field holds 63 plus the terminator.
+    {
+        var name_buffer: [40 * 4]u8 = undefined;
+        var len: usize = 0;
+        for (0..40) |_| {
+            @memcpy(name_buffer[len..][0..4], "𐐷");
+            len += 4;
+        }
+        var opts = ClientOptions{};
+        opts.workstation = name_buffer[0..len];
+        const base = buildRequestBase(&opts, &data, 0, rng, std.testing.io);
+        try std.testing.expectEqual(@as(u16, 0xD801), base.workstation_name[60]);
+        try std.testing.expectEqual(@as(u16, 0xDC37), base.workstation_name[61]);
+        try std.testing.expectEqual(@as(u16, 0), base.workstation_name[62]);
+    }
+}
+
+test "an invalid UTF-8 workstation name is a configuration error" {
+    const gpa = std.testing.allocator;
+    var res = try cli_helper.parse(gpa, &vlmzs_opts, &.{ "--workstation", "\xff\xfe" });
+    defer res.deinit();
+    try std.testing.expectError(error.InvalidWorkstation, resolveOptions(&res));
+}
+
+test "a timestamp before the Unix epoch prints as the epoch" {
+    // `formatUtc` takes a FILETIME-derived second count, which a response can
+    // put before 1970; the narrowing cast must not trap.
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("1970-01-01 00:00:00", formatUtc(-1, &buf));
+    try std.testing.expectEqualStrings("1970-01-01 00:00:00", formatUtc(-11_644_473_600, &buf));
 }

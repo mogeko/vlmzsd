@@ -34,11 +34,13 @@ fn writeHelp(w: *std.Io.Writer) !void {
     , .{});
 }
 
-fn errOut(io: Io, comptime fmt: []const u8, args: anytype) void {
+/// Report a fatal error on stderr and exit with status 1.
+fn fatal(io: Io, comptime fmt: []const u8, args: anytype) noreturn {
     var ebuf: [512]u8 = undefined;
     var ew = std.Io.File.writer(std.Io.File.stderr(), io, &ebuf);
     ew.interface.print(fmt, args) catch {};
     ew.interface.flush() catch {};
+    std.process.exit(1);
 }
 
 /// Derive the default output path: the input's stem plus `.json` (with `-r`)
@@ -95,24 +97,20 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--output")) {
             i += 1;
             if (i >= args.items.len) {
-                errOut(init.io, "kmdconv: error: -o/--output requires an argument\n", .{});
-                std.process.exit(1);
+                fatal(init.io, "kmdconv: error: -o/--output requires an argument\n", .{});
             }
             output_path = args.items[i];
         } else if (a.len > 0 and a[0] == '-' and !std.mem.eql(u8, a, "-")) {
-            errOut(init.io, "kmdconv: error: unknown option {s}\n", .{a});
-            std.process.exit(1);
+            fatal(init.io, "kmdconv: error: unknown option {s}\n", .{a});
         } else if (input == null) {
             input = a;
         } else {
-            errOut(init.io, "kmdconv: error: too many positional arguments\n", .{});
-            std.process.exit(1);
+            fatal(init.io, "kmdconv: error: too many positional arguments\n", .{});
         }
     }
 
     if (input == null) {
-        errOut(init.io, "kmdconv: error: missing input file (use - for stdin)\n", .{});
-        std.process.exit(1);
+        fatal(init.io, "kmdconv: error: missing input file (use - for stdin)\n", .{});
     }
 
     // Read input.
@@ -123,10 +121,8 @@ pub fn main(init: std.process.Init) !void {
         input_data = try readStdin(init.io, init.gpa);
         input_owned = true;
     } else {
-        input_data = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, input.?, init.gpa, .unlimited) catch |e| {
-            errOut(init.io, "kmdconv: error: cannot read {s}: {s}\n", .{ input.?, @errorName(e) });
-            std.process.exit(1);
-        };
+        input_data = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, input.?, init.gpa, .unlimited) catch |e|
+            fatal(init.io, "kmdconv: error: cannot read {s}: {s}\n", .{ input.?, @errorName(e) });
         input_owned = true;
     }
 
@@ -137,26 +133,26 @@ pub fn main(init: std.process.Init) !void {
     if (reverse) {
         var arena: std.heap.ArenaAllocator = .init(init.gpa);
         defer arena.deinit();
-        const data = kmsdata.parse(arena.allocator(), input_data) catch |e| {
-            errOut(init.io, "kmdconv: error: invalid .kmd data: {s} (is this a JSON file? remove -r to convert it to .kmd)\n", .{@errorName(e)});
-            std.process.exit(1);
-        };
-        output_data = kmsDataToJson(&data, init.gpa) catch |e| {
-            errOut(init.io, "kmdconv: error: cannot serialize JSON: {s}\n", .{@errorName(e)});
-            std.process.exit(1);
-        };
+        const data = kmsdata.parse(arena.allocator(), input_data) catch |e|
+            fatal(
+                init.io,
+                "kmdconv: error: invalid .kmd data: {s} (is this a JSON file? remove -r to convert it to .kmd)\n",
+                .{@errorName(e)},
+            );
+        output_data = kmsDataToJson(&data, init.gpa) catch |e|
+            fatal(init.io, "kmdconv: error: cannot serialize JSON: {s}\n", .{@errorName(e)});
         output_owned = true;
     } else {
         var arena: std.heap.ArenaAllocator = .init(init.gpa);
         defer arena.deinit();
-        const data = jsonToKmsData(arena.allocator(), input_data) catch |e| {
-            errOut(init.io, "kmdconv: error: invalid JSON input: {s} (is this a .kmd file? use -r to convert it to JSON)\n", .{@errorName(e)});
-            std.process.exit(1);
-        };
-        output_data = kmsdata.write(init.gpa, &data) catch |e| {
-            errOut(init.io, "kmdconv: error: cannot build .kmd data: {s}\n", .{@errorName(e)});
-            std.process.exit(1);
-        };
+        const data = jsonToKmsData(arena.allocator(), input_data) catch |e|
+            fatal(
+                init.io,
+                "kmdconv: error: invalid JSON input: {s} (is this a .kmd file? use -r to convert it to JSON)\n",
+                .{@errorName(e)},
+            );
+        output_data = kmsdata.write(init.gpa, &data) catch |e|
+            fatal(init.io, "kmdconv: error: cannot build .kmd data: {s}\n", .{@errorName(e)});
         output_owned = true;
     }
 
@@ -165,19 +161,15 @@ pub fn main(init: std.process.Init) !void {
     var derived: ?[]u8 = null;
     defer if (derived) |p| init.gpa.free(p);
     if (output_path == null and !std.mem.eql(u8, input.?, "-")) {
-        derived = deriveOutputPath(init.gpa, input.?, reverse) catch |e| {
-            errOut(init.io, "kmdconv: error: cannot derive output path: {s}\n", .{@errorName(e)});
-            std.process.exit(1);
-        };
+        derived = deriveOutputPath(init.gpa, input.?, reverse) catch |e|
+            fatal(init.io, "kmdconv: error: cannot derive output path: {s}\n", .{@errorName(e)});
     }
     const out_path: ?[]const u8 = output_path orelse derived;
 
     // Write output.
     if (out_path) |p| {
-        std.Io.Dir.writeFile(std.Io.Dir.cwd(), init.io, .{ .sub_path = p, .data = output_data }) catch |e| {
-            errOut(init.io, "kmdconv: error: cannot write {s}: {s}\n", .{ p, @errorName(e) });
-            std.process.exit(1);
-        };
+        std.Io.Dir.writeFile(std.Io.Dir.cwd(), init.io, .{ .sub_path = p, .data = output_data }) catch |e|
+            fatal(init.io, "kmdconv: error: cannot write {s}: {s}\n", .{ p, @errorName(e) });
     } else {
         var obuf: [8192]u8 = undefined;
         var ow = std.Io.File.writer(std.Io.File.stdout(), init.io, &obuf);
@@ -445,4 +437,178 @@ fn getStr(obj: Json.ObjectMap, key: []const u8) ![]const u8 {
         .string => |s| s,
         else => error.TypeMismatch,
     };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+test "JSON round-trip reproduces the embedded .kmd byte for byte" {
+    // The converter's contract: `.kmd` → JSON → `.kmd` reproduces the input.
+    // The string pool is rebuilt without deduplication, so this also pins that
+    // the embedded data needs none for a byte-identical result.
+    const gpa = std.testing.allocator;
+    const raw: []const u8 = @embedFile("vlmcsd.kmd");
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+
+    const data = try kmsdata.parse(arena.allocator(), raw);
+    const json = try kmsDataToJson(&data, gpa);
+    defer gpa.free(json);
+
+    const converted = try jsonToKmsData(arena.allocator(), json);
+    const bytes = try kmsdata.write(gpa, &converted);
+    defer gpa.free(bytes);
+
+    try std.testing.expectEqualSlices(u8, raw, bytes);
+}
+
+test "the JSON document names every field the writer needs" {
+    const gpa = std.testing.allocator;
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+
+    const data = try kmsdata.parse(arena.allocator(), @embedFile("vlmcsd.kmd"));
+    const json = try kmsDataToJson(&data, gpa);
+    defer gpa.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{ .parse_numbers = true });
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try std.testing.expectEqual(@as(i64, data.major_ver), obj.get("major_ver").?.integer);
+    try std.testing.expectEqual(@as(i64, data.minor_ver), obj.get("minor_ver").?.integer);
+    try std.testing.expectEqual(@as(i64, data.flags), obj.get("flags").?.integer);
+
+    try std.testing.expectEqual(data.csvlk.len, obj.get("csvlk").?.array.items.len);
+    try std.testing.expectEqual(data.app_count, obj.get("apps").?.array.items.len);
+    try std.testing.expectEqual(data.kms_count, obj.get("kms").?.array.items.len);
+    try std.testing.expectEqual(data.sku_count, obj.get("skus").?.array.items.len);
+    try std.testing.expectEqual(data.host_builds.len, obj.get("hostbuilds").?.array.items.len);
+
+    // Every per-record key the reverse direction reads back.
+    const csvlk = obj.get("csvlk").?.array.items[0].object;
+    try std.testing.expectEqualStrings(data.csvlk[0].epid, csvlk.get("epid").?.string);
+    try std.testing.expectEqualStrings(data.csvlk[0].name, csvlk.get("name").?.string);
+    try std.testing.expectEqual(@as(i64, data.csvlk[0].group_id), csvlk.get("group_id").?.integer);
+    try std.testing.expectEqual(@as(i64, data.csvlk[0].max_key_id), csvlk.get("max_key_id").?.integer);
+
+    const item = obj.get("apps").?.array.items[0].object;
+    try std.testing.expectEqualStrings(data.apps()[0].name, item.get("name").?.string);
+    try std.testing.expectEqual(@as(usize, 32), item.get("guid").?.string.len);
+
+    const host_build = obj.get("hostbuilds").?.array.items[0].object;
+    try std.testing.expectEqualStrings(data.host_builds[0].display_name, host_build.get("display_name").?.string);
+    try std.testing.expectEqual(@as(i64, data.host_builds[0].build_number), host_build.get("build_number").?.integer);
+}
+
+test "jsonToKmsData rejects malformed input" {
+    const gpa = std.testing.allocator;
+    // Every case is a self-contained document: the first field that fails is
+    // the one named in the expectation.
+    const Case = struct { json: []const u8, expected: anyerror };
+    const cases = [_]Case{
+        .{
+            .json = "[]",
+            .expected = error.InvalidJson,
+        },
+        .{
+            // `apps`/`kms`/`skus` are required.
+            .json = "{\"minor_ver\":0,\"major_ver\":2,\"flags\":1}",
+            .expected = error.MissingField,
+        },
+        .{
+            .json = "{\"apps\":[],\"kms\":[],\"skus\":[],\"csvlk\":[],\"hostbuilds\":[],\"minor_ver\":0,\"major_ver\":2,\"flags\":\"x\"}",
+            .expected = error.TypeMismatch,
+        },
+        .{
+            .json = "{\"apps\":[],\"kms\":[],\"skus\":[],\"csvlk\":[],\"hostbuilds\":[],\"minor_ver\":70000,\"major_ver\":2,\"flags\":1}",
+            .expected = error.Overflow,
+        },
+        .{
+            // A GUID is exactly 32 hex digits.
+            .json = "{\"apps\":[{\"guid\":\"00112233445566778899aabbccddee\",\"name\":\"X\",\"app_index\":0,\"kms_index\":0}],\"kms\":[],\"skus\":[],\"csvlk\":[],\"hostbuilds\":[],\"minor_ver\":0,\"major_ver\":2,\"flags\":1}",
+            .expected = error.InvalidGuid,
+        },
+        .{
+            .json = "{\"apps\":[],\"kms\":[],\"skus\":[],\"csvlk\":[],\"hostbuilds\":[],\"minor_ver\":0,\"major_ver\":2,\"flags\":1,\"extra\":0,,}",
+            .expected = error.SyntaxError,
+        },
+    };
+
+    for (cases) |case| {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        try std.testing.expectError(case.expected, jsonToKmsData(arena.allocator(), case.json));
+    }
+}
+
+test "empty record arrays convert but are rejected by the writer" {
+    // docs/kmdconv.md: every array must be non-empty. The JSON parser accepts
+    // the document; `kmsdata.write` is where the format rule is enforced.
+    const gpa = std.testing.allocator;
+    const json = "{\"apps\":[],\"kms\":[],\"skus\":[],\"csvlk\":[],\"hostbuilds\":[],\"minor_ver\":0,\"major_ver\":2,\"flags\":1}";
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const data = try jsonToKmsData(arena.allocator(), json);
+    try std.testing.expectError(error.InvalidFormat, kmsdata.write(gpa, &data));
+}
+
+test "parseGuid accepts 32 hex digits and nothing else" {
+    const lower = try parseGuid("00112233445566778899aabbccddeeff");
+    try std.testing.expectEqualSlices(u8, &.{
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    }, &lower);
+    const upper = try parseGuid("00112233445566778899AABBCCDDEEFF");
+    try std.testing.expectEqualSlices(u8, &lower, &upper);
+
+    try std.testing.expectError(error.InvalidGuid, parseGuid("00112233445566778899aabbccddee"));
+    try std.testing.expectError(error.InvalidGuid, parseGuid("00112233445566778899aabbccddeeff00"));
+    try std.testing.expectError(error.InvalidGuid, parseGuid("00112233445566778899aabbccddeeg"));
+}
+
+test "the default output path keeps the stem and swaps the suffix" {
+    const gpa = std.testing.allocator;
+
+    const cases = [_]struct { input: []const u8, reverse: bool, want: []const u8 }{
+        .{ .input = "data.json", .reverse = false, .want = "data.kmd" },
+        .{ .input = "dir/sub/data.json", .reverse = false, .want = "data.kmd" },
+        .{ .input = "data.kmd", .reverse = true, .want = "data.json" },
+        .{ .input = "src/vlmcsd.kmd", .reverse = true, .want = "vlmcsd.json" },
+    };
+    for (cases) |case| {
+        const got = try deriveOutputPath(gpa, case.input, case.reverse);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(case.want, got);
+    }
+}
+
+test "a name with an interior NUL does not survive a round-trip" {
+    // The format is a NUL-terminated string pool, so a name carrying a NUL is
+    // truncated on the way back in. `write` cannot represent it; the converter
+    // must either reject it or the caller must not be surprised. Pin which.
+    const gpa = std.testing.allocator;
+    const raw: []const u8 = @embedFile("vlmcsd.kmd");
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+
+    const data = try kmsdata.parse(arena.allocator(), raw);
+    const json = try kmsDataToJson(&data, gpa);
+    defer gpa.free(json);
+
+    var converted = try jsonToKmsData(arena.allocator(), json);
+    // Inject an interior NUL into the first product name.
+    const name = try arena.allocator().dupe(u8, "AB\x00CD");
+    converted.items[converted.app_count].name = name;
+
+    const bytes = try kmsdata.write(gpa, &converted);
+    defer gpa.free(bytes);
+    var reparsed = try kmsdata.parse(gpa, bytes);
+    defer reparsed.deinit(gpa);
+    try std.testing.expectEqualStrings("AB", reparsed.items[converted.app_count].name);
 }

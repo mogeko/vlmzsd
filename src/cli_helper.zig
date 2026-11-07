@@ -291,10 +291,11 @@ fn hexVal(c: u8) error{InvalidGuid}!u8 {
 }
 
 /// Parse a GUID in `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form (case-insensitive)
-/// into its 16 raw bytes.
+/// into the 16 serialized bytes: Data1/Data2/Data3 little-endian, then the
+/// 8-byte tail in string order (docs/migration.md §3.3).
 pub fn parseGuid(str: []const u8) error{InvalidGuid}![16]u8 {
     if (str.len != 36) return error.InvalidGuid;
-    var out: [16]u8 = undefined;
+    var text_order: [16]u8 = undefined;
     var oi: usize = 0;
     var i: usize = 0;
     while (i < str.len) : (i += 1) {
@@ -304,11 +305,17 @@ pub fn parseGuid(str: []const u8) error{InvalidGuid}![16]u8 {
         }
         const hi = try hexVal(str[i]);
         const lo = try hexVal(str[i + 1]);
-        out[oi] = (hi << 4) | lo;
+        text_order[oi] = (hi << 4) | lo;
         oi += 1;
         i += 1;
     }
     if (oi != 16) return error.InvalidGuid;
+
+    var out: [16]u8 = undefined;
+    std.mem.writeInt(u32, out[0..4], std.mem.readInt(u32, text_order[0..4], .big), .little);
+    std.mem.writeInt(u16, out[4..6], std.mem.readInt(u16, text_order[4..6], .big), .little);
+    std.mem.writeInt(u16, out[6..8], std.mem.readInt(u16, text_order[6..8], .big), .little);
+    @memcpy(out[8..16], text_order[8..16]);
     return out;
 }
 
@@ -623,7 +630,10 @@ fn writeCounterLine(w: *std.Io.Writer, io: Io, loss: Loss, scope: []const u8) vo
 /// Write a UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp followed by a space. Its length
 /// is fixed, so it can be formatted straight into the line it belongs to.
 fn writeTimestampPrefix(buf: *[timestamp_len]u8, io: Io) void {
-    const secs: u64 = @intCast(@divTrunc(Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_s));
+    // A clock set before 1970 makes the seconds negative; format 0 (the epoch)
+    // instead of trapping on the narrowing cast.
+    const now_ns = Io.Clock.now(.real, io).nanoseconds;
+    const secs: u64 = std.math.cast(u64, @divTrunc(now_ns, std.time.ns_per_s)) orelse 0;
     const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
     const yad = epoch.getEpochDay().calculateYearDay();
     const mad = yad.calculateMonthDay();
@@ -734,6 +744,10 @@ fn loadKmdFrom(io: Io, gpa: Allocator, dir_path: []const u8, name: []const u8) !
     return .{ .path = full_path, .data = data };
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 test "parseDurationSeconds" {
     try std.testing.expectEqual(@as(u64, 30), try parseDurationSeconds("30s"));
     try std.testing.expectEqual(@as(u64, 7200), try parseDurationSeconds("2h"));
@@ -767,9 +781,15 @@ test "parseLevel" {
 }
 
 test "parseGuid" {
+    // The serialized order is Data1/Data2/Data3 little-endian (docs/migration.md
+    // §3.3), so the first three fields are reversed relative to the text.
     const g = try parseGuid("00112233-4455-6677-8899-aabbccddeeff");
-    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff }, &g);
-    try std.testing.expectEqualSlices(u8, &(try parseGuid("00112233-4455-6677-8899-AABBCCDDEEFF")), &.{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff });
+    try std.testing.expectEqualSlices(u8, &.{ 0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff }, &g);
+    try std.testing.expectEqualSlices(u8, &(try parseGuid("00112233-4455-6677-8899-AABBCCDDEEFF")), &.{ 0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff });
+    // A real interface GUID, so the expected bytes come from the same table the
+    // wire layer uses.
+    const iface = try parseGuid("51C82175-844E-4750-B0D8-EC255555BC06");
+    try std.testing.expectEqualSlices(u8, &.{ 0x75, 0x21, 0xc8, 0x51, 0x4e, 0x84, 0x50, 0x47, 0xb0, 0xd8, 0xec, 0x25, 0x55, 0x55, 0xbc, 0x06 }, &iface);
     try std.testing.expectError(error.InvalidGuid, parseGuid("nope"));
     try std.testing.expectError(error.InvalidGuid, parseGuid("00112233-4455-6677-8899-aabbccddee"));
 }

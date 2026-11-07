@@ -27,8 +27,10 @@ comptime {
 // Types
 // ---------------------------------------------------------------------------
 
-/// A 16-byte GUID. Treated as opaque bytes (never parsed into scalar fields
-/// here); the C reference only ever compares or copies GUIDs wholesale.
+/// A 16-byte GUID in serialized order: Data1/Data2/Data3 little-endian, then
+/// the 8-byte tail in canonical string order (docs/migration.md §3.3). `.kmd`
+/// GUIDs use the same layout, so request fields can be filled straight from
+/// `KmsData`; only canonical GUID text needs converting.
 pub const Guid = [16]u8;
 
 /// Windows FILETIME: 100-ns ticks since 1601-01-01, little-endian u64.
@@ -116,6 +118,12 @@ pub const max_clients = 671;
 pub const max_required_clients = 2000;
 /// Reject requests whose client time is off by more than 4 hours — §5.
 pub const client_time_tolerance_seconds = 4 * 60 * 60;
+/// Largest `ServerConfig.lcid` the ePID generator accepts: it takes the LCID as
+/// a non-negative `i16`.
+pub const max_lcid: u16 = 32767;
+/// Largest `ServerConfig.build` the ePID generator accepts: Windows build
+/// numbers fit in 16 bits.
+pub const max_build: u32 = 65535;
 
 /// Fixed (max-ePID) sizes of the response structs.
 pub const request_size: usize = @sizeOf(Request);
@@ -238,6 +246,22 @@ comptime {
     std.debug.assert(response_v5_size == 240);
     std.debug.assert(response_v6_size == 280);
     std.debug.assert(version_size == 4);
+
+    // The ePID is the only variable-length response field, and it is written
+    // into `Response.kms_pid`; `utf8ToUcs2` keeps one unit for the terminator,
+    // so this is its largest possible size.
+    const max_pid_size = (pid_buffer_size - 1) * @sizeOf(u16);
+    std.debug.assert(max_pid_size == 126);
+
+    // Worst case for the ciphertext buffer: the largest ePID plus a whole
+    // PKCS#7 padding block must fit `out[version_size..]`, which is what
+    // `aesCbcEncrypt` asserts before it pads.
+    std.debug.assert(v6_pre_epid_size - version_size + max_pid_size +
+        v6_post_epid_size + @sizeOf([16]u8) <= max_response_size - version_size);
+
+    // v4 has no padding; the CMAC covers the whole response body.
+    std.debug.assert(v4_pre_epid_size + v4_post_epid_size + max_pid_size <=
+        max_response_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -276,8 +300,12 @@ pub fn u64ToFileTime(v: u64) FileTime {
 }
 
 /// Seconds since 1970-01-01 → FILETIME ticks (100 ns since 1601-01-01).
+/// A date outside the FILETIME range (before 1601) saturates to 0 rather than
+/// trapping on the narrowed arithmetic.
 pub fn unixTimeToFileTime(unix: i64) u64 {
-    return @intCast((unix + filetime_epoch_offset) * ticks_per_second);
+    const shifted = std.math.add(i64, unix, filetime_epoch_offset) catch return 0;
+    const ticks = std.math.mul(i64, shifted, ticks_per_second) catch return 0;
+    return std.math.cast(u64, ticks) orelse 0;
 }
 
 /// FILETIME ticks → seconds since 1970-01-01.
@@ -333,6 +361,7 @@ pub fn getPlatformId(data: *const kmsdata.KmsData, host_build: i32) i32 {
     for (data.host_builds) |hb| {
         if (hb.build_number <= host_build) return hb.platform_id;
     }
+    if (data.host_builds.len == 0) return 0;
     return data.host_builds[data.host_builds.len - 1].platform_id;
 }
 
@@ -343,7 +372,15 @@ pub fn getReleaseDate(data: *const kmsdata.KmsData, host_build: i32) i64 {
         i -= 1;
         if (data.host_builds[i].build_number >= host_build) return data.host_builds[i].release_date;
     }
+    if (data.host_builds.len == 0) return 0;
     return data.host_builds[0].release_date;
+}
+
+/// Pick one LCID from `lcid_list`. Level 1 draws it once per run, so every
+/// CSVLC's pre-generated ePID carries the same language (C `randomPidInit`
+/// samples `lang` before its loop).
+pub fn randomLcid(rng: std.Random) u16 {
+    return lcid_list[rng.uintLessThan(usize, lcid_list.len)];
 }
 
 /// Return `lcid` when it is a member of `lcid_list`, else 0.
@@ -357,7 +394,8 @@ pub fn isValidLcid(lcid: u16) u16 {
 /// Return `build` when it matches a known host build, else 0.
 pub fn isValidHostBuild(data: *const kmsdata.KmsData, build: u32) u32 {
     for (data.host_builds) |hb| {
-        if (build == @as(u32, @intCast(hb.build_number))) return build;
+        const number = std.math.cast(u32, hb.build_number) orelse continue;
+        if (build == number) return build;
     }
     return 0;
 }
@@ -416,6 +454,10 @@ pub const ServerConfig = struct {
 
 pub const BuildError = error{
     PidTooLong,
+    /// No host build matches the negotiated transfer syntax.
+    NoHostBuild,
+    /// The CSVLC record cannot produce a valid randomized ePID.
+    InvalidCsvlk,
 };
 
 /// Write the ePID (UCS-2) and its byte length into `response`.
@@ -440,21 +482,37 @@ fn itoc(buf: []u8, value: u32, digits: u8) []u8 {
     return buf[0..s.len];
 }
 
-/// Pick a random host build whose NDR64 capability matches `use_ndr64`
-/// (mirrors the C `getRandomServerType`).
-fn getRandomServerType(data: *const kmsdata.KmsData, rng: std.Random, use_ndr64: bool) u32 {
-    std.debug.assert(data.host_builds.len > 0); // otherwise the loop never terminates
-    while (true) {
-        const idx = rng.uintLessThan(usize, data.host_builds.len);
-        const is_ndr64 = (data.host_builds[idx].flags & use_ndr64_flag) != 0;
-        if (is_ndr64 == use_ndr64) return @intCast(idx);
+/// True when at least one host build advertises the requested NDR64 support.
+/// `generateRandomPid` needs such a build when it picks one itself.
+pub fn hasHostBuildForNdr64(data: *const kmsdata.KmsData, use_ndr64: bool) bool {
+    for (data.host_builds) |host_build| {
+        if (((host_build.flags & use_ndr64_flag) != 0) == use_ndr64) return true;
     }
+    return false;
+}
+
+/// Pick a random host build whose NDR64 capability matches `use_ndr64`.
+/// Scans each build at most once, starting from a random position, so data
+/// without a matching build reports `null` instead of looping forever.
+fn getRandomServerType(data: *const kmsdata.KmsData, rng: std.Random, use_ndr64: bool) ?usize {
+    if (data.host_builds.len == 0) return null;
+
+    var index = rng.uintLessThan(usize, data.host_builds.len);
+    var visited: usize = 0;
+    while (visited < data.host_builds.len) : (visited += 1) {
+        const is_ndr64 = (data.host_builds[index].flags & use_ndr64_flag) != 0;
+        if (is_ndr64 == use_ndr64) return index;
+        index += 1;
+        if (index == data.host_builds.len) index = 0;
+    }
+    return null;
 }
 
 /// Pick a random host build number whose NDR64 capability matches `use_ndr64`
 /// (used by level-1 pre-randomization to fix one build for all CSVLCs).
-pub fn randomHostBuild(data: *const kmsdata.KmsData, rng: std.Random, use_ndr64: bool) i32 {
-    return data.host_builds[getRandomServerType(data, rng, use_ndr64)].build_number;
+pub fn randomHostBuild(data: *const kmsdata.KmsData, rng: std.Random, use_ndr64: bool) ?i32 {
+    const index = getRandomServerType(data, rng, use_ndr64) orelse return null;
+    return data.host_builds[index].build_number;
 }
 
 /// Generate a randomized ePID for CSVLC `index` into `out` (UTF-8), matching
@@ -468,18 +526,22 @@ pub fn generateRandomPid(
     rng: std.Random,
     use_ndr64: bool,
     now_unix: i64,
-) []u8 {
-    std.debug.assert(index < data.csvlk.len);
-    std.debug.assert(out.len >= pid_buffer_size);
+) BuildError![]u8 {
+    if (data.host_builds.len == 0) return error.NoHostBuild;
+    if (index >= data.csvlk.len) return error.InvalidCsvlk;
+    if (out.len < pid_buffer_size) return error.PidTooLong;
 
-    const resolved_build: i32 = if (host_build == 0)
-        data.host_builds[getRandomServerType(data, rng, use_ndr64)].build_number
-    else
-        host_build;
+    const resolved_build: i32 = if (host_build == 0) blk: {
+        const build_index = getRandomServerType(data, rng, use_ndr64) orelse return error.NoHostBuild;
+        break :blk data.host_builds[build_index].build_number;
+    } else host_build;
 
     const csvlk = data.csvlk[index];
-    std.debug.assert(csvlk.max_key_id > csvlk.min_key_id); // avoid uintLessThan by zero
-    const key_id = csvlk.min_key_id + rng.uintLessThan(u32, csvlk.max_key_id - csvlk.min_key_id);
+    if (csvlk.max_key_id <= csvlk.min_key_id) return error.InvalidCsvlk;
+    const key_span = csvlk.max_key_id - csvlk.min_key_id;
+    const platform_id = std.math.cast(u32, getPlatformId(data, resolved_build)) orelse return error.InvalidCsvlk;
+
+    const key_id = csvlk.min_key_id + rng.uintLessThan(u32, key_span);
     std.debug.assert(key_id >= csvlk.min_key_id);
     std.debug.assert(key_id < csvlk.max_key_id);
 
@@ -496,12 +558,14 @@ pub fn generateRandomPid(
         min_time + @as(i64, @intCast(rng.uintLessThan(u64, @intCast(span))))
     else
         min_time;
-
-    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(kms_time) };
+    // Corrupt data can place the generated date before the Unix epoch; clamp
+    // it instead of panicking in the u64 cast.
+    const epoch_secs: u64 = std.math.cast(u64, kms_time) orelse 0;
+    const epoch = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
     const yad = epoch.getEpochDay().calculateYearDay();
 
     var b: [6][16]u8 = undefined;
-    const platform = itoc(&b[0], @intCast(getPlatformId(data, resolved_build)), 5);
+    const platform = itoc(&b[0], platform_id, 5);
     const group = itoc(&b[1], csvlk.group_id, 5);
     const key_hi = itoc(&b[2], key_id / 1_000_000, 3);
     const key_lo = itoc(&b[3], key_id % 1_000_000, 6);
@@ -544,9 +608,12 @@ pub fn initClientLists(
     rng: std.Random,
 ) void {
     const apps = data.apps();
+    // The caller owns the slice; one longer than the app table leaves the extra
+    // slots empty instead of indexing past `apps`.
+    const initialized = @min(lists.lists.len, apps.len);
     for (lists.lists, 0..) |*cl, i| {
         cl.* = std.mem.zeroes(ClientList);
-        if (start_empty) continue;
+        if (start_empty or i >= initialized) continue;
         const max_count: usize = apps[i].n_count_policy;
         const half: usize = max_count >> 1;
         const prefill: usize = if (half > 0) half - 1 else 0;
@@ -567,10 +634,26 @@ pub fn createResponseBase(
     rng: std.Random,
     now_unix: i64,
 ) i32 {
-    std.debug.assert(cfg.data.csvlk.len > 0);
+    if (cfg.data.csvlk.len == 0) return hresult.invalid_arg;
 
-    const required_clients: u32 = if (request.n_policy < 1) 1 else request.n_policy << 1;
+    // `apps()` and `kms()` slice `items` by count, so the counts must describe
+    // a well-formed App/KMS/SKU layout before either slice is taken.
+    if (cfg.data.app_count > cfg.data.items.len) return hresult.invalid_arg;
+    const items_after_app = cfg.data.items.len - cfg.data.app_count;
+    if (cfg.data.kms_count > items_after_app) return hresult.invalid_arg;
+    if (cfg.data.sku_count != items_after_app - cfg.data.kms_count) return hresult.invalid_arg;
+
+    // The generator takes these as `i16`/`i32`; a wider setting has no ePID
+    // representation, so reject it instead of narrowing here.
+    if (cfg.lcid > max_lcid or cfg.build > max_build) return hresult.invalid_arg;
+
+    // Reject N_Policy values that would exceed the protocol limit before
+    // multiplying: a u32 wrap would turn 0x80000000 into 0 and 0x80000002
+    // into 4, bypassing the > 2000 rule below — docs/migration.md §5.
+    if (request.n_policy > max_required_clients / 2) return hresult.invalid_arg;
+    const required_clients: u32 = if (request.n_policy < 1) 1 else request.n_policy * 2;
     std.debug.assert(required_clients >= 1);
+    std.debug.assert(required_clients <= max_required_clients);
 
     const kms_items = cfg.data.kms();
     const index_opt = getProductIndex(&request.kms_id, kms_items);
@@ -593,7 +676,9 @@ pub fn createResponseBase(
 
     if (cfg.whitelisting_level & whitelist_app_guid != 0) {
         if (index_opt) |i| {
-            const app_guid = cfg.data.apps()[kms_items[i].app_index].guid;
+            const app_index: usize = kms_items[i].app_index;
+            if (app_index >= cfg.data.app_count) return hresult.invalid_arg;
+            const app_guid = cfg.data.apps()[app_index].guid;
             if (!guidEqual(&app_guid, &request.app_id)) return hresult.product_rejected;
         } else {
             return hresult.product_rejected;
@@ -601,12 +686,15 @@ pub fn createResponseBase(
     }
 
     const epid_index: usize = if (index_opt) |i| kms_items[i].epid_index else 0;
+    if (epid_index >= cfg.data.csvlk.len) return hresult.invalid_arg;
 
     // Client count: strict mode tracks per-app CMIDs; otherwise answer the
     // minimum active clients (mirrors `CreateResponseBaseCallback`).
     if (cfg.maintain_clients) {
         const app_index: usize = if (index_opt) |i| kms_items[i].app_index else 0;
+        if (app_index >= cfg.data.app_count) return hresult.invalid_arg;
         if (cfg.client_lists) |client_lists| {
+            if (app_index >= client_lists.lists.len) return hresult.invalid_arg;
             while (!client_lists.mutex.tryLock()) std.atomic.spinLoopHint();
             defer client_lists.mutex.unlock();
             const list = &client_lists.lists[app_index];
@@ -665,7 +753,16 @@ pub fn createResponseBase(
     const pid: []const u8 = if (override) |p|
         p
     else if (cfg.randomization_level == 2)
-        generateRandomPid(cfg.data, epid_index, &pid_buf, @intCast(cfg.lcid), @intCast(cfg.build), rng, cfg.use_ndr64, now_unix)
+        generateRandomPid(
+            cfg.data,
+            epid_index,
+            &pid_buf,
+            @intCast(cfg.lcid),
+            @intCast(cfg.build),
+            rng,
+            cfg.use_ndr64,
+            now_unix,
+        ) catch return hresult.invalid_arg
     else
         cfg.data.csvlk[epid_index].epid;
 
@@ -757,10 +854,12 @@ pub fn createResponseV6(
     now_unix: i64,
 ) i32 {
     const is_v6 = majorVersion(request.version) > 5;
-    const key: []const u8 = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
+    // v5 and v6 share the 128-bit key width; the `Key` variant also selects the
+    // v6 round-key modification.
+    const key: *const crypto.Key = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
 
     // 1. Decrypt the request in place (IV + base + pad, zero IV).
-    crypto.aesCbcDecrypt(key, is_v6, null, std.mem.asBytes(request)[4..], v6_decrypt_size);
+    crypto.aesCbcDecrypt(key, null, std.mem.asBytes(request)[4..][0..v6_decrypt_size]);
 
     const response: *ResponseV6 = @ptrCast(out);
     @memset(out[0..@sizeOf(ResponseV6)], 0);
@@ -798,7 +897,7 @@ pub fn createResponseV6(
 
     if (is_v6) createV6Hmac(out[version_size..], encrypt_size, 0);
 
-    encrypt_size = crypto.aesCbcEncrypt(key, is_v6, null, out[version_size..], encrypt_size);
+    encrypt_size = crypto.aesCbcEncrypt(key, null, out[version_size..][0..encrypt_size], out[version_size..]);
 
     return @intCast(encrypt_size + version_size);
 }
@@ -820,8 +919,9 @@ pub fn createRequestV6(out: *RequestV6, base: *const Request, rng: std.Random) v
     out.base = base.*;
 
     const is_v6 = majorVersion(base.version) > 5;
-    const key: []const u8 = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
-    _ = crypto.aesCbcEncrypt(key, is_v6, &out.iv, std.mem.asBytes(out)[20..], @sizeOf(Request));
+    const key: *const crypto.Key = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
+    const region = std.mem.asBytes(out)[20..];
+    _ = crypto.aesCbcEncrypt(key, &out.iv, region[0..@sizeOf(Request)], region);
 }
 
 fn checkPidLength(base: *const Response) bool {
@@ -869,12 +969,27 @@ pub fn decryptResponseV4(
     raw_request: *const RequestV4,
 ) ResponseResult {
     var result = ResponseResult{};
+
+    // The peer chooses the size: refuse anything shorter than the fixed fields
+    // plus a one-unit ePID, or longer than the reported-size field, rather than
+    // reading past the payload or narrowing the count.
+    if (response_size < v4_pre_epid_size + v4_post_epid_size or
+        response_size > response.len or
+        response_size > std.math.maxInt(u16))
+    {
+        result.decrypt_success = false;
+        return result;
+    }
     result.effective_response_size = @intCast(response_size);
 
     const pid_size_raw = readLe(u32, response, 4);
     const pid_size: usize = @min(pid_size_raw, pid_buffer_size * 2);
     const copy_size = v4_pre_epid_size + pid_size;
     const message_size = copy_size + v4_post_epid_size;
+    if (response_size < copy_size) {
+        result.decrypt_success = false;
+        return result;
+    }
 
     @memcpy(std.mem.asBytes(out)[0..copy_size], response[0..copy_size]);
     @memcpy(std.mem.asBytes(out)[cmid_offset..][0 .. response_size - copy_size], response[copy_size..]);
@@ -886,7 +1001,11 @@ pub fn decryptResponseV4(
     result.pid_length_ok = checkPidLength(&out.base);
     result.version_ok = out.base.version == raw_request.base.version;
     result.hash_ok = std.mem.eql(u8, &out.mac, &mac);
-    result.timestamp_ok = std.mem.eql(u8, std.mem.asBytes(&out.base.client_time), std.mem.asBytes(&raw_request.base.client_time));
+    result.timestamp_ok = std.mem.eql(
+        u8,
+        std.mem.asBytes(&out.base.client_time),
+        std.mem.asBytes(&raw_request.base.client_time),
+    );
     result.client_machine_id_ok = guidEqual(&out.base.cmid, &raw_request.base.cmid);
     result.correct_response_size = @intCast(@sizeOf(ResponseV4) - pid_buffer_size * 2 + pid_size);
 
@@ -939,13 +1058,25 @@ pub fn decryptResponseV6(
     hwid: ?*[8]u8,
 ) ResponseResult {
     var result = ResponseResult{};
+
+    // The peer chooses the size: the payload must hold the unencrypted Version
+    // field, a whole number of AES blocks after it (CBC with PKCS#7), and fit
+    // the field the result reports it in.
+    if (response_size < version_size + 16 or
+        response_size > response.len or
+        response_size > std.math.maxInt(u16) or
+        (response_size - version_size) % 16 != 0)
+    {
+        result.decrypt_success = false;
+        return result;
+    }
     result.effective_response_size = @intCast(response_size);
 
     const is_v6 = majorVersion(readLe(u32, response, 0)) > 5;
-    const key: []const u8 = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
+    const key: *const crypto.Key = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
 
     // Decrypt everything after the unencrypted Version field.
-    crypto.aesCbcDecrypt(key, is_v6, null, response[version_size..], response_size - version_size);
+    crypto.aesCbcDecrypt(key, null, response[version_size..response_size]);
 
     // PKCS#7 padding must be 1..16 and uniform.
     const last_pad = response[response_size - 1];
@@ -960,21 +1091,33 @@ pub fn decryptResponseV6(
         }
     }
 
+    // The decrypted payload must still hold the fixed header and the trailing
+    // fields around the ePID; a peer can send any size it likes.
+    if (response_size < v6_pre_epid_size) {
+        result.decrypt_success = false;
+        return result;
+    }
+
     const pid_size_raw = readLe(u32, response, 24);
     const pid_size: usize = @min(pid_size_raw, pid_buffer_size * 2);
 
     const copy_size1 = v6_pre_epid_size + pid_size;
+    const copy_size2: usize = if (is_v6) v6_post_epid_size else v5_post_epid_size;
+    if (response_size < copy_size1 + copy_size2) {
+        result.decrypt_success = false;
+        return result;
+    }
+
     @memcpy(std.mem.asBytes(out)[0..copy_size1], response[0..copy_size1]);
     out.base.kms_pid[pid_buffer_size - 1] = 0;
 
-    const copy_size2: usize = if (is_v6) v6_post_epid_size else v5_post_epid_size;
     @memcpy(
         std.mem.asBytes(out)[response_base_offset + cmid_offset ..][0..copy_size2],
         response[copy_size1..][0..copy_size2],
     );
 
     // Decrypt the request in place so its base fields are readable.
-    crypto.aesCbcDecrypt(key, is_v6, null, std.mem.asBytes(raw_request)[4..], v6_decrypt_size);
+    crypto.aesCbcDecrypt(key, null, std.mem.asBytes(raw_request)[4..][0..v6_decrypt_size]);
 
     result.version_ok =
         raw_request.version == out.base.version and
@@ -982,7 +1125,11 @@ pub fn decryptResponseV6(
         raw_request.version == raw_request.base.version;
 
     result.pid_length_ok = checkPidLength(&out.base);
-    result.timestamp_ok = std.mem.eql(u8, std.mem.asBytes(&out.base.client_time), std.mem.asBytes(&raw_request.base.client_time));
+    result.timestamp_ok = std.mem.eql(
+        u8,
+        std.mem.asBytes(&out.base.client_time),
+        std.mem.asBytes(&raw_request.base.client_time),
+    );
     result.client_machine_id_ok = guidEqual(&out.base.cmid, &raw_request.base.cmid);
 
     // Rebuild the random key and verify its hash.
@@ -993,7 +1140,9 @@ pub fn decryptResponseV6(
     crypto.sha256(&random_key, &hash_verify);
     result.hash_ok = std.mem.eql(u8, &out.hash, &hash_verify);
 
-    result.correct_response_size = @intCast((if (is_v6) response_v6_size else response_v5_size) - pid_buffer_size * 2 + pid_size);
+    result.correct_response_size = @intCast(
+        (if (is_v6) response_v6_size else response_v5_size) - pid_buffer_size * 2 + pid_size,
+    );
 
     if (is_v6) {
         if (hwid) |h| @memcpy(h, &out.hwid);
@@ -1028,7 +1177,7 @@ test "generateRandomPid format" {
     var prng: std.Random.DefaultPrng = .init(0xDEAD_BEEF);
     var buf: [pid_buffer_size]u8 = undefined;
     // CSVLC 0 (Windows), fixed LCID 1033 and build 17763.
-    const pid = generateRandomPid(&td.data, 0, &buf, 1033, 17763, prng.random(), true, 1_700_000_000);
+    const pid = try generateRandomPid(&td.data, 0, &buf, 1033, 17763, prng.random(), true, 1_700_000_000);
 
     // platform(5)-group(5)-keyHi(3)-keyLo(6)-03-lang-build.0000-yday(3)year(4)
     try std.testing.expectEqualStrings("03612", pid[0..5]); // platform id for 17763
@@ -1061,7 +1210,7 @@ test "generateRandomPid random lang/build" {
     var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     var buf: [pid_buffer_size]u8 = undefined;
     // lang < 1 → random LCID; host_build 0 → random build.
-    const pid = generateRandomPid(&td.data, 0, &buf, 0, 0, prng.random(), true, 1_700_000_000);
+    const pid = try generateRandomPid(&td.data, 0, &buf, 0, 0, prng.random(), true, 1_700_000_000);
 
     // The middle is always "-03-" and the tail is ".0000-yday(3)year(4)".
     try std.testing.expect(std.mem.indexOf(u8, pid, "-03-") != null);
@@ -1206,18 +1355,42 @@ fn makeVariantData(allocator: std.mem.Allocator, release_date: i64) !kmsdata.Kms
     };
 }
 
-test "required_clients over 2000 rejected" {
+test "required_clients over 2000 rejected without u32 wrap" {
     const alloc = std.testing.allocator;
     var td = try loadTestData(alloc);
     defer td.deinit(alloc);
 
-    var cfg = ServerConfig{ .data = &td.data };
-    var base = makeBase(&td.data, 6 << 16);
-    base.n_policy = 1001; // required_clients = 2002 > 2000 — docs/migration.md §5
+    const Case = struct {
+        n_policy: u32,
+        hr: i32,
+        /// Expected `Response.Count` when `hr == hresult.ok`.
+        count: u32 = 0,
+    };
+    // docs/migration.md §5: required_clients = 2 * N_Policy must stay in
+    // [1, 2000]. A u32 wrap would turn 0x80000000 into 0 and 0x80000002 into
+    // 4, so these values must be rejected before the multiplication.
+    const cases = [_]Case{
+        .{ .n_policy = 0, .hr = hresult.ok, .count = 1 },
+        .{ .n_policy = 1, .hr = hresult.ok, .count = 2 },
+        .{ .n_policy = 1000, .hr = hresult.ok, .count = 2000 },
+        .{ .n_policy = 1001, .hr = hresult.invalid_arg },
+        .{ .n_policy = 0x7FFF_FFFF, .hr = hresult.invalid_arg },
+        .{ .n_policy = 0x8000_0000, .hr = hresult.invalid_arg },
+        .{ .n_policy = 0x8000_0002, .hr = hresult.invalid_arg },
+        .{ .n_policy = 0xFFFF_FFFF, .hr = hresult.invalid_arg },
+    };
 
+    var cfg = ServerConfig{ .data = &td.data };
     var prng: std.Random.DefaultPrng = .init(0);
-    var resp: Response = undefined;
-    try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+    for (cases) |case| {
+        var base = makeBase(&td.data, 6 << 16);
+        base.n_policy = case.n_policy;
+
+        var resp: Response = undefined;
+        const hr = createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000);
+        try std.testing.expectEqual(case.hr, hr);
+        if (case.hr == hresult.ok) try std.testing.expectEqual(case.count, resp.count);
+    }
 }
 
 test "client time off by more than 4 hours rejected" {
@@ -1296,8 +1469,78 @@ test "ePID date span zero or negative" {
     var prng: std.Random.DefaultPrng = .init(0);
     var out: [pid_buffer_size]u8 = undefined;
     // span <= 0 → take min_time directly, never `%0` (the C UB fix).
-    const pid = generateRandomPid(&data, 0, &out, 0, 0, prng.random(), true, now);
+    const pid = try generateRandomPid(&data, 0, &out, 0, 0, prng.random(), true, now);
     try std.testing.expect(pid.len > 0);
+}
+
+test "random host build selection is bounded and reports no match" {
+    const alloc = std.testing.allocator;
+    var data = try makeVariantData(alloc, 1_700_000_000);
+    defer data.deinit(alloc);
+
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
+    const rng = prng.random();
+
+    // The single variant build advertises NDR64; asking for the other
+    // capability must return null instead of retrying forever.
+    try std.testing.expect(hasHostBuildForNdr64(&data, true));
+    try std.testing.expect(!hasHostBuildForNdr64(&data, false));
+    try std.testing.expectEqual(@as(?usize, null), getRandomServerType(&data, rng, false));
+    try std.testing.expectEqual(@as(?i32, null), randomHostBuild(&data, rng, false));
+
+    var out: [pid_buffer_size]u8 = undefined;
+    try std.testing.expectError(error.NoHostBuild, generateRandomPid(&data, 0, &out, 0, 0, rng, false, 1_700_000_000));
+}
+
+test "generateRandomPid rejects invalid CSVLC data" {
+    const alloc = std.testing.allocator;
+    var data = try makeVariantData(alloc, 1_700_000_000);
+    defer data.deinit(alloc);
+
+    var prng: std.Random.DefaultPrng = .init(0);
+    var out: [pid_buffer_size]u8 = undefined;
+
+    data.csvlk[0].max_key_id = data.csvlk[0].min_key_id;
+    try std.testing.expectError(error.InvalidCsvlk, generateRandomPid(&data, 0, &out, 0, 17763, prng.random(), true, 1_700_000_000));
+}
+
+test "generateRandomPid clamps dates before the Unix epoch" {
+    const alloc = std.testing.allocator;
+    var data = try makeVariantData(alloc, -2_000_000_000);
+    defer data.deinit(alloc);
+
+    var prng: std.Random.DefaultPrng = .init(0xDEAD_BEEF);
+    var out: [pid_buffer_size]u8 = undefined;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        const pid = try generateRandomPid(&data, 0, &out, 1033, 17763, prng.random(), true, 1_700_000_000);
+        try std.testing.expect(pid.len > 0);
+    }
+}
+
+test "createResponseBase rejects malformed data indices" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = ServerConfig{ .data = &td.data };
+    var base = makeBase(&td.data, 6 << 16);
+    var prng: std.Random.DefaultPrng = .init(0);
+    var resp: Response = undefined;
+
+    const kms_item = td.data.app_count;
+    const original_epid = td.data.items[kms_item].epid_index;
+    td.data.items[kms_item].epid_index = 200;
+    try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+    td.data.items[kms_item].epid_index = original_epid;
+
+    td.data.items[kms_item].app_index = 200;
+    cfg.whitelisting_level = 1;
+    try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+    td.data.items[kms_item].app_index = 0;
+
+    td.data.app_count = td.data.items.len + 1;
+    try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
 }
 
 test "v4 request/response round-trip" {
@@ -1377,4 +1620,168 @@ test "v6 request/response round-trip" {
     try std.testing.expectEqual(cfg.hwid, hwid);
     try std.testing.expectEqual(base.version, resp.base.version);
     try std.testing.expect(guidEqual(&resp.base.cmid, &base.cmid));
+}
+
+test "a truncated v5/v6 response is rejected, never read past" {
+    // The peer picks the response size, so every path below must stop before
+    // slicing: below the Version field, not a whole AES block, a block whose
+    // padding is wrong, and a valid block that is still too short for the
+    // fixed ePID header.
+    var resp: ResponseV6 = undefined;
+    var request: RequestV6 = std.mem.zeroes(RequestV6);
+    var buf: [512]u8 = undefined;
+
+    for ([_]usize{ 0, 3, 4, 12, 20, 28, 36 }) |size| {
+        @memset(buf[0..size], 0);
+        if (size >= version_size) writeLe(u32, buf[0..size], 0, 6 << 16);
+        const result = decryptResponseV6(&resp, size, buf[0..size], &request, null);
+        try std.testing.expect(!result.decrypt_success);
+        try std.testing.expect(!result.ok());
+    }
+
+    // One block that decrypts to valid PKCS#7 padding but leaves no room for
+    // the ePID header.
+    {
+        var block: [20]u8 = @splat(0);
+        writeLe(u32, block[0..4], 0, 6 << 16);
+        // `len = 0` pads a whole block of 0x10, so the plaintext is exactly the
+        // padding a 16-byte body would need.
+        const written = crypto.aesCbcEncrypt(&crypto.aes_key_v6, null, block[4..4], block[4..20]);
+        try std.testing.expectEqual(@as(usize, 16), written);
+        const result = decryptResponseV6(&resp, block.len, &block, &request, null);
+        try std.testing.expect(!result.decrypt_success);
+    }
+}
+
+test "a truncated v4 response is rejected, never read past" {
+    var resp: ResponseV4 = undefined;
+    var request: RequestV4 = std.mem.zeroes(RequestV4);
+    var buf: [512]u8 = undefined;
+
+    // Shorter than the fixed fields, and a PIDSize that claims more than the
+    // payload holds.
+    for ([_]usize{ 0, 4, 8, 20, 40 }) |size| {
+        @memset(buf[0..size], 0);
+        const result = decryptResponseV4(&resp, size, buf[0..size], &request);
+        try std.testing.expect(!result.ok());
+    }
+
+    @memset(buf[0..64], 0);
+    writeLe(u32, buf[0..4], 0, 4 << 16);
+    writeLe(u32, buf[4..8], 0, 0xFFFF_FFFF);
+    const result = decryptResponseV4(&resp, 64, buf[0..64], &request);
+    try std.testing.expect(!result.ok());
+}
+
+test "a pinned LCID or build the generator cannot represent is rejected, not narrowed" {
+    // `ServerConfig.lcid` is u16 and `build` is u32, but the generator takes an
+    // i16/i32: a wider setting must answer with an HRESULT instead of trapping
+    // in `@intCast`. The CLI enforces the same bounds, so this is the library
+    // caller's path.
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var prng: std.Random.DefaultPrng = .init(0x1c1d);
+    const rng = prng.random();
+    const base = makeBase(&td.data, 6 << 16);
+    var resp: Response = undefined;
+
+    // A representative request that would otherwise be served.
+    {
+        var cfg = ServerConfig{ .data = &td.data };
+        cfg.randomization_level = 2;
+        try std.testing.expectEqual(hresult.ok, createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
+    }
+    {
+        var cfg = ServerConfig{ .data = &td.data };
+        cfg.randomization_level = 2;
+        cfg.lcid = max_lcid + 1;
+        try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
+    }
+    {
+        var cfg = ServerConfig{ .data = &td.data };
+        cfg.randomization_level = 2;
+        cfg.build = max_build + 1;
+        try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
+    }
+    // The documented maxima are still accepted.
+    {
+        var cfg = ServerConfig{ .data = &td.data };
+        cfg.randomization_level = 2;
+        cfg.lcid = max_lcid;
+        cfg.build = max_build;
+        try std.testing.expectEqual(hresult.ok, createResponseBase(&cfg, &base, &resp, rng, 1_700_000_000));
+    }
+}
+
+test "isValidHostBuild treats a negative build number as no match" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 17763), isValidHostBuild(&td.data, 17763));
+    try std.testing.expectEqual(@as(u32, 0), isValidHostBuild(&td.data, 0));
+
+    // `parse` rejects negative numbers, but a hand-built `KmsData` can hold one.
+    td.data.host_builds[0].build_number = -1;
+    try std.testing.expectEqual(@as(u32, 0), isValidHostBuild(&td.data, 0xFFFF_FFFF));
+}
+
+test "unixTimeToFileTime saturates instead of trapping" {
+    try std.testing.expectEqual(@as(u64, 0), unixTimeToFileTime(-filetime_epoch_offset - 1));
+    try std.testing.expectEqual(@as(u64, 0), unixTimeToFileTime(std.math.minInt(i64)));
+    // The epoch itself is the FILETIME offset, unchanged by the guard.
+    try std.testing.expectEqual(@as(u64, filetime_epoch_offset * ticks_per_second), unixTimeToFileTime(0));
+}
+
+test "a response larger than the reported size field is rejected" {
+    // `ResponseResult` reports the size as u16, so a longer payload must fail
+    // verification instead of trapping in the narrowing cast.
+    var resp: ResponseV6 = undefined;
+    var request: RequestV6 = std.mem.zeroes(RequestV6);
+    var buf: [70_000]u8 = undefined;
+    @memset(buf[0..], 0);
+    writeLe(u32, buf[0..], 0, 6 << 16);
+
+    const v6 = decryptResponseV6(&resp, buf.len, &buf, &request, null);
+    try std.testing.expect(!v6.decrypt_success);
+
+    var resp4: ResponseV4 = undefined;
+    var request4: RequestV4 = std.mem.zeroes(RequestV4);
+    const v4 = decryptResponseV4(&resp4, buf.len, &buf, &request4);
+    try std.testing.expect(!v4.ok());
+}
+
+test "initClientLists tolerates a list slice longer than the app table" {
+    // The slice lengths come from the caller; a longer list must not index past
+    // `data.apps()`.
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    const storage = try alloc.alloc(ClientList, td.data.app_count + 1);
+    defer alloc.free(storage);
+    var lists = ClientLists{ .lists = storage };
+    var prng: std.Random.DefaultPrng = .init(7);
+    initClientLists(&lists, &td.data, false, prng.random());
+
+    // Every app got its prefill; the extra slot stays empty.
+    try std.testing.expect(lists.lists[0].max_count == td.data.apps()[0].n_count_policy);
+    try std.testing.expectEqual(@as(usize, 0), lists.lists[td.data.app_count].max_count);
+}
+
+test "host-build lookups tolerate a data file with no host builds" {
+    // Both lookups fall back to an entry at the ends of the table; with an empty
+    // table that fallback would index out of bounds. `generateRandomPid` checks
+    // first, but these are public entry points of their own.
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+    const saved = td.data.host_builds;
+    td.data.host_builds = &.{};
+    defer td.data.host_builds = saved;
+
+    try std.testing.expectEqual(@as(i32, 0), getPlatformId(&td.data, 17763));
+    try std.testing.expectEqual(@as(i64, 0), getReleaseDate(&td.data, 17763));
 }

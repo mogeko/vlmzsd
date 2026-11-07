@@ -286,6 +286,10 @@ pub fn Queue(comptime T: type, comptime capacity: usize) type {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 const testing = std.testing;
 
 /// Small ring: its two laps are enough to expose an off-by-one in the sequence
