@@ -323,9 +323,11 @@ pub fn dispatchKmsRequest(
 ) !DispatchResult {
     if (request_body.len < request32_fixed_size) return error.InvalidRequest;
 
+    // An unnegotiated context is `invalid_ctx` (0xFFFF), which a request may
+    // legitimately carry as its id: it must not match by coincidence.
     const context_id = readLe(u16, request_body, 4);
-    const is_ndr64 = context_id == negotiation.ndr64_ctx;
-    const is_ndr32 = context_id == negotiation.ndr_ctx;
+    const is_ndr64 = negotiation.ndr64_ctx != invalid_ctx and context_id == negotiation.ndr64_ctx;
+    const is_ndr32 = negotiation.ndr_ctx != invalid_ctx and context_id == negotiation.ndr_ctx;
     if (!is_ndr32 and !is_ndr64) return .{ .kind = .{ .fault = nca_unk_if } };
 
     const data_offset: usize = if (is_ndr64) request64_fixed_size else request32_fixed_size;
@@ -340,15 +342,16 @@ pub fn dispatchKmsRequest(
     var response_size: i32 = e_invalid_arg;
     var major_ver: u16 = 0;
 
-    // Mirror `checkRpcRequestSize` (rpc.c): only KMS v4.0/v5.0/v6.0 are
-    // supported. `major_index` wraps for major < 4 exactly like the C
-    // `uint16_t` arithmetic, so the `<= 2` test rejects those too.
+    // Only KMS v4.0/v5.0/v6.0 are supported (C `checkRpcRequestSize`). The
+    // reference subtracts 4 in 16-bit arithmetic and rejects the wrapped index
+    // (`majorIndex >= countof(_Versions)`); the same subtraction in Zig traps
+    // on underflow, so the range is compared directly instead.
     if (request_body.len >= data_offset + 4) {
         const version = readLe(u32, request_body, data_offset);
-        const major_index: u32 = (version >> 16) - 4;
+        const major = version >> 16;
         const minor: u32 = version & 0xffff;
-        if (major_index <= 2 and minor == 0) {
-            major_ver = @intCast(version >> 16);
+        if (major >= 4 and major <= 6 and minor == 0) {
+            major_ver = @intCast(major);
             const kms_request_size: usize = if (major_ver == 4) kms_request_v4_size else kms_request_v6_size;
             if (request_body.len >= data_offset + kms_request_size) {
                 if (major_ver == 4) {
@@ -596,6 +599,9 @@ pub fn parseKmsResponse(response_body: []const u8, use_ndr64: bool) KmsResponseP
     const data_size_max = readLe(u32, response_body, 12);
     const response_size: usize = data_length;
     if (data_size_max == 0) {
+        // A rejected body carries the status where `DataSizeIs` would be; a
+        // short body has no status to read, so it cannot report success.
+        if (response_body.len < 20) return .{ .data = "", .status = nca_proto_error };
         return .{ .data = "", .status = readLe(i32, response_body, 16) };
     }
     if (response_body.len < data_offset + response_size + 4) return .{ .data = "", .status = nca_proto_error };
@@ -813,6 +819,43 @@ test "dispatch unsupported KMS version returns HRESULT" {
     }
 }
 
+test "dispatch rejects every unsupported major version without trapping" {
+    // Pin the rejection contract for every major outside 4..6: a RESPONSE with
+    // 0x8007000D and no payload, never a trap. `major - 4` in unsigned
+    // arithmetic traps on underflow, so the values below 4 are the ones that
+    // need the range compared instead of the difference.
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = kms.ServerConfig{ .data = &td.data };
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
+    const rng = prng.random();
+    var negotiation = BindNegotiation{ .ndr_ctx = 0, .ndr64_ctx = 1 };
+    const e_invalid_arg: i32 = @bitCast(@as(u32, 0x8007000D));
+
+    for ([_]u32{ 0, 1, 2, 3, 7, 0x7FFF, 0xFFFF }) |major| {
+        var base = makeBase(&td.data);
+        base.version = major << 16;
+        var request_v6: kms.RequestV6 = undefined;
+        kms.createRequestV6(&request_v6, &base, rng);
+
+        const rpc_request = try wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), false, 2);
+        defer alloc.free(rpc_request);
+        const dispatch = try dispatchKmsRequest(alloc, rpc_request[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
+        const resp_body = switch (dispatch.kind) {
+            .fault => return error.TestUnexpectedResult,
+            .response => |body| body,
+        };
+        defer alloc.free(resp_body);
+        const parsed = parseKmsResponse(resp_body, false);
+        try std.testing.expectEqual(e_invalid_arg, parsed.status);
+        try std.testing.expectEqual(@as(usize, 0), parsed.data.len);
+        // The version is reported as 0 for an unparseable request.
+        try std.testing.expectEqual(@as(u16, 0), dispatch.major_version);
+    }
+}
+
 test "rejected response wire bytes (NDR64)" {
     const alloc = std.testing.allocator;
     var td = try loadTestData(alloc);
@@ -956,6 +999,26 @@ test "unknown context returns FAULT" {
         .fault => |nca| try std.testing.expectEqual(nca_unk_if, nca),
         .response => return error.TestUnexpectedResult,
     }
+
+    // `invalid_ctx` means "nothing negotiated under this id", so a request that
+    // uses 0xFFFF itself must not be dispatched as NDR64 when only NDR32 was
+    // bound: `BindNegotiation` leaves the other id at `invalid_ctx`.
+    var ndr32_only = BindNegotiation{};
+    ndr32_only.ndr_ctx = 0;
+    std.mem.writeInt(u16, body[4..6], invalid_ctx, .little);
+    const unnegotiated = try dispatchKmsRequest(alloc, &body, &ndr32_only, &cfg, prng.random(), 1_700_000_000);
+    switch (unnegotiated.kind) {
+        .fault => |nca| try std.testing.expectEqual(nca_unk_if, nca),
+        .response => return error.TestUnexpectedResult,
+    }
+
+    // With nothing negotiated at all, every context id is unknown.
+    const nothing = BindNegotiation{};
+    const none = try dispatchKmsRequest(alloc, &body, &nothing, &cfg, prng.random(), 1_700_000_000);
+    switch (none.kind) {
+        .fault => |nca| try std.testing.expectEqual(nca_unk_if, nca),
+        .response => return error.TestUnexpectedResult,
+    }
 }
 
 test "BTFN bind negotiation round-trip" {
@@ -1008,4 +1071,30 @@ test "BTFN declined when disabled" {
     try std.testing.expect(result.has_ndr32);
     try std.testing.expect(!result.has_ndr64);
     try std.testing.expect(!result.has_btfn);
+}
+
+test "parseKmsResponse treats a short body as a protocol error" {
+    // A peer can answer with fewer bytes than the fixed fields. A short body
+    // must not report success: the status field it would be read from is
+    // absent, and an empty payload must not reach the decrypt step.
+    var buf: [32]u8 = undefined;
+
+    for ([_]usize{ 0, 4, 8, 12, 16, 19 }) |size| {
+        @memset(buf[0..size], 0);
+        const ndr32 = parseKmsResponse(buf[0..size], false);
+        try std.testing.expectEqual(@as(usize, 0), ndr32.data.len);
+        try std.testing.expectEqual(@as(i32, @bitCast(nca_proto_error)), ndr32.status);
+
+        const ndr64 = parseKmsResponse(buf[0..size], true);
+        try std.testing.expectEqual(@as(usize, 0), ndr64.data.len);
+        try std.testing.expectEqual(@as(i32, @bitCast(nca_proto_error)), ndr64.status);
+    }
+
+    // A DataLength that points past the body is the same kind of lie.
+    @memset(buf[0..32], 0);
+    std.mem.writeInt(u32, buf[8..12], 1000, .little);
+    std.mem.writeInt(u32, buf[12..16], 0x0002_0000, .little);
+    const oversize = parseKmsResponse(buf[0..32], false);
+    try std.testing.expectEqual(@as(usize, 0), oversize.data.len);
+    try std.testing.expectEqual(@as(i32, @bitCast(nca_proto_error)), oversize.status);
 }

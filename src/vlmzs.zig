@@ -251,7 +251,7 @@ const vlmzs_opts = [_]cli_helper.Opt{
     .{ .name = "kms-id", .kind = .guid, .group = "Request", .desc = "Override KMSID (GUID)" },
     .{ .name = "cmid", .short = 'c', .kind = .guid, .group = "Request", .desc = "Client machine ID (GUID, default random)" },
     .{ .name = "prev-cmid", .short = 'o', .kind = .guid, .group = "Request", .desc = "Previous client machine ID (GUID)" },
-    .{ .name = "workstation", .short = 'w', .kind = .str, .hint = "name", .group = "Request", .desc = "Workstation name" },
+    .{ .name = "workstation", .short = 'w', .kind = .str, .hint = "name", .group = "Request", .desc = "Workstation name (UTF-8, sent as UTF-16)" },
     .{ .name = "vm", .short = 'm', .group = "Request", .desc = "Present as a virtual machine" },
     .{ .name = "count", .short = 'n', .kind = .int, .hint = "u32", .group = "Request", .desc = "Number of requests (default 1)" },
     .{ .name = "virtual-clients", .short = 'r', .kind = .int, .hint = "u32", .group = "Request", .desc = "NCountPolicy override" },

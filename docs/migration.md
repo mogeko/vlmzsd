@@ -172,6 +172,11 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
   `keyId ∈ [MinKeyId, MaxKeyId)`; the `hostBuild` `UseNdr64` flag must match the negotiated syntax;
   date `min = max(ReleaseDate, HostBuildReleaseDate)`, `max = max(now, BUILD_TIME)`, `span<=0` takes `min` (fixes C's `%0` UB);
   the LCID list (`lcid_list`, 158 entries) keeps the C `LcidList` order.
+- **Client decrypt** (`decryptResponseV4/V6`): the payload must hold the fixed fields before anything is sliced —
+  v4: version, PIDSize and the trailing fields; v5/v6: the unencrypted Version plus a whole number of AES blocks
+  whose PKCS#7 padding is 1..16 and uniform — and the PIDSize-derived slice must fit inside it. Every check reports
+  through `ResponseResult` (`decrypt_success`, `pid_length_ok`, …, aggregated by `ok()`); nothing is read past the
+  payload and no check panics.
 - **Client list** (`--maintain-clients`): `ClientList{guids[671], current_count, max_count, current_position}`;
   ring buffer + oldest-entry eviction; `max_count` capped at `min(required, 671)` (avoids the C out-of-bounds).
 
@@ -191,10 +196,16 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
   - context mismatch → **FAULT** `nca_unk_if` (`AllocHint=32`, `Error.Code@8`, `CallId=2`).
   - too-short request / major outside 4..6 / minor != 0 → **RESPONSE** + `0x8007000D` (`DataSizeMax=DataLength=0`,
     status in the `DataSizeIs` slot: NDR32@16 / NDR64@24), **not** a FAULT and **not** a disconnect.
+  - the supported-major test compares the range directly (`major >= 4 and major <= 6`) and never subtracts 4 and
+    tests the difference: that difference is unsigned, so a major below 4 traps on underflow instead of being
+    rejected. C arrives at the same outcome through 16-bit arithmetic, where `major - 4` wraps and
+    `majorIndex >= countof(_Versions)` fails.
 - **Response assembly**: success writes `DataLength/DataSizeMax/DataSizeIs` + data + trailing 4-byte return code;
   rejection writes only `DataLength=0/DataSizeMax=0`, return code right after (NDR64 body 28 bytes).
-- **Client parsing** (`parseKmsResponse`): `DataSizeMax==0` is treated as rejection, status read from the
-  `DataSizeIs` slot; success reads the status at `data_offset + data_length`.
+- **Client parsing** (`parseKmsResponse`): `DataSizeMax==0` is treated as rejection, with the status read from the
+  `DataSizeIs` slot; success reads the status at `data_offset + data_length`. A body too short for the field being
+  read, or a `DataLength` that points past the body, is reported as `nca_proto_error` — never as a successful
+  response with no payload.
 
 ### 4.3 `src/crypto.zig` (← `crypto.c` / `crypto_internal.c`)
 
@@ -250,6 +261,8 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 | CLI numeric range checks | **Intentional hardening** | C casts option values into narrower fields without checking, so an out-of-range value silently wraps. Zig rejects `--lcid` above 32767, `--build` above 65535, and durations that do not fit the seconds/minutes field, and reports a configuration error instead of truncating. |
 | Comma-separated env lists | **Intentional hardening** | C has no environment-variable layer. Zig splits `VLMZSD_LISTEN`/`VLMZSD_EPID` on commas, skips empty segments, and treats a value with no non-empty segment as unset, so the default applies. |
 | Per-request clock | **C defect fix** | C reads the wall clock once per connection (`GetTime` in `rpcServer`), so every request on a keep-alive connection is compared against the accept time; a connection held open for hours then fails the `--check-client-time` window and generates level-2 ePIDs dated from the wrong moment. Zig samples the clock before each REQUEST. |
+| Client response validation | **Intentional hardening** | `kms.decryptResponseV4/V6` reject a payload shorter than the fixed fields and, for v5/v6, one whose encrypted part is not a whole AES block or whose padding is not 1..16 and uniform; `rpc.parseKmsResponse` reports `nca_proto_error` for a body too short to hold its status field. A response from a broken or hostile server therefore ends as a verification failure — `vlmzs` prints the reason and exits 1 — with no read past the payload. C indexes the response without those checks. |
+| Unnegotiated context id `0xFFFF` | **C defect fix** | `invalid_ctx` (0xFFFF) is also the id a request may carry. C compares the request's context id against its stored ids without excluding the sentinel, so `0xFFFF` matches an unnegotiated NDR64 context and the request is parsed with the wrong layout. Zig requires the negotiated id to differ from `invalid_ctx`, so such a request gets the documented FAULT `nca_unk_if`. |
 | Very short request (< 16-byte body) | **Known deviation** | C over-reads `ContextId` and usually replies FAULT; Zig disconnects. Real KMS requests are ≥ 268 bytes, unreachable. |
 | Concurrency limit | **Intentional design** | C bounds concurrent work with a `MaxTaskSemaphore`; Zig checks an atomic in-flight gate (`InFlight`) *before* `accept`, so connections over `--max-clients` (default 1024) stay in the kernel backlog — queued rather than accepted into a blocked worker, and reset once the backlog overflows. Process thread count follows the peak of concurrent connections, never the current count. |
 | Log delivery | **Intentional design** | C writes every line from the worker thread, so a slow consumer stalls that worker; Zig keeps the format and levels but delivers through a bounded, **lossy** queue drained by a writer task, so under load lines can be **dropped** (counted and reported on stderr: a per-period delta when the writer goes idle, the run's total at shutdown). The C log options (`-l`, `-T0`/`-T1`, `-e`) are dropped — §8. |
@@ -259,23 +272,38 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 
 ## 6. Verification
 
-- **Unit tests** (`zig build test --summary all` → all pass) for the migrated protocol behavior:
-  - `kms.zig`: struct layout pinned by comptime asserts (enforced by any build); v4/v5/v6 request→response→decrypt round-trips; ePID format; client list insert/evict.
-  - `rpc.zig`: BIND negotiation (NDR32/NDR64/BTFN); request wrap (NDR32/NDR64); dispatch end-to-end; invalid-version HRESULT.
-  - `crypto.zig`: v4 CMAC / v5 / v6 encryption / CBC / HMAC-SHA256 golden vectors.
-  - `kmsdata.zig`: `.kmd` parsing field asserts.
-  - `network.zig`: private-IP classification.
-- **Golden vectors**: hard-coded hex constants in `src/crypto.zig` tests, derived from the upstream C `dump_vectors`.
-- **End-to-end (manual)**: `vlmzs` ↔ `vlmzsd` for v4/v5/v6 over NDR32 and NDR64, including
-  invalid-version rejection. Not part of `zig build test`.
-- **Real client**: final acceptance should be against a real Windows KMS client or packet capture (below).
+- **Unit tests** (`zig build test --summary all` → all pass) cover the protocol contract above:
+  - `kms.zig` — struct layout (comptime asserts, enforced by every build); v4/v5/v6
+    request→response→decrypt round-trips; ePID format, LCID/build selection, date clamping;
+    strict-mode rejections (N_Policy bounds, client time, whitelist, full client list);
+    malformed-data indices; truncated-response guards.
+  - `rpc.zig` — BIND negotiation (NDR32/NDR64/BTFN); request wrap (NDR32/NDR64); dispatch
+    end-to-end; every unsupported major version and non-zero minor → `0x8007000D`; oversized
+    N_Policy; too-short request; unknown and unnegotiated context ids → FAULT; short response
+    bodies.
+  - `crypto.zig` — v4 CMAC / v5 / v6 encryption / CBC / HMAC-SHA256 golden vectors.
+  - `kmsdata.zig` — embedded-data parse, header fields, write round-trip, and rejection of
+    malformed containers and illegal record fields.
+  - `network.zig` — the transport half of §4.2: `serveRpc` end to end (BIND/ALTER-CONTEXT,
+    NDR32/NDR64, disconnect-per-request, per-request clock), private-IP classification, and the
+    read deadline, cancelation, split-packet, and peer-close paths. It is internal to the
+    binaries, but the behavior it pins is the wire contract of §4.2.
+- **Golden vectors**: hard-coded hex constants in the `src/crypto.zig` tests, derived from the
+  upstream C `dump_vectors`.
+- **End-to-end (manual)**: `vlmzs` ↔ `vlmzsd` across v4/v5/v6 × NDR32/NDR64, the randomization
+  levels, strict modes, `--disconnect-per-request`, and the malformed-request paths. Not part of
+  `zig build test`.
+- **Real client**: final acceptance is against a real Windows KMS client or packet capture
+  (below).
 
 ## 7. Suggested final acceptance
 
 1. Byte-level round-trip against a real Windows KMS client (or Wine + capture) for v4/v5/v6, NDR32/NDR64.
 2. Diff `CurrentCount` and eviction behavior under `--maintain-clients`.
 3. Diff BIND (including NDR64 + BTFN) negotiation byte order.
-4. Diff error-path (invalid version / short request) response bytes (already aligned with C behavior; recommended to lock with golden vectors).
+4. Diff error-path response bytes (unsupported version, short request, unknown context) against a capture. The
+   expected shapes are stated in §4.1/§4.2 and already pinned by `src/rpc.zig` tests; what remains is a diff
+   against a real exchange.
 
 ## 8. CLI surface changes
 
@@ -310,6 +338,7 @@ migration surface. They will be added when DNS SRV is implemented:
 ## 9. Notes
 
 - The upstream C source ([Wind4/vlmcsd@svn1113](https://github.com/Wind4/vlmcsd/tree/svn1113)) is no longer vendored; it remains a historical reference only.
-- Build uses `build.zig` only; two executables: `vlmzsd` (server) and `vlmzs` (client).
+- Build uses `build.zig` only; three executables: `vlmzsd` (server), `vlmzs` (client), and `kmdconv` (the
+  `.kmd` ↔ JSON developer tool, [`docs/kmdconv.md`](./kmdconv.md)).
 - The migration favors "idiomatic Zig" over transliteration: `std.crypto` / `std.net` / `std.Io` / `std.unicode` / `std.mem` first;
   `shared_globals.c` global state is replaced by explicit context/allocator/RNG passing.

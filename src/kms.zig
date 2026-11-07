@@ -923,10 +923,21 @@ pub fn decryptResponseV4(
     var result = ResponseResult{};
     result.effective_response_size = @intCast(response_size);
 
+    // The peer chooses the size: refuse anything shorter than the fixed fields
+    // plus a one-unit ePID rather than reading past the payload.
+    if (response_size < v4_pre_epid_size + v4_post_epid_size or response_size > response.len) {
+        result.decrypt_success = false;
+        return result;
+    }
+
     const pid_size_raw = readLe(u32, response, 4);
     const pid_size: usize = @min(pid_size_raw, pid_buffer_size * 2);
     const copy_size = v4_pre_epid_size + pid_size;
     const message_size = copy_size + v4_post_epid_size;
+    if (response_size < copy_size) {
+        result.decrypt_success = false;
+        return result;
+    }
 
     @memcpy(std.mem.asBytes(out)[0..copy_size], response[0..copy_size]);
     @memcpy(std.mem.asBytes(out)[cmid_offset..][0 .. response_size - copy_size], response[copy_size..]);
@@ -993,6 +1004,16 @@ pub fn decryptResponseV6(
     var result = ResponseResult{};
     result.effective_response_size = @intCast(response_size);
 
+    // The peer chooses the size: the payload must hold the unencrypted Version
+    // field and a whole number of AES blocks after it (CBC with PKCS#7).
+    if (response_size < version_size + 16 or
+        response_size > response.len or
+        (response_size - version_size) % 16 != 0)
+    {
+        result.decrypt_success = false;
+        return result;
+    }
+
     const is_v6 = majorVersion(readLe(u32, response, 0)) > 5;
     const key: []const u8 = if (is_v6) &crypto.aes_key_v6 else &crypto.aes_key_v5;
 
@@ -1012,14 +1033,26 @@ pub fn decryptResponseV6(
         }
     }
 
+    // The decrypted payload must still hold the fixed header and the trailing
+    // fields around the ePID; a peer can send any size it likes.
+    if (response_size < v6_pre_epid_size) {
+        result.decrypt_success = false;
+        return result;
+    }
+
     const pid_size_raw = readLe(u32, response, 24);
     const pid_size: usize = @min(pid_size_raw, pid_buffer_size * 2);
 
     const copy_size1 = v6_pre_epid_size + pid_size;
+    const copy_size2: usize = if (is_v6) v6_post_epid_size else v5_post_epid_size;
+    if (response_size < copy_size1 + copy_size2) {
+        result.decrypt_success = false;
+        return result;
+    }
+
     @memcpy(std.mem.asBytes(out)[0..copy_size1], response[0..copy_size1]);
     out.base.kms_pid[pid_buffer_size - 1] = 0;
 
-    const copy_size2: usize = if (is_v6) v6_post_epid_size else v5_post_epid_size;
     @memcpy(
         std.mem.asBytes(out)[response_base_offset + cmid_offset ..][0..copy_size2],
         response[copy_size1..][0..copy_size2],
@@ -1523,4 +1556,55 @@ test "v6 request/response round-trip" {
     try std.testing.expectEqual(cfg.hwid, hwid);
     try std.testing.expectEqual(base.version, resp.base.version);
     try std.testing.expect(guidEqual(&resp.base.cmid, &base.cmid));
+}
+
+test "a truncated v5/v6 response is rejected, never read past" {
+    // The peer picks the response size, so every path below must stop before
+    // slicing: below the Version field, not a whole AES block, a block whose
+    // padding is wrong, and a valid block that is still too short for the
+    // fixed ePID header.
+    var resp: ResponseV6 = undefined;
+    var request: RequestV6 = std.mem.zeroes(RequestV6);
+    var buf: [512]u8 = undefined;
+
+    for ([_]usize{ 0, 3, 4, 12, 20, 28, 36 }) |size| {
+        @memset(buf[0..size], 0);
+        if (size >= version_size) writeLe(u32, buf[0..size], 0, 6 << 16);
+        const result = decryptResponseV6(&resp, size, buf[0..size], &request, null);
+        try std.testing.expect(!result.decrypt_success);
+        try std.testing.expect(!result.ok());
+    }
+
+    // One block that decrypts to valid PKCS#7 padding but leaves no room for
+    // the ePID header.
+    {
+        var block: [20]u8 = @splat(0);
+        writeLe(u32, block[0..4], 0, 6 << 16);
+        // `len = 0` pads a whole block of 0x10, so the plaintext is exactly the
+        // padding a 16-byte body would need.
+        const written = crypto.aesCbcEncrypt(&crypto.aes_key_v6, true, null, block[4..20], 0);
+        try std.testing.expectEqual(@as(usize, 16), written);
+        const result = decryptResponseV6(&resp, block.len, &block, &request, null);
+        try std.testing.expect(!result.decrypt_success);
+    }
+}
+
+test "a truncated v4 response is rejected, never read past" {
+    var resp: ResponseV4 = undefined;
+    var request: RequestV4 = std.mem.zeroes(RequestV4);
+    var buf: [512]u8 = undefined;
+
+    // Shorter than the fixed fields, and a PIDSize that claims more than the
+    // payload holds.
+    for ([_]usize{ 0, 4, 8, 20, 40 }) |size| {
+        @memset(buf[0..size], 0);
+        const result = decryptResponseV4(&resp, size, buf[0..size], &request);
+        try std.testing.expect(!result.ok());
+    }
+
+    @memset(buf[0..64], 0);
+    writeLe(u32, buf[0..4], 0, 4 << 16);
+    writeLe(u32, buf[4..8], 0, 0xFFFF_FFFF);
+    const result = decryptResponseV4(&resp, 64, buf[0..64], &request);
+    try std.testing.expect(!result.ok());
 }
