@@ -125,6 +125,10 @@ array and runs to the end of the file. Strings are NUL-terminated C strings
 
 ## 8. Legality constraints
 
+Strings are NUL-terminated, so a name or ePID must not contain a NUL of its own:
+the reader stops at the first one, and a writer that is handed such a string
+round-trips it truncated.
+
 The parser (`kmsdata.parse`) rejects a file with `error.InvalidFormat` when any
 of these hold:
 

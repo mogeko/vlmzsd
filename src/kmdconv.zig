@@ -586,3 +586,29 @@ test "the default output path keeps the stem and swaps the suffix" {
         try std.testing.expectEqualStrings(case.want, got);
     }
 }
+
+test "a name with an interior NUL does not survive a round-trip" {
+    // The format is a NUL-terminated string pool, so a name carrying a NUL is
+    // truncated on the way back in. `write` cannot represent it; the converter
+    // must either reject it or the caller must not be surprised. Pin which.
+    const gpa = std.testing.allocator;
+    const raw: []const u8 = @embedFile("vlmcsd.kmd");
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+
+    const data = try kmsdata.parse(arena.allocator(), raw);
+    const json = try kmsDataToJson(&data, gpa);
+    defer gpa.free(json);
+
+    var converted = try jsonToKmsData(arena.allocator(), json);
+    // Inject an interior NUL into the first product name.
+    const name = try arena.allocator().dupe(u8, "AB\x00CD");
+    converted.items[converted.app_count].name = name;
+
+    const bytes = try kmsdata.write(gpa, &converted);
+    defer gpa.free(bytes);
+    var reparsed = try kmsdata.parse(gpa, bytes);
+    defer reparsed.deinit(gpa);
+    try std.testing.expectEqualStrings("AB", reparsed.items[converted.app_count].name);
+}

@@ -265,7 +265,7 @@ pub fn serveRpc(
 
             if (action == 0) {
                 if (options.on_event) |cb| {
-                    cb(options.event_context, .{ .bind_negotiated = negotiation.ndr64_ctx != rpc.invalid_ctx });
+                    cb(options.event_context, .{ .bind_negotiated = negotiation.hasNdr64() });
                 }
             }
 

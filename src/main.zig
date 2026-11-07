@@ -324,6 +324,12 @@ fn buildEpidOverrides(
         };
         const name = entry[0..eq];
         const epid = entry[eq + 1 ..];
+        if (epid.len == 0) {
+            // An empty ePID would be answered to clients as a blank product
+            // key; it is a malformed entry, not an override.
+            log.warn("ignoring --epid with an empty ePID: {s}", .{name});
+            continue;
+        }
         const idx = findCsvlkByName(data, name) orelse {
             log.warn("ignoring --epid for unknown CSVLC name: {s}", .{name});
             continue;
@@ -1582,4 +1588,35 @@ test "level-1 ePIDs share one LCID and one host build" {
         }
     }
     try std.testing.expect(shared_lcid.?.len > 0);
+}
+
+test "an --epid entry with an empty ePID is ignored" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var data = try kmsdata.parse(gpa, @embedFile("vlmcsd.kmd"));
+    defer data.deinit(gpa);
+
+    var out_buf: [512]u8 = undefined;
+    var err_buf: [512]u8 = undefined;
+    var log = try cli_helper.Logger.init(gpa, io, &out_buf, &err_buf);
+    defer log.deinit(gpa);
+
+    var opts = ServerOptions{};
+    opts.randomize = 0;
+    opts.epids = &.{ "Windows=", "Windows=03612-00000-000-000000-03-1033-19045.0000-0002023" };
+
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    const overrides = try buildEpidOverrides(gpa, &data, &opts, prng.random(), 1_700_000_000, &log);
+    defer {
+        for (overrides) |slot| if (slot) |s| gpa.free(s);
+        gpa.free(overrides);
+    }
+
+    // The empty value is skipped, so the later entry survives instead of being
+    // replaced by a blank product key.
+    try std.testing.expectEqualStrings(
+        "03612-00000-000-000000-03-1033-19045.0000-0002023",
+        overrides[0].?,
+    );
 }

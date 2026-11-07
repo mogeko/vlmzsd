@@ -187,6 +187,21 @@ pub const BindResponseOptions = struct {
 pub const BindNegotiation = struct {
     ndr_ctx: u16 = invalid_ctx,
     ndr64_ctx: u16 = invalid_ctx,
+    /// Whether the client actually proposed each syntax. The id alone cannot
+    /// say: `invalid_ctx` (0xFFFF) is a legal value for the client to choose,
+    /// so "no id" and "id 0xFFFF" are only distinguishable here.
+    ndr32_negotiated: bool = false,
+    ndr64_negotiated: bool = false,
+
+    /// True when NDR32 carried by a request is the negotiated one.
+    pub fn hasNdr32(self: BindNegotiation) bool {
+        return self.ndr32_negotiated or self.ndr_ctx != invalid_ctx;
+    }
+
+    /// True when NDR64 carried by a request is the negotiated one.
+    pub fn hasNdr64(self: BindNegotiation) bool {
+        return self.ndr64_negotiated or self.ndr64_ctx != invalid_ctx;
+    }
 };
 
 /// Build a BIND/ALTER-CONTEXT response body (no RPC header).
@@ -213,10 +228,12 @@ pub fn buildBindResponse(
         const transfer_syntax = request_body[base + 24 .. base + 40];
         if (std.mem.eql(u8, transfer_syntax, &transfer_syntax_ndr32)) {
             negotiation.ndr_ctx = context_id;
+            negotiation.ndr32_negotiated = true;
         }
         if (options.use_ndr64 and std.mem.eql(u8, transfer_syntax, &transfer_syntax_ndr64)) {
             ndr64_possible = true;
             negotiation.ndr64_ctx = context_id;
+            negotiation.ndr64_negotiated = true;
         }
     }
 
@@ -323,11 +340,12 @@ pub fn dispatchKmsRequest(
 ) !DispatchResult {
     if (request_body.len < request32_fixed_size) return error.InvalidRequest;
 
-    // An unnegotiated context is `invalid_ctx` (0xFFFF), which a request may
-    // legitimately carry as its id: it must not match by coincidence.
+    // An unnegotiated context must not match by coincidence: `invalid_ctx`
+    // (0xFFFF) is also a legal id for the client to have proposed, so validity
+    // is tracked separately from the id value.
     const context_id = readLe(u16, request_body, 4);
-    const is_ndr64 = negotiation.ndr64_ctx != invalid_ctx and context_id == negotiation.ndr64_ctx;
-    const is_ndr32 = negotiation.ndr_ctx != invalid_ctx and context_id == negotiation.ndr_ctx;
+    const is_ndr64 = negotiation.hasNdr64() and context_id == negotiation.ndr64_ctx;
+    const is_ndr32 = negotiation.hasNdr32() and context_id == negotiation.ndr_ctx;
     if (!is_ndr32 and !is_ndr64) return .{ .kind = .{ .fault = nca_unk_if } };
 
     const data_offset: usize = if (is_ndr64) request64_fixed_size else request32_fixed_size;
@@ -1143,4 +1161,47 @@ test "wrapKmsRequest rejects a request that does not fit the 16-bit fragment len
     @memset(too_big, 0);
     try std.testing.expectError(error.PacketTooLarge, wrapKmsRequest(alloc, too_big, false, 2));
     try std.testing.expectError(error.PacketTooLarge, wrapKmsRequest(alloc, too_big, true, 2));
+}
+
+test "a client may negotiate any 16-bit context id, including the sentinel" {
+    // `invalid_ctx` (0xFFFF) is a value the client may legitimately propose. The
+    // negotiation must remember that the id *was* negotiated, so the sentinel
+    // cannot be used as "nothing negotiated" without also tracking validity.
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    const bind_packet = try buildBindRequest(alloc, packet_type.bind_req, 2, .{ .use_ndr64 = false });
+    defer alloc.free(bind_packet);
+    const bind_body = try alloc.dupe(u8, bind_packet[header_size..]);
+    defer alloc.free(bind_body);
+    // Move the single NDR32 CtxItem to the sentinel id.
+    std.mem.writeInt(u16, bind_body[bind_request_fixed_size..][0..2], invalid_ctx, .little);
+
+    var negotiation = BindNegotiation{};
+    const ack = try buildBindResponse(alloc, bind_body, 7, .{ .use_ndr64 = false }, &negotiation);
+    defer alloc.free(ack);
+    try std.testing.expectEqual(invalid_ctx, negotiation.ndr_ctx);
+
+    var cfg = kms.ServerConfig{ .data = &td.data };
+    var prng: std.Random.DefaultPrng = .init(0x0c0f_fee1);
+    const rng = prng.random();
+    var request_v6: kms.RequestV6 = undefined;
+    kms.createRequestV6(&request_v6, &makeBase(&td.data), rng);
+    const wrapped = try wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), false, 3);
+    defer alloc.free(wrapped);
+    std.mem.writeInt(u16, wrapped[header_size + 4 ..][0..2], invalid_ctx, .little);
+
+    const dispatch = try dispatchKmsRequest(alloc, wrapped[header_size..], &negotiation, &cfg, rng, 1_700_000_000);
+    switch (dispatch.kind) {
+        .fault => |nca| {
+            std.debug.print("negotiated ctx 0xFFFF was rejected with FAULT 0x{X:0>8}\n", .{nca});
+            return error.TestUnexpectedResult;
+        },
+        .response => |body| {
+            defer alloc.free(body);
+            const parsed = parseKmsResponse(body, false);
+            try std.testing.expectEqual(@as(i32, 0), parsed.status);
+        },
+    }
 }

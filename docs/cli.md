@@ -82,7 +82,8 @@ equal to the GUIDs stored in the `.kmd` data.
 `--epid <name>=<epid>`, where `<name>` is a CSVLC name from the `.kmd` data
 (e.g. `Windows`, `Office2013`) and `<epid>` is the 20-byte ePID string.
 Repeatable; comma-separated in the environment variable. A repeated `<name>`
-keeps its last ePID.
+keeps its last ePID. An entry without `=` or with an empty ePID is ignored with
+a warning, as is a name that no CSVLC in the data has.
 
 ## 5. Server (`vlmzsd`) options
 

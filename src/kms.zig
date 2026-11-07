@@ -590,9 +590,12 @@ pub fn initClientLists(
     rng: std.Random,
 ) void {
     const apps = data.apps();
+    // The caller owns the slice; one longer than the app table leaves the extra
+    // slots empty instead of indexing past `apps`.
+    const initialized = @min(lists.lists.len, apps.len);
     for (lists.lists, 0..) |*cl, i| {
         cl.* = std.mem.zeroes(ClientList);
-        if (start_empty) continue;
+        if (start_empty or i >= initialized) continue;
         const max_count: usize = apps[i].n_count_policy;
         const half: usize = max_count >> 1;
         const prefill: usize = if (half > 0) half - 1 else 0;
@@ -1727,4 +1730,22 @@ test "a response larger than the reported size field is rejected" {
     var request4: RequestV4 = std.mem.zeroes(RequestV4);
     const v4 = decryptResponseV4(&resp4, buf.len, &buf, &request4);
     try std.testing.expect(!v4.ok());
+}
+
+test "initClientLists tolerates a list slice longer than the app table" {
+    // The slice lengths come from the caller; a longer list must not index past
+    // `data.apps()`.
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    const storage = try alloc.alloc(ClientList, td.data.app_count + 1);
+    defer alloc.free(storage);
+    var lists = ClientLists{ .lists = storage };
+    var prng: std.Random.DefaultPrng = .init(7);
+    initClientLists(&lists, &td.data, false, prng.random());
+
+    // Every app got its prefill; the extra slot stays empty.
+    try std.testing.expect(lists.lists[0].max_count == td.data.apps()[0].n_count_policy);
+    try std.testing.expectEqual(@as(usize, 0), lists.lists[td.data.app_count].max_count);
 }
