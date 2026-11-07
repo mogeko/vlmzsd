@@ -106,9 +106,9 @@ Grouped by concern (help is rendered in these groups).
 | `--max-clients <n>` | `-m` | `1024` | `VLMZSD_MAX_CLIENTS` | concurrent client cap; `0` = unlimited |
 
 `--listen` takes an **IP literal only**, repeatable to bind several addresses;
-the port always comes from `--port`, so `--listen 0.0.0.0:1688` is rejected as an
-invalid address. The default `::` is a dual-stack socket covering IPv4 and IPv6,
-and falls back to `0.0.0.0` on a host without an IPv6 stack.
+the port always comes from `--port`, so `--listen 0.0.0.0:1688` is rejected as a
+configuration error. The default `::` is a dual-stack socket covering IPv4 and
+IPv6, and falls back to `0.0.0.0` on a host without an IPv6 stack.
 
 `--port 0` asks the kernel for an ephemeral port, which is useful for tests and
 side-by-side instances. The startup line reports the port that was actually
@@ -260,10 +260,13 @@ because a write to that sink would block the same way, so the status is the only
 cannot be caught.
 
 Exit status: `0` after a graceful shutdown, and `0` for `--help`/`--version`.
-Every startup failure — an unreadable or invalid `.kmd`, no usable `--listen`
-address, or an option that does not parse — reports one `error:` line and exits
-`1` (an argument error prints `vlmzsd: error: <reason>` without the log
-timestamp). A forced exit (second signal) uses `128 + signum` instead.
+Every startup failure — an unreadable or invalid `.kmd`, a `--listen` value that
+is not an IP literal, or an option that does not parse — reports one `error:`
+line and exits `1`. An option error names the option and value it rejected, in
+the spelling that supplied them (the flag, or the environment variable), and is
+printed without the log timestamp; a startup failure that needs the server's
+context keeps the timestamped logger. A forced exit (second signal) uses
+`128 + signum` instead.
 
 ### Logging
 

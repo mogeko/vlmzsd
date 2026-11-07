@@ -38,6 +38,19 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
+/// What a configuration error is about, so a binary can print one line naming
+/// the spelling the user used instead of a bare Zig error name. A Zig error
+/// union carries no payload, so the parser and the value helpers fill this
+/// out-parameter instead.
+pub const Diag = struct {
+    /// The argument as typed (`--bogus`, `-n`, `--port`) or, for a value that
+    /// came from the environment, the variable name (`VLMZSD_PORT`). Empty when
+    /// the error is not about one specific argument.
+    spelling: []const u8 = "",
+    /// The offending value, when the error is about a value.
+    value: []const u8 = "",
+};
+
 /// Parsed result. Values are kept as raw strings; the caller converts them
 /// with its own semantic parsers (duration / GUID / integer width).
 pub const Result = struct {
@@ -112,6 +125,13 @@ fn bumpFlag(res: *Result, name: []const u8) ParseError!void {
 /// Parse `args` against `opts`. Supports `--long`, `--long=value`,
 /// `--long value`, `-s`, `-svalue`, `--` terminator, and positionals.
 pub fn parse(allocator: Allocator, opts: []const Opt, args: []const []const u8) ParseError!Result {
+    var diag: Diag = .{};
+    return parseWithDiag(allocator, opts, args, &diag);
+}
+
+/// `parse`, recording the argument that failed in `diag` so the caller can
+/// name it (`parseErrorMessage`).
+pub fn parseWithDiag(allocator: Allocator, opts: []const Opt, args: []const []const u8, diag: *Diag) ParseError!Result {
     var res = Result{
         .allocator = allocator,
         .flags = std.StringHashMap(u32).init(allocator),
@@ -133,16 +153,28 @@ pub fn parse(allocator: Allocator, opts: []const Opt, args: []const []const u8) 
         if (arg.len > 2 and arg[0] == '-' and arg[1] == '-') {
             const body = arg[2..];
             if (std.mem.indexOfScalar(u8, body, '=')) |eq| {
-                const opt = findLong(opts, body[0..eq]) orelse return error.UnknownOption;
-                if (opt.kind == .flag) return error.FlagTakesNoValue;
+                const opt = findLong(opts, body[0..eq]) orelse {
+                    diag.* = .{ .spelling = arg };
+                    return error.UnknownOption;
+                };
+                if (opt.kind == .flag) {
+                    diag.* = .{ .spelling = arg[0 .. eq + 2] };
+                    return error.FlagTakesNoValue;
+                }
                 try appendValue(&res, opt, body[eq + 1 ..]);
             } else {
-                const opt = findLong(opts, body) orelse return error.UnknownOption;
+                const opt = findLong(opts, body) orelse {
+                    diag.* = .{ .spelling = arg };
+                    return error.UnknownOption;
+                };
                 if (opt.kind == .flag) {
                     try bumpFlag(&res, opt.name);
                 } else {
                     i += 1;
-                    if (i >= args.len) return error.MissingValue;
+                    if (i >= args.len) {
+                        diag.* = .{ .spelling = arg };
+                        return error.MissingValue;
+                    }
                     try appendValue(&res, opt, args[i]);
                 }
             }
@@ -152,7 +184,13 @@ pub fn parse(allocator: Allocator, opts: []const Opt, args: []const []const u8) 
             // (`-n3`) or, when the cluster ends there, the next argument.
             var j: usize = 1;
             while (j < arg.len) : (j += 1) {
-                const opt = findShort(opts, arg[j]) orelse return error.UnknownOption;
+                if (findShort(opts, arg[j]) == null) {
+                    // The whole token, cluster included: a slice cannot spell
+                    // "the dash plus this character" when it is mid-cluster.
+                    diag.* = .{ .spelling = arg };
+                    return error.UnknownOption;
+                }
+                const opt = findShort(opts, arg[j]).?;
                 if (opt.kind == .flag) {
                     try bumpFlag(&res, opt.name);
                     continue;
@@ -161,7 +199,10 @@ pub fn parse(allocator: Allocator, opts: []const Opt, args: []const []const u8) 
                     try appendValue(&res, opt, arg[j + 1 ..]);
                 } else {
                     i += 1;
-                    if (i >= args.len) return error.MissingValue;
+                    if (i >= args.len) {
+                        diag.* = .{ .spelling = arg };
+                        return error.MissingValue;
+                    }
                     try appendValue(&res, opt, args[i]);
                 }
                 break;
@@ -171,6 +212,19 @@ pub fn parse(allocator: Allocator, opts: []const Opt, args: []const []const u8) 
         }
     }
     return res;
+}
+
+/// One line describing a parse failure, e.g. `unknown option "--bogus"`, for
+/// the caller's `error:` prefix. Falls back to a generic phrase when `buf` is
+/// too small (it only needs a few dozen bytes).
+pub fn parseErrorMessage(err: ParseError, diag: Diag, buf: []u8) []const u8 {
+    const text = switch (err) {
+        error.UnknownOption => std.fmt.bufPrint(buf, "unknown option \"{s}\"", .{diag.spelling}),
+        error.MissingValue => std.fmt.bufPrint(buf, "option \"{s}\" needs a value", .{diag.spelling}),
+        error.FlagTakesNoValue => std.fmt.bufPrint(buf, "option \"{s}\" takes no value", .{diag.spelling}),
+        error.OutOfMemory => std.fmt.bufPrint(buf, "out of memory", .{}),
+    };
+    return text catch "invalid arguments";
 }
 
 /// Placeholder shown for a value-taking option when no explicit `hint` is set.
@@ -638,8 +692,12 @@ fn writeTimestampPrefix(buf: *[timestamp_len]u8, io: Io) void {
     const yad = epoch.getEpochDay().calculateYearDay();
     const mad = yad.calculateMonthDay();
     const day_secs: u64 = secs % 86400;
+    // The prefix is a fixed 21 bytes, so the year must fit four digits. A clock
+    // set past 9999 (broken hardware, not a date anyone logs) would otherwise
+    // overflow the buffer; clamping keeps the line greppable and the fixed
+    // layout intact.
     const written = std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z ", .{
-        @as(u32, yad.year),
+        @as(u32, @min(yad.year, 9999)),
         @as(u32, @backingInt(mad.month)),
         @as(u32, mad.day_index) + 1,
         @as(u32, @intCast(day_secs / 3600)),
@@ -842,6 +900,47 @@ test "parse errors" {
     try std.testing.expectError(error.UnknownOption, parse(alloc, &test_opts, &.{"--bogus"}));
     try std.testing.expectError(error.MissingValue, parse(alloc, &test_opts, &.{"--protocol"}));
     try std.testing.expectError(error.FlagTakesNoValue, parse(alloc, &test_opts, &.{"--verbose=1"}));
+}
+
+test "a parse error names the argument that failed" {
+    const alloc = std.testing.allocator;
+    var buf: [64]u8 = undefined;
+
+    {
+        var diag: Diag = .{};
+        try std.testing.expectError(error.UnknownOption, parseWithDiag(alloc, &test_opts, &.{"--bogus"}, &diag));
+        try std.testing.expectEqualStrings("--bogus", diag.spelling);
+        try std.testing.expectEqualStrings(
+            "unknown option \"--bogus\"",
+            parseErrorMessage(error.UnknownOption, diag, &buf),
+        );
+    }
+    {
+        var diag: Diag = .{};
+        try std.testing.expectError(error.MissingValue, parseWithDiag(alloc, &test_opts, &.{"--protocol"}, &diag));
+        try std.testing.expectEqualStrings("--protocol", diag.spelling);
+        try std.testing.expectEqualStrings(
+            "option \"--protocol\" needs a value",
+            parseErrorMessage(error.MissingValue, diag, &buf),
+        );
+    }
+    {
+        var diag: Diag = .{};
+        try std.testing.expectError(error.FlagTakesNoValue, parseWithDiag(alloc, &test_opts, &.{"--verbose=1"}, &diag));
+        // The flag, not the whole `--verbose=1` token: the value is the mistake.
+        try std.testing.expectEqualStrings("--verbose", diag.spelling);
+        try std.testing.expectEqualStrings(
+            "option \"--verbose\" takes no value",
+            parseErrorMessage(error.FlagTakesNoValue, diag, &buf),
+        );
+    }
+    {
+        // A cluster is reported as the token the user typed.
+        const opts = [_]Opt{.{ .name = "verbose", .short = 'v' }};
+        var diag: Diag = .{};
+        try std.testing.expectError(error.UnknownOption, parseWithDiag(alloc, &opts, &.{"-vZ"}, &diag));
+        try std.testing.expectEqualStrings("-vZ", diag.spelling);
+    }
 }
 
 test "short flags cluster and count" {

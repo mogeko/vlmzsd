@@ -22,7 +22,7 @@ fn writeHelp(w: *std.Io.Writer) !void {
         \\
         \\Convert between the `.kmd` binary data format and JSON.
         \\  <file>           input JSON file (or a `.kmd` file with -r); output
-        \\                   defaults to a sibling file with the matching suffix
+        \\                   defaults to <stem>.<suffix> in the current directory
         \\
         \\Options:
         \\  -h, --help            print this help and exit
@@ -156,8 +156,9 @@ pub fn main(init: std.process.Init) !void {
         output_owned = true;
     }
 
-    // Determine the output path: `-o/--output` wins; otherwise derive a sibling
-    // file with the matching extension when the input is a real file (not stdin).
+    // Determine the output path: `-o/--output` wins; otherwise derive the
+    // input's stem plus the matching suffix in the current directory, when the
+    // input is a real file (not stdin).
     var derived: ?[]u8 = null;
     defer if (derived) |p| init.gpa.free(p);
     if (output_path == null and !std.mem.eql(u8, input.?, "-")) {
