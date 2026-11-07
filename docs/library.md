@@ -158,3 +158,31 @@ from type signatures alone:
 Byte-level behavior is pinned by the wire-regression tests; see
 [`docs/migration.md`](./migration.md) for the canonical layouts extracted from
 the C reference.
+
+## Public API history
+
+Scope: the four modules above. `network`, `cli_helper`, and `mpsc_queue` are
+internal to the binaries and carry no compatibility promise, so they are not
+tracked here; the CLI surface is specified in [`docs/cli.md`](./cli.md).
+
+| Version | Change |
+|---|---|
+| `0.6.0` | `kms` makes two ePID helpers nullable/error-returning and adds two, and `kmsdata`/`kms`/`rpc` tighten input validation — details below. |
+| `0.2.4` | `kms` adds the strict-mode limits `max_required_clients`, `client_time_tolerance_seconds`, `whitelist_retail`, `whitelist_app_guid`. |
+| `0.2.3` | `kmsdata` adds `write`, the inverse of `parse`. |
+| `0.1.0` | `rpc.DispatchResult` becomes a struct carrying `major_version` and `response_size` around the `kind` union. |
+| `0.0.2` | `kms` adds the ePID helpers and the client list (`ClientList`, `ClientLists`, `initClientLists`, `generateRandomPid`, `randomHostBuild`, …); `ServerConfig` grows the randomization and client-list fields, and the response builders take the RNG. |
+
+### `0.6.0`
+
+| Item | Kind | Change |
+|---|---|---|
+| `kms.randomHostBuild` | **breaking** | `i32` → `?i32`; `null` means no host build advertises the requested NDR64 capability |
+| `kms.generateRandomPid` | **breaking** | `[]u8` → `BuildError![]u8`; `BuildError` gains `NoHostBuild` and `InvalidCsvlk` (empty host-build table, CSVLC index out of range, `MaxKeyId <= MinKeyId`, platform id above `u32`) |
+| `kms.hasHostBuildForNdr64` | added | whether the data can supply a host build for the negotiated transfer syntax |
+| `kms.randomLcid` | added | one LCID from the internal list; level-1 pre-generation draws it once per run, level 2 still draws per request |
+| `kmsdata.parse`, `kmsdata.write` | behavior | structurally invalid data → `error.InvalidFormat` (offsets not the contiguous layout of [`docs/kmd-format.md`](./kmd-format.md) §2, counts overflowing or past the file, an empty CSVLC/App/KMS/SKU/HostBuild array, an item index outside its array, `MaxKeyId <= MinKeyId`, a negative `BuildNumber`/`PlatformId`) |
+| `kms.createResponseBase` | behavior | `n_policy > 1000`, `KmsData` counts that do not describe `items`, or an unusable CSVLC/ePID → `hresult.invalid_arg` (`0x8007000D`), still as a normal RESPONSE |
+| `kms.decryptResponseV4`, `decryptResponseV6` | behavior | truncated or misaligned payload → `ResponseResult.decrypt_success = false` (`ok()` is false); nothing is read past the buffer |
+| `rpc.dispatchKmsRequest` | behavior | major outside 4..6 (including 0..3) → `0x8007000D`; an unnegotiated context (`invalid_ctx`, `0xFFFF`) → FAULT `nca_unk_if` |
+| `rpc.parseKmsResponse` | behavior | body too short for the field it must read, or `DataLength` past the body → `nca_proto_error` |
