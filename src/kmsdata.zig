@@ -90,6 +90,49 @@ fn readLe(comptime T: type, raw: []const u8, offset: usize) T {
     return std.mem.readInt(T, raw[offset..][0..n].ptr[0..n], .little);
 }
 
+fn checkedAdd(a: usize, b: usize) error{InvalidFormat}!usize {
+    return std.math.add(usize, a, b) catch error.InvalidFormat;
+}
+
+fn checkedMul(a: usize, b: usize) error{InvalidFormat}!usize {
+    return std.math.mul(usize, a, b) catch error.InvalidFormat;
+}
+
+/// Structural and index validation shared by `parse` and `write`.
+/// `parse` builds every array first, then rejects data that would make later
+/// array indexing or record iteration unsafe.
+fn validateData(data: *const KmsData) error{InvalidFormat}!void {
+    if (data.major_ver != 2) return error.InvalidFormat;
+    if (data.csvlk.len == 0 or data.host_builds.len == 0) return error.InvalidFormat;
+    if (data.app_count == 0 or data.kms_count == 0 or data.sku_count == 0) return error.InvalidFormat;
+    if (data.csvlk.len > std.math.maxInt(u8)) return error.InvalidFormat;
+    if (data.app_count > std.math.maxInt(u32) or
+        data.kms_count > std.math.maxInt(u32) or
+        data.sku_count > std.math.maxInt(u32) or
+        data.host_builds.len > std.math.maxInt(u32))
+    {
+        return error.InvalidFormat;
+    }
+
+    const kms_end = try checkedAdd(data.app_count, data.kms_count);
+    const total_items = try checkedAdd(kms_end, data.sku_count);
+    if (total_items != data.items.len) return error.InvalidFormat;
+
+    for (data.csvlk) |csvlk| {
+        if (csvlk.max_key_id <= csvlk.min_key_id) return error.InvalidFormat;
+    }
+    for (data.items, 0..) |item, i| {
+        if (item.epid_index >= data.csvlk.len) return error.InvalidFormat;
+        if (i < data.app_count) continue; // App item
+        if (item.app_index >= data.app_count) return error.InvalidFormat;
+        if (i < kms_end) continue; // KMS item
+        if (item.kms_index >= data.kms_count) return error.InvalidFormat;
+    }
+    for (data.host_builds) |host_build| {
+        if (host_build.build_number < 0 or host_build.platform_id < 0) return error.InvalidFormat;
+    }
+}
+
 fn writeLe(comptime T: type, raw: []u8, offset: usize, value: T) void {
     const n = @divExact(@typeInfo(T).int.bits, 8);
     std.mem.writeInt(T, raw[offset..][0..n], value, .little);
@@ -106,8 +149,8 @@ fn cString(raw: []const u8, offset: usize) error{InvalidFormat}![]const u8 {
 pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
     if (raw.len < header_size) return error.InvalidFormat;
     if (!std.mem.eql(u8, raw[0..4], "KMD\x00")) return error.InvalidFormat;
-    // Mirrors `loadKmsData` (`data[size-1] != 0` → format error when
-    // UNSAFE_DATA_LOAD is off).
+    // The string pool is NUL-terminated, so the file must end with a NUL byte
+    // (docs/kmd-format.md §2).
     if (raw[raw.len - 1] != 0) return error.InvalidFormat;
 
     const minor_ver = readLe(u16, raw, 4);
@@ -116,27 +159,37 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
 
     const flags = raw[9];
     const csvlk_count: usize = raw[8];
-    const app_count: usize = @intCast(readLe(u32, raw, 12));
-    const kms_count: usize = @intCast(readLe(u32, raw, 16));
-    const sku_count: usize = @intCast(readLe(u32, raw, 20));
-    const hostbuild_count: usize = @intCast(readLe(u32, raw, 24));
+    const app_count = std.math.cast(usize, readLe(u32, raw, 12)) orelse return error.InvalidFormat;
+    const kms_count = std.math.cast(usize, readLe(u32, raw, 16)) orelse return error.InvalidFormat;
+    const sku_count = std.math.cast(usize, readLe(u32, raw, 20)) orelse return error.InvalidFormat;
+    const hostbuild_count = std.math.cast(usize, readLe(u32, raw, 24)) orelse return error.InvalidFormat;
 
-    const app_offset: usize = @intCast(readLe(u64, raw, 32));
-    const hostbuild_offset: usize = @intCast(readLe(u64, raw, 56));
+    const app_offset = std.math.cast(usize, readLe(u64, raw, 32)) orelse return error.InvalidFormat;
+    const hostbuild_offset = std.math.cast(usize, readLe(u64, raw, 56)) orelse return error.InvalidFormat;
 
-    // Basic bounds checks (the file is trusted, but avoid wild allocations).
-    const total_items = app_count + kms_count + sku_count;
-    if (header_size + csvlk_count * csvlk_size > raw.len) return error.InvalidFormat;
-    if (app_offset + total_items * item_size > raw.len) return error.InvalidFormat;
-    if (hostbuild_offset + hostbuild_count * hostbuild_size > raw.len) return error.InvalidFormat;
+    if (csvlk_count == 0 or app_count == 0 or kms_count == 0 or sku_count == 0 or hostbuild_count == 0) {
+        return error.InvalidFormat;
+    }
+
+    // The header offsets are part of the format: records are contiguous and
+    // start exactly where the previous section ends — docs/kmd-format.md §2.
+    const csvlk_end = try checkedAdd(header_size, try checkedMul(csvlk_count, csvlk_size));
+    if (csvlk_end > raw.len or app_offset != csvlk_end) return error.InvalidFormat;
+
+    const total_items = try checkedAdd(try checkedAdd(app_count, kms_count), sku_count);
+    const items_end = try checkedAdd(app_offset, try checkedMul(total_items, item_size));
+    if (items_end > raw.len or hostbuild_offset != items_end) return error.InvalidFormat;
+
+    const hostbuild_end = try checkedAdd(hostbuild_offset, try checkedMul(hostbuild_count, hostbuild_size));
+    if (hostbuild_end > raw.len) return error.InvalidFormat;
 
     const csvlk = try allocator.alloc(CsvlkData, csvlk_count);
     errdefer allocator.free(csvlk);
     for (csvlk, 0..) |*rec, i| {
         const base = header_size + i * csvlk_size;
-        const epid_offset: usize = @intCast(readLe(u64, raw, base));
+        const epid_offset = std.math.cast(usize, readLe(u64, raw, base)) orelse return error.InvalidFormat;
         const epid = try cString(raw, epid_offset);
-        const name = try cString(raw, epid_offset + epid.len + 1);
+        const name = try cString(raw, try checkedAdd(epid_offset, epid.len + 1));
         rec.* = .{
             .epid = epid,
             .name = name,
@@ -156,7 +209,7 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
         @memcpy(guid[0..], raw[base..][0..16]);
         item.* = .{
             .guid = guid,
-            .name = try cString(raw, @intCast(readLe(u64, raw, base + 16))),
+            .name = try cString(raw, std.math.cast(usize, readLe(u64, raw, base + 16)) orelse return error.InvalidFormat),
             .app_index = raw[base + 24],
             .kms_index = raw[base + 25],
             .protocol_version = raw[base + 26],
@@ -172,7 +225,7 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
     for (host_builds, 0..) |*hb, i| {
         const base = hostbuild_offset + i * hostbuild_size;
         hb.* = .{
-            .display_name = try cString(raw, @intCast(readLe(u64, raw, base))),
+            .display_name = try cString(raw, std.math.cast(usize, readLe(u64, raw, base)) orelse return error.InvalidFormat),
             .release_date = readLe(i64, raw, base + 8),
             .build_number = readLe(i32, raw, base + 16),
             .platform_id = readLe(i32, raw, base + 20),
@@ -184,9 +237,8 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
     std.debug.assert(csvlk.len == csvlk_count);
     std.debug.assert(items.len == total_items);
     std.debug.assert(host_builds.len == hostbuild_count);
-    std.debug.assert(app_count + kms_count + sku_count == total_items);
 
-    return .{
+    const data: KmsData = .{
         .minor_ver = minor_ver,
         .major_ver = major_ver,
         .flags = flags,
@@ -197,6 +249,8 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
         .sku_count = sku_count,
         .host_builds = host_builds,
     };
+    try validateData(&data);
+    return data;
 }
 
 /// Serialize `data` back into a `.kmd` byte buffer (the inverse of `parse`).
@@ -204,16 +258,14 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
 /// semantically identical to the source but not necessarily byte-identical.
 /// The caller owns the returned slice.
 pub fn write(allocator: Allocator, data: *const KmsData) ![]u8 {
-    if (data.major_ver != 2) return error.InvalidFormat;
+    try validateData(data);
     const csvlk_count = data.csvlk.len;
     const total_items = data.items.len;
     const hb_count = data.host_builds.len;
-    if (csvlk_count > std.math.maxInt(u8)) return error.InvalidFormat;
-    if (data.app_count + data.kms_count + data.sku_count != total_items) return error.InvalidFormat;
 
-    const app_offset = header_size + csvlk_count * csvlk_size;
-    const hostbuild_offset = app_offset + total_items * item_size;
-    const string_pool_offset = hostbuild_offset + hb_count * hostbuild_size;
+    const app_offset = try checkedAdd(header_size, try checkedMul(csvlk_count, csvlk_size));
+    const hostbuild_offset = try checkedAdd(app_offset, try checkedMul(total_items, item_size));
+    const string_pool_offset = try checkedAdd(hostbuild_offset, try checkedMul(hb_count, hostbuild_size));
 
     // Build the string pool, recording each field's offset within it. The
     // CSVLC `name` follows its `epid` with a NUL between them (see `parse`).
@@ -248,7 +300,7 @@ pub fn write(allocator: Allocator, data: *const KmsData) ![]u8 {
 
     if (pool.items.len == 0) try pool.append(allocator, 0); // trailing NUL
 
-    const total_size = string_pool_offset + pool.items.len;
+    const total_size = try checkedAdd(string_pool_offset, pool.items.len);
     const buf = try allocator.alloc(u8, total_size);
     errdefer allocator.free(buf);
     @memset(buf, 0);
@@ -420,4 +472,113 @@ test "kmd header fields" {
     try std.testing.expectEqual(@as(u64, 328), readLe(u64, raw, 32)); // AppItemOffset
     try std.testing.expectEqual(@as(u64, 9928), readLe(u64, raw, 56)); // HostBuildOffset
     try std.testing.expectEqual(@as(u8, 0), raw[raw.len - 1]); // trailing NUL
+}
+
+fn copyEmbedded(allocator: Allocator) ![]u8 {
+    return allocator.dupe(u8, @embedFile("vlmcsd.kmd"));
+}
+
+test "parse rejects malformed container data" {
+    const alloc = std.testing.allocator;
+    const embedded = @embedFile("vlmcsd.kmd");
+
+    // Fewer than 72 bytes.
+    try std.testing.expectError(error.InvalidFormat, parse(alloc, embedded[0..40]));
+
+    {
+        const raw = try copyEmbedded(alloc);
+        defer alloc.free(raw);
+        raw[0] = 'B'; // Magic
+        try std.testing.expectError(error.InvalidFormat, parse(alloc, raw));
+    }
+    {
+        const raw = try copyEmbedded(alloc);
+        defer alloc.free(raw);
+        writeLe(u16, raw, 6, 3); // MajorVer
+        try std.testing.expectError(error.InvalidFormat, parse(alloc, raw));
+    }
+    {
+        const raw = try copyEmbedded(alloc);
+        defer alloc.free(raw);
+        raw[raw.len - 1] = 1; // trailing NUL
+        try std.testing.expectError(error.InvalidFormat, parse(alloc, raw));
+    }
+    {
+        const raw = try copyEmbedded(alloc);
+        defer alloc.free(raw);
+        writeLe(u32, raw, 20, 1_000_000); // SkuItemCount past the file
+        try std.testing.expectError(error.InvalidFormat, parse(alloc, raw));
+    }
+    {
+        const raw = try copyEmbedded(alloc);
+        defer alloc.free(raw);
+        writeLe(u64, raw, 32, 326); // AppItemOffset != 72 + CsvlkCount*32
+        try std.testing.expectError(error.InvalidFormat, parse(alloc, raw));
+    }
+    {
+        const raw = try copyEmbedded(alloc);
+        defer alloc.free(raw);
+        writeLe(u64, raw, 32, std.math.maxInt(u64)); // checked add overflow
+        try std.testing.expectError(error.InvalidFormat, parse(alloc, raw));
+    }
+    {
+        const raw = try copyEmbedded(alloc);
+        defer alloc.free(raw);
+        writeLe(u64, raw, 72, raw.len + 1); // CSVLC ePID offset past the file
+        try std.testing.expectError(error.InvalidFormat, parse(alloc, raw));
+    }
+    {
+        const raw = try copyEmbedded(alloc);
+        defer alloc.free(raw);
+        writeLe(u32, raw, 24, 0); // HostBuildCount
+        try std.testing.expectError(error.InvalidFormat, parse(alloc, raw));
+    }
+}
+
+test "parse rejects invalid record fields" {
+    const alloc = std.testing.allocator;
+    const embedded = @embedFile("vlmcsd.kmd");
+    const app_count = readLe(u32, embedded, 12);
+    const app_offset = readLe(u64, embedded, 32);
+    const hostbuild_offset = readLe(u64, embedded, 56);
+
+    {
+        const raw = try copyEmbedded(alloc);
+        defer alloc.free(raw);
+        // First CSVLC: MinKeyId == MaxKeyId cannot generate a key id.
+        writeLe(u32, raw, 72 + 24, readLe(u32, raw, 72 + 20));
+        try std.testing.expectError(error.InvalidFormat, parse(alloc, raw));
+    }
+    {
+        const raw = try copyEmbedded(alloc);
+        defer alloc.free(raw);
+        // First KMS item: EPidIndex past the CSVLC array.
+        const kms_item = @as(usize, @intCast(app_offset)) + app_count * item_size;
+        raw[kms_item + 30] = 200;
+        try std.testing.expectError(error.InvalidFormat, parse(alloc, raw));
+    }
+    {
+        const raw = try copyEmbedded(alloc);
+        defer alloc.free(raw);
+        // First HostBuild: negative build number.
+        writeLe(i32, raw, @as(usize, @intCast(hostbuild_offset)) + 16, -1);
+        try std.testing.expectError(error.InvalidFormat, parse(alloc, raw));
+    }
+}
+
+test "write rejects illegal data" {
+    const alloc = std.testing.allocator;
+    var data = try parse(alloc, @embedFile("vlmcsd.kmd"));
+    defer data.deinit(alloc);
+
+    data.csvlk[0].max_key_id = data.csvlk[0].min_key_id;
+    try std.testing.expectError(error.InvalidFormat, write(alloc, &data));
+
+    data.csvlk[0].max_key_id = data.csvlk[0].min_key_id + 1;
+    data.items[data.app_count].epid_index = 200;
+    try std.testing.expectError(error.InvalidFormat, write(alloc, &data));
+
+    data.items[data.app_count].epid_index = 0;
+    data.app_count = 0;
+    try std.testing.expectError(error.InvalidFormat, write(alloc, &data));
 }

@@ -416,6 +416,10 @@ pub const ServerConfig = struct {
 
 pub const BuildError = error{
     PidTooLong,
+    /// No host build matches the negotiated transfer syntax.
+    NoHostBuild,
+    /// The CSVLC record cannot produce a valid randomized ePID.
+    InvalidCsvlk,
 };
 
 /// Write the ePID (UCS-2) and its byte length into `response`.
@@ -440,21 +444,37 @@ fn itoc(buf: []u8, value: u32, digits: u8) []u8 {
     return buf[0..s.len];
 }
 
-/// Pick a random host build whose NDR64 capability matches `use_ndr64`
-/// (mirrors the C `getRandomServerType`).
-fn getRandomServerType(data: *const kmsdata.KmsData, rng: std.Random, use_ndr64: bool) u32 {
-    std.debug.assert(data.host_builds.len > 0); // otherwise the loop never terminates
-    while (true) {
-        const idx = rng.uintLessThan(usize, data.host_builds.len);
-        const is_ndr64 = (data.host_builds[idx].flags & use_ndr64_flag) != 0;
-        if (is_ndr64 == use_ndr64) return @intCast(idx);
+/// True when at least one host build advertises the requested NDR64 support.
+/// `generateRandomPid` needs such a build when it picks one itself.
+pub fn hasHostBuildForNdr64(data: *const kmsdata.KmsData, use_ndr64: bool) bool {
+    for (data.host_builds) |host_build| {
+        if (((host_build.flags & use_ndr64_flag) != 0) == use_ndr64) return true;
     }
+    return false;
+}
+
+/// Pick a random host build whose NDR64 capability matches `use_ndr64`.
+/// Scans each build at most once, starting from a random position, so data
+/// without a matching build reports `null` instead of looping forever.
+fn getRandomServerType(data: *const kmsdata.KmsData, rng: std.Random, use_ndr64: bool) ?usize {
+    if (data.host_builds.len == 0) return null;
+
+    var index = rng.uintLessThan(usize, data.host_builds.len);
+    var visited: usize = 0;
+    while (visited < data.host_builds.len) : (visited += 1) {
+        const is_ndr64 = (data.host_builds[index].flags & use_ndr64_flag) != 0;
+        if (is_ndr64 == use_ndr64) return index;
+        index += 1;
+        if (index == data.host_builds.len) index = 0;
+    }
+    return null;
 }
 
 /// Pick a random host build number whose NDR64 capability matches `use_ndr64`
 /// (used by level-1 pre-randomization to fix one build for all CSVLCs).
-pub fn randomHostBuild(data: *const kmsdata.KmsData, rng: std.Random, use_ndr64: bool) i32 {
-    return data.host_builds[getRandomServerType(data, rng, use_ndr64)].build_number;
+pub fn randomHostBuild(data: *const kmsdata.KmsData, rng: std.Random, use_ndr64: bool) ?i32 {
+    const index = getRandomServerType(data, rng, use_ndr64) orelse return null;
+    return data.host_builds[index].build_number;
 }
 
 /// Generate a randomized ePID for CSVLC `index` into `out` (UTF-8), matching
@@ -468,18 +488,22 @@ pub fn generateRandomPid(
     rng: std.Random,
     use_ndr64: bool,
     now_unix: i64,
-) []u8 {
-    std.debug.assert(index < data.csvlk.len);
-    std.debug.assert(out.len >= pid_buffer_size);
+) BuildError![]u8 {
+    if (data.host_builds.len == 0) return error.NoHostBuild;
+    if (index >= data.csvlk.len) return error.InvalidCsvlk;
+    if (out.len < pid_buffer_size) return error.PidTooLong;
 
-    const resolved_build: i32 = if (host_build == 0)
-        data.host_builds[getRandomServerType(data, rng, use_ndr64)].build_number
-    else
-        host_build;
+    const resolved_build: i32 = if (host_build == 0) blk: {
+        const build_index = getRandomServerType(data, rng, use_ndr64) orelse return error.NoHostBuild;
+        break :blk data.host_builds[build_index].build_number;
+    } else host_build;
 
     const csvlk = data.csvlk[index];
-    std.debug.assert(csvlk.max_key_id > csvlk.min_key_id); // avoid uintLessThan by zero
-    const key_id = csvlk.min_key_id + rng.uintLessThan(u32, csvlk.max_key_id - csvlk.min_key_id);
+    if (csvlk.max_key_id <= csvlk.min_key_id) return error.InvalidCsvlk;
+    const key_span = csvlk.max_key_id - csvlk.min_key_id;
+    const platform_id = std.math.cast(u32, getPlatformId(data, resolved_build)) orelse return error.InvalidCsvlk;
+
+    const key_id = csvlk.min_key_id + rng.uintLessThan(u32, key_span);
     std.debug.assert(key_id >= csvlk.min_key_id);
     std.debug.assert(key_id < csvlk.max_key_id);
 
@@ -496,12 +520,14 @@ pub fn generateRandomPid(
         min_time + @as(i64, @intCast(rng.uintLessThan(u64, @intCast(span))))
     else
         min_time;
-
-    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(kms_time) };
+    // Corrupt data can place the generated date before the Unix epoch; clamp
+    // it instead of panicking in the u64 cast.
+    const epoch_secs: u64 = std.math.cast(u64, kms_time) orelse 0;
+    const epoch = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
     const yad = epoch.getEpochDay().calculateYearDay();
 
     var b: [6][16]u8 = undefined;
-    const platform = itoc(&b[0], @intCast(getPlatformId(data, resolved_build)), 5);
+    const platform = itoc(&b[0], platform_id, 5);
     const group = itoc(&b[1], csvlk.group_id, 5);
     const key_hi = itoc(&b[2], key_id / 1_000_000, 3);
     const key_lo = itoc(&b[3], key_id % 1_000_000, 6);
@@ -567,7 +593,14 @@ pub fn createResponseBase(
     rng: std.Random,
     now_unix: i64,
 ) i32 {
-    std.debug.assert(cfg.data.csvlk.len > 0);
+    if (cfg.data.csvlk.len == 0) return hresult.invalid_arg;
+
+    // `apps()` and `kms()` slice `items` by count, so the counts must describe
+    // a well-formed App/KMS/SKU layout before either slice is taken.
+    if (cfg.data.app_count > cfg.data.items.len) return hresult.invalid_arg;
+    const items_after_app = cfg.data.items.len - cfg.data.app_count;
+    if (cfg.data.kms_count > items_after_app) return hresult.invalid_arg;
+    if (cfg.data.sku_count != items_after_app - cfg.data.kms_count) return hresult.invalid_arg;
 
     // Reject N_Policy values that would exceed the protocol limit before
     // multiplying: a u32 wrap would turn 0x80000000 into 0 and 0x80000002
@@ -598,7 +631,9 @@ pub fn createResponseBase(
 
     if (cfg.whitelisting_level & whitelist_app_guid != 0) {
         if (index_opt) |i| {
-            const app_guid = cfg.data.apps()[kms_items[i].app_index].guid;
+            const app_index: usize = kms_items[i].app_index;
+            if (app_index >= cfg.data.app_count) return hresult.invalid_arg;
+            const app_guid = cfg.data.apps()[app_index].guid;
             if (!guidEqual(&app_guid, &request.app_id)) return hresult.product_rejected;
         } else {
             return hresult.product_rejected;
@@ -606,12 +641,15 @@ pub fn createResponseBase(
     }
 
     const epid_index: usize = if (index_opt) |i| kms_items[i].epid_index else 0;
+    if (epid_index >= cfg.data.csvlk.len) return hresult.invalid_arg;
 
     // Client count: strict mode tracks per-app CMIDs; otherwise answer the
     // minimum active clients (mirrors `CreateResponseBaseCallback`).
     if (cfg.maintain_clients) {
         const app_index: usize = if (index_opt) |i| kms_items[i].app_index else 0;
+        if (app_index >= cfg.data.app_count) return hresult.invalid_arg;
         if (cfg.client_lists) |client_lists| {
+            if (app_index >= client_lists.lists.len) return hresult.invalid_arg;
             while (!client_lists.mutex.tryLock()) std.atomic.spinLoopHint();
             defer client_lists.mutex.unlock();
             const list = &client_lists.lists[app_index];
@@ -670,7 +708,7 @@ pub fn createResponseBase(
     const pid: []const u8 = if (override) |p|
         p
     else if (cfg.randomization_level == 2)
-        generateRandomPid(cfg.data, epid_index, &pid_buf, @intCast(cfg.lcid), @intCast(cfg.build), rng, cfg.use_ndr64, now_unix)
+        generateRandomPid(cfg.data, epid_index, &pid_buf, @intCast(cfg.lcid), @intCast(cfg.build), rng, cfg.use_ndr64, now_unix) catch return hresult.invalid_arg
     else
         cfg.data.csvlk[epid_index].epid;
 
@@ -1033,7 +1071,7 @@ test "generateRandomPid format" {
     var prng: std.Random.DefaultPrng = .init(0xDEAD_BEEF);
     var buf: [pid_buffer_size]u8 = undefined;
     // CSVLC 0 (Windows), fixed LCID 1033 and build 17763.
-    const pid = generateRandomPid(&td.data, 0, &buf, 1033, 17763, prng.random(), true, 1_700_000_000);
+    const pid = try generateRandomPid(&td.data, 0, &buf, 1033, 17763, prng.random(), true, 1_700_000_000);
 
     // platform(5)-group(5)-keyHi(3)-keyLo(6)-03-lang-build.0000-yday(3)year(4)
     try std.testing.expectEqualStrings("03612", pid[0..5]); // platform id for 17763
@@ -1066,7 +1104,7 @@ test "generateRandomPid random lang/build" {
     var prng: std.Random.DefaultPrng = .init(0x1234_5678);
     var buf: [pid_buffer_size]u8 = undefined;
     // lang < 1 → random LCID; host_build 0 → random build.
-    const pid = generateRandomPid(&td.data, 0, &buf, 0, 0, prng.random(), true, 1_700_000_000);
+    const pid = try generateRandomPid(&td.data, 0, &buf, 0, 0, prng.random(), true, 1_700_000_000);
 
     // The middle is always "-03-" and the tail is ".0000-yday(3)year(4)".
     try std.testing.expect(std.mem.indexOf(u8, pid, "-03-") != null);
@@ -1325,8 +1363,78 @@ test "ePID date span zero or negative" {
     var prng: std.Random.DefaultPrng = .init(0);
     var out: [pid_buffer_size]u8 = undefined;
     // span <= 0 → take min_time directly, never `%0` (the C UB fix).
-    const pid = generateRandomPid(&data, 0, &out, 0, 0, prng.random(), true, now);
+    const pid = try generateRandomPid(&data, 0, &out, 0, 0, prng.random(), true, now);
     try std.testing.expect(pid.len > 0);
+}
+
+test "random host build selection is bounded and reports no match" {
+    const alloc = std.testing.allocator;
+    var data = try makeVariantData(alloc, 1_700_000_000);
+    defer data.deinit(alloc);
+
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
+    const rng = prng.random();
+
+    // The single variant build advertises NDR64; asking for the other
+    // capability must return null instead of retrying forever.
+    try std.testing.expect(hasHostBuildForNdr64(&data, true));
+    try std.testing.expect(!hasHostBuildForNdr64(&data, false));
+    try std.testing.expectEqual(@as(?usize, null), getRandomServerType(&data, rng, false));
+    try std.testing.expectEqual(@as(?i32, null), randomHostBuild(&data, rng, false));
+
+    var out: [pid_buffer_size]u8 = undefined;
+    try std.testing.expectError(error.NoHostBuild, generateRandomPid(&data, 0, &out, 0, 0, rng, false, 1_700_000_000));
+}
+
+test "generateRandomPid rejects invalid CSVLC data" {
+    const alloc = std.testing.allocator;
+    var data = try makeVariantData(alloc, 1_700_000_000);
+    defer data.deinit(alloc);
+
+    var prng: std.Random.DefaultPrng = .init(0);
+    var out: [pid_buffer_size]u8 = undefined;
+
+    data.csvlk[0].max_key_id = data.csvlk[0].min_key_id;
+    try std.testing.expectError(error.InvalidCsvlk, generateRandomPid(&data, 0, &out, 0, 17763, prng.random(), true, 1_700_000_000));
+}
+
+test "generateRandomPid clamps dates before the Unix epoch" {
+    const alloc = std.testing.allocator;
+    var data = try makeVariantData(alloc, -2_000_000_000);
+    defer data.deinit(alloc);
+
+    var prng: std.Random.DefaultPrng = .init(0xDEAD_BEEF);
+    var out: [pid_buffer_size]u8 = undefined;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        const pid = try generateRandomPid(&data, 0, &out, 1033, 17763, prng.random(), true, 1_700_000_000);
+        try std.testing.expect(pid.len > 0);
+    }
+}
+
+test "createResponseBase rejects malformed data indices" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+
+    var cfg = ServerConfig{ .data = &td.data };
+    var base = makeBase(&td.data, 6 << 16);
+    var prng: std.Random.DefaultPrng = .init(0);
+    var resp: Response = undefined;
+
+    const kms_item = td.data.app_count;
+    const original_epid = td.data.items[kms_item].epid_index;
+    td.data.items[kms_item].epid_index = 200;
+    try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+    td.data.items[kms_item].epid_index = original_epid;
+
+    td.data.items[kms_item].app_index = 200;
+    cfg.whitelisting_level = 1;
+    try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
+    td.data.items[kms_item].app_index = 0;
+
+    td.data.app_count = td.data.items.len + 1;
+    try std.testing.expectEqual(hresult.invalid_arg, createResponseBase(&cfg, &base, &resp, prng.random(), 1_700_000_000));
 }
 
 test "v4 request/response round-trip" {

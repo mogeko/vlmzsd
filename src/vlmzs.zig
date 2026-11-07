@@ -369,6 +369,15 @@ fn findSku(data: *const kmsdata.KmsData, product: ?[]const u8) !usize {
     }
 }
 
+/// The client needs an App/KMS/SKU entry for every activation request.
+/// `kmsdata.parse` already rejects empty arrays; this keeps the client's
+/// contract explicit.
+fn validateKmsData(data: *const kmsdata.KmsData) error{IncompleteKmsData}!void {
+    if (data.app_count == 0 or data.kms_count == 0 or data.sku_count == 0) {
+        return error.IncompleteKmsData;
+    }
+}
+
 fn randomCmid(rng: std.Random) [16]u8 {
     var g: [16]u8 = undefined;
     rng.bytes(&g);
@@ -862,6 +871,11 @@ pub fn main(init: std.process.Init) !void {
     };
     defer data.deinit(init.gpa);
 
+    validateKmsData(&data) catch {
+        out.eprint("error: incomplete KMS data file\n", .{});
+        std.process.exit(1);
+    };
+
     if (opts.list_products) {
         listProducts(&data, &out);
         return;
@@ -1139,4 +1153,14 @@ test "--timeout bounds a peer that never answers" {
             .timeout = network.timeoutSeconds(1),
         } } },
     ));
+}
+
+test "incomplete KMS data is rejected by the client" {
+    const alloc = std.testing.allocator;
+    var data = try kmsdata.parse(alloc, @embedFile("vlmcsd.kmd"));
+    defer data.deinit(alloc);
+
+    try validateKmsData(&data);
+    data.app_count = 0;
+    try std.testing.expectError(error.IncompleteKmsData, validateKmsData(&data));
 }

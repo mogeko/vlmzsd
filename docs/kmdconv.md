@@ -158,8 +158,32 @@ RFC 4122 form).
       "epid_index": 0
     }
   ],
-  "kms": [],
-  "skus": [],
+  "kms": [
+    {
+      "guid": "651f7f90cdad2e4a95bc4bf500bc6e58",
+      "name": "Windows Server 2025",
+      "app_index": 0,
+      "kms_index": 0,
+      "protocol_version": 6,
+      "n_count_policy": 5,
+      "is_retail": 0,
+      "is_preview": 0,
+      "epid_index": 0
+    }
+  ],
+  "skus": [
+    {
+      "guid": "f2afb545a060f242bc4bec6e5f7b527e",
+      "name": "Windows Server 2025 Azure Core",
+      "app_index": 0,
+      "kms_index": 0,
+      "protocol_version": 6,
+      "n_count_policy": 5,
+      "is_retail": 0,
+      "is_preview": 0,
+      "epid_index": 0
+    }
+  ],
   "hostbuilds": [
     {
       "display_name": "Windows 11 24H2 / Server 2025",
@@ -174,7 +198,10 @@ RFC 4122 form).
 
 ## Notes
 
+- Every one of `csvlk`, `apps`, `kms`, `skus`, and `hostbuilds` must contain at
+  least one record; `kmsdata.write` rejects an incomplete data set.
 - The `.kmd` produced from JSON is semantically identical to its source but
-  not byte-identical: the string pool is rebuilt without deduplication. Use
-  `scripts/dump_kmd.py` to inspect a generated file, and see the `kmd-upgrade`
-  skill for the workflow around editing the embedded `src/vlmcsd.kmd`.
+  not necessarily byte-identical: the string pool is rebuilt without
+  deduplication. Use `scripts/dump_kmd.py` to inspect a generated file, and see
+  the `kmd-upgrade` skill for the workflow around editing the embedded
+  `src/vlmcsd.kmd`.

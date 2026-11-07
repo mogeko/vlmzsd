@@ -304,7 +304,10 @@ fn buildEpidOverrides(
 ) ![]const ?[]const u8 {
     const n = data.csvlk.len;
     const overrides = try gpa.alloc(?[]const u8, n);
-    errdefer gpa.free(overrides);
+    errdefer {
+        for (overrides) |slot| if (slot) |s| gpa.free(s);
+        gpa.free(overrides);
+    }
     @memset(overrides, null);
 
     // 1. `--epid <name>=<epid>` overrides.
@@ -329,9 +332,9 @@ fn buildEpidOverrides(
         var host_build: i32 = if (opts.build != 0) @intCast(opts.build) else 0;
         for (overrides, 0..) |*slot, i| {
             if (slot.* != null) continue;
-            if (host_build == 0) host_build = kms.randomHostBuild(data, rng, opts.ndr64);
+            if (host_build == 0) host_build = kms.randomHostBuild(data, rng, opts.ndr64) orelse return error.NoHostBuild;
             var buf: [kms.pid_buffer_size]u8 = undefined;
-            const pid = kms.generateRandomPid(data, i, &buf, lang, host_build, rng, opts.ndr64, now_unix);
+            const pid = try kms.generateRandomPid(data, i, &buf, lang, host_build, rng, opts.ndr64, now_unix);
             slot.* = try gpa.dupe(u8, pid);
         }
     }
@@ -1114,12 +1117,28 @@ pub fn main(init: std.process.Init) !void {
     var prng: std.Random.DefaultPrng = .init(cli_helper.makeSeed(init.io));
     const rng = prng.random();
 
-    const epid_overrides = try buildEpidOverrides(init.gpa, &data, &opts, rng, cli_helper.nowUnix(init.io), &log);
+    const epid_overrides = buildEpidOverrides(init.gpa, &data, &opts, rng, cli_helper.nowUnix(init.io), &log) catch |e| {
+        fatal(&log, init.io, "cannot initialize randomized ePIDs: {s}", .{@errorName(e)});
+    };
     defer {
         for (epid_overrides) |slot| {
             if (slot) |s| init.gpa.free(s);
         }
         init.gpa.free(epid_overrides);
+    }
+
+    // Level 2 generates each ePID at request time. Reject a data file that
+    // cannot supply a host build for the negotiated transfer syntax now,
+    // instead of rejecting every request later.
+    if (opts.randomize == 2) {
+        var needs_random_pid = false;
+        for (epid_overrides) |slot| if (slot == null) {
+            needs_random_pid = true;
+            break;
+        };
+        if (needs_random_pid and opts.build == 0 and !kms.hasHostBuildForNdr64(&data, opts.ndr64)) {
+            fatal(&log, init.io, "no host build matches the NDR64 setting for randomized ePIDs", .{});
+        }
     }
 
     // Client lists (strict mode): one per app, pre-filled unless --start-empty.
