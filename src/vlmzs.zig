@@ -564,6 +564,10 @@ const Conn = struct {
     call_id: u32 = 2,
     /// Applied to the BIND reply and to every RESPONSE read.
     idle: network.ReadOptions,
+    /// The owner reconnects and resends when the peer closed the connection, so
+    /// this attempt's report is dropped instead of printing a header the retry
+    /// would print again.
+    retry_on_close: bool = false,
 };
 
 /// Transfer syntax for a request: the reference client sends the first request
@@ -608,6 +612,60 @@ fn bindContexts(
     return bind;
 }
 
+/// One client connection that outlives a single request: the socket, its
+/// buffers, and the negotiated transfer syntax.
+///
+/// `Io.Reader`/`Io.Writer` find their owning struct with `@fieldParentPtr`, so a
+/// session must never be copied after `open` — it stays in the caller's frame as
+/// a single `var`, which is also what lets `reopen` re-address `conn` after a
+/// reconnection.
+const Session = struct {
+    io: Io,
+    stream: Io.net.Stream,
+    reader: Io.net.Stream.Reader,
+    writer: Io.net.Stream.Writer,
+    conn: Conn,
+    /// BIND/ALTER-CONTEXT outcome, kept so later requests can widen to NDR64.
+    bind: rpc.BindResult,
+    rbuf: [4096]u8,
+    wbuf: [4096]u8,
+
+    /// Connect and BIND, leaving `conn` ready to carry one REQUEST.
+    fn open(self: *Session, gpa: Allocator, opts: *const ClientOptions) !void {
+        const io = self.io;
+        self.stream = try network.connect(io, opts.host.?, opts.port, opts.address_family);
+        self.reader = self.stream.reader(io, &self.rbuf);
+        self.writer = self.stream.writer(io, &self.wbuf);
+        self.conn = .{
+            .reader = &self.reader.interface,
+            .writer = &self.writer.interface,
+            .use_ndr64 = false,
+            .call_id = 2,
+            .idle = .{ .peer = .{
+                .io = io,
+                .handle = self.stream.socket.handle,
+                .timeout = network.timeoutSeconds(opts.timeout_seconds),
+            } },
+            // A reused session reconnects when the peer closed; a one-shot
+            // connection (`--reconnect-per-request`) has nothing to retry.
+            .retry_on_close = true,
+        };
+        self.bind = try bindContexts(gpa, &self.reader.interface, &self.writer.interface, &self.conn.call_id, opts, self.conn.idle);
+        self.conn.use_ndr64 = requestUseNdr64(self.bind, true, opts.ndr64);
+    }
+
+    fn close(self: *Session) void {
+        self.stream.close(self.io);
+    }
+
+    /// Replace a connection the peer closed (`--disconnect-per-request` on the
+    /// server, or any keep-alive timeout) with a fresh one.
+    fn reopen(self: *Session, gpa: Allocator, opts: *const ClientOptions) !void {
+        self.close();
+        try self.open(gpa, opts);
+    }
+};
+
 fn sendRequest(
     gpa: Allocator,
     io: Io,
@@ -616,32 +674,40 @@ fn sendRequest(
     rng: std.Random,
     out: *Output,
     data: *const kmsdata.KmsData,
-) !void {
-    var stream = try network.connect(io, opts.host.?, opts.port, opts.address_family);
-    defer stream.close(io);
-
-    var rbuf: [4096]u8 = undefined;
-    var wbuf: [4096]u8 = undefined;
-    var reader = stream.reader(io, &rbuf);
-    var writer = stream.writer(io, &wbuf);
-
-    const idle: network.ReadOptions = .{ .peer = .{
+) !Outcome {
+    var session: Session = .{
         .io = io,
-        .handle = stream.socket.handle,
-        .timeout = network.timeoutSeconds(opts.timeout_seconds),
-    } };
-    var call_id: u32 = 2;
-    const bind = try bindContexts(gpa, &reader.interface, &writer.interface, &call_id, opts, idle);
-
-    var conn = Conn{
-        .reader = &reader.interface,
-        .writer = &writer.interface,
-        .use_ndr64 = requestUseNdr64(bind, true, opts.ndr64),
-        .call_id = call_id,
-        .idle = idle,
+        .stream = undefined,
+        .reader = undefined,
+        .writer = undefined,
+        .conn = undefined,
+        .bind = undefined,
+        .rbuf = undefined,
+        .wbuf = undefined,
     };
+    try session.open(gpa, opts);
+    defer session.close();
 
-    try sendRequestOn(gpa, &conn, base, rng, out, data, opts.verbose);
+    return sendRequestOn(gpa, &session.conn, base, rng, out, data, opts.verbose);
+}
+
+/// What one activation attempt produced. A server rejection and a failed
+/// response verification are both `failed`: the client did reach the server, but
+/// the activation did not succeed, which is what the exit status reports.
+/// Transport failures stay Zig errors and propagate to the caller.
+const Outcome = enum { activated, failed };
+
+/// Flag a send failure the caller will retry on a fresh connection, so the
+/// attempt's staged report is dropped instead of printing a request header the
+/// retry would print again. Returns the error unchanged.
+fn markRetryableSend(conn: *const Conn, discard_report: *bool, err: anyerror) anyerror {
+    switch (err) {
+        error.EndOfStream, error.ConnectionResetByPeer, error.SocketUnconnected => {
+            if (conn.retry_on_close) discard_report.* = true;
+        },
+        else => {},
+    }
+    return err;
 }
 
 /// Send one KMS request over an already-established connection (BIND done).
@@ -653,17 +719,20 @@ fn sendRequestOn(
     out: *Output,
     data: *const kmsdata.KmsData,
     verbose: bool,
-) !void {
+) !Outcome {
     // One request = one lock acquisition: stage the report here and flush it on
     // every exit path, including the early rejection/verification returns.
     var report_out_buffer: [report_buffer_size]u8 = undefined;
     var report_err_buffer: [report_buffer_size]u8 = undefined;
     var report = Report.init(out, &report_out_buffer, &report_err_buffer);
-    defer out.writeBlock(report.out.buffered(), report.err.buffered());
+    // Set when the connection turns out to be closed and the caller will resend
+    // on a fresh one: the nothing-happened attempt leaves no output behind.
+    var discard_report = false;
+    defer if (!discard_report) out.writeBlock(report.out.buffered(), report.err.buffered());
     // A network failure below returns with the request prefix still unline-
     // terminated; close the line before the flush above, so the caller's
     // stderr diagnostic does not continue it.
-    errdefer report.endLine();
+    errdefer if (!discard_report) report.endLine();
 
     const proto: u16 = @intCast(base.version >> 16);
     if (verbose) printRequestVerbose(&base, data, &report);
@@ -672,27 +741,27 @@ fn sendRequestOn(
     if (proto == 4) {
         var req: kms.RequestV4 = undefined;
         kms.createRequestV4(&req, &base);
-        const sent = try network.clientSendRequest(gpa, conn.reader, conn.writer, &conn.call_id, std.mem.asBytes(&req), conn.use_ndr64, conn.idle);
+        const sent = network.clientSendRequest(gpa, conn.reader, conn.writer, &conn.call_id, std.mem.asBytes(&req), conn.use_ndr64, conn.idle) catch |err| return markRetryableSend(conn, &discard_report, err);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
             printRejection(sent.status, &report);
-            return;
+            return .failed;
         }
         var resp: kms.ResponseV4 = undefined;
         const result = kms.decryptResponseV4(&resp, sent.data.len, sent.data, &req);
         if (!result.ok()) {
             reportVerificationErrors(result, &report);
-            return;
+            return .failed;
         }
         if (verbose) printResponseVerbose(&resp.base, null, result, &report) else printResultSummary(&resp.base, null, &report);
     } else {
         var req: kms.RequestV6 = undefined;
         kms.createRequestV6(&req, &base, rng);
-        const sent = try network.clientSendRequest(gpa, conn.reader, conn.writer, &conn.call_id, std.mem.asBytes(&req), conn.use_ndr64, conn.idle);
+        const sent = network.clientSendRequest(gpa, conn.reader, conn.writer, &conn.call_id, std.mem.asBytes(&req), conn.use_ndr64, conn.idle) catch |err| return markRetryableSend(conn, &discard_report, err);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
             printRejection(sent.status, &report);
-            return;
+            return .failed;
         }
         var resp: kms.ResponseV6 = undefined;
         // Only a v6 response carries a HwId, and only then does the decrypt
@@ -702,11 +771,20 @@ fn sendRequestOn(
         const result = kms.decryptResponseV6(&resp, sent.data.len, sent.data, &req, if (is_v6) &hwid else null);
         if (!result.ok()) {
             reportVerificationErrors(result, &report);
-            return;
+            return .failed;
         }
         const hwid_or_null: ?*const [8]u8 = if (is_v6) &hwid else null;
         if (verbose) printResponseVerbose(&resp.base, hwid_or_null, result, &report) else printResultSummary(&resp.base, hwid_or_null, &report);
     }
+    return .activated;
+}
+
+/// Exit non-zero when any request did not activate. The per-request diagnostics
+/// are already on stderr; this is the summary the exit status refers to.
+fn exitOnFailures(out: *Output, failures: u32, total: u32) void {
+    if (failures == 0) return;
+    out.eprint("{d} of {d} request(s) failed\n", .{ failures, total });
+    std.process.exit(1);
 }
 
 /// A dispatch failure is fatal for a one-shot client, but the requests already
@@ -734,15 +812,21 @@ fn sendRequestTask(
     out: *Output,
     data: *const kmsdata.KmsData,
     permits: *Io.Semaphore,
+    failures: *std.atomic.Value(u32),
 ) void {
     defer permits.post(io);
     var prng: std.Random.DefaultPrng = .init(seed);
-    sendRequest(gpa, io, opts, base, prng.random(), out, data) catch |e| switch (e) {
+    const outcome = sendRequest(gpa, io, opts, base, prng.random(), out, data) catch |e| switch (e) {
         // Aborted, not failed: this is `dispatchFailed`'s cancel, and the
         // dispatch error it is already reporting says why.
-        error.Canceled => {},
-        else => out.eprint("request failed: {s}\n", .{@errorName(e)}),
+        error.Canceled => return,
+        else => {
+            out.eprint("request failed: {s}\n", .{@errorName(e)});
+            _ = failures.fetchAdd(1, .monotonic);
+            return;
+        },
     };
+    if (outcome == .failed) _ = failures.fetchAdd(1, .monotonic);
 }
 
 /// How many `--reconnect-per-request` requests may be in flight at once.
@@ -763,8 +847,34 @@ fn parallelism() usize {
 /// Window used when the platform cannot report a CPU count.
 const fallback_parallelism: usize = 8;
 
+/// Send one request over `session`, reconnecting once when the peer has closed
+/// the connection.
+///
+/// A server run with `--disconnect-per-request` closes after every RESPONSE, so
+/// the next request on a keep-alive connection meets a closed socket. The failed
+/// attempt never reached a live connection, so it is safe to send again: one
+/// reopen per request, no retry loop.
+fn sendOnSession(
+    gpa: Allocator,
+    opts: *const ClientOptions,
+    session: *Session,
+    base: kms.Request,
+    rng: std.Random,
+    out: *Output,
+    data: *const kmsdata.KmsData,
+) !Outcome {
+    return sendRequestOn(gpa, &session.conn, base, rng, out, data, opts.verbose) catch |err| switch (err) {
+        error.EndOfStream, error.ConnectionResetByPeer, error.SocketUnconnected => {
+            try session.reopen(gpa, opts);
+            return sendRequestOn(gpa, &session.conn, base, rng, out, data, opts.verbose);
+        },
+        else => |e| return e,
+    };
+}
+
 /// Send `--count` requests over a single reused connection (keep-alive).
 /// Requests are sequential because one connection carries one in-flight RPC.
+/// Returns how many of them did not activate.
 fn sendRequestsReused(
     gpa: Allocator,
     io: Io,
@@ -773,39 +883,31 @@ fn sendRequestsReused(
     sku_index: usize,
     rng: std.Random,
     out: *Output,
-) !void {
-    var stream = try network.connect(io, opts.host.?, opts.port, opts.address_family);
-    defer stream.close(io);
-
-    var rbuf: [4096]u8 = undefined;
-    var wbuf: [4096]u8 = undefined;
-    var reader = stream.reader(io, &rbuf);
-    var writer = stream.writer(io, &wbuf);
-
-    const idle: network.ReadOptions = .{ .peer = .{
+) !u32 {
+    var session: Session = .{
         .io = io,
-        .handle = stream.socket.handle,
-        .timeout = network.timeoutSeconds(opts.timeout_seconds),
-    } };
-    var call_id: u32 = 2;
-    const bind = try bindContexts(gpa, &reader.interface, &writer.interface, &call_id, opts, idle);
-
-    var conn = Conn{
-        .reader = &reader.interface,
-        .writer = &writer.interface,
-        .use_ndr64 = requestUseNdr64(bind, true, opts.ndr64),
-        .call_id = call_id,
-        .idle = idle,
+        .stream = undefined,
+        .reader = undefined,
+        .writer = undefined,
+        .conn = undefined,
+        .bind = undefined,
+        .rbuf = undefined,
+        .wbuf = undefined,
     };
+    try session.open(gpa, opts);
+    defer session.close();
 
+    var failures: u32 = 0;
     var i: usize = 0;
     while (i < opts.count) : (i += 1) {
         const base = buildRequestBase(opts, data, sku_index, rng, io);
-        try sendRequestOn(gpa, &conn, base, rng, out, data, opts.verbose);
+        const outcome = try sendOnSession(gpa, opts, &session, base, rng, out, data);
+        if (outcome == .failed) failures += 1;
         // Later requests on the same association use NDR64 when the server
         // supports it (C `firstPacketSent` in `rpcSendRequest`).
-        conn.use_ndr64 = requestUseNdr64(bind, false, opts.ndr64);
+        session.conn.use_ndr64 = requestUseNdr64(session.bind, false, opts.ndr64);
     }
+    return failures;
 }
 
 fn listProducts(data: *const kmsdata.KmsData, out: *Output) void {
@@ -930,6 +1032,7 @@ pub fn main(init: std.process.Init) !void {
         // `async_limit`); the dispatcher blocks on it, so the bound is ours.
         var group: Io.Group = .init;
         var permits: Io.Semaphore = .{ .permits = parallelism() };
+        var failures: std.atomic.Value(u32) = .init(0);
         var i: usize = 0;
         while (i < opts.count) : (i += 1) {
             const seed = prng.random().int(u64);
@@ -939,7 +1042,7 @@ pub fn main(init: std.process.Init) !void {
                 dispatchFailed(&out, init.io, &group, e);
             };
             group.concurrent(init.io, sendRequestTask, .{
-                init.gpa, init.io, &opts, base, seed, &out, &data, &permits,
+                init.gpa, init.io, &opts, base, seed, &out, &data, &permits, &failures,
             }) catch |e| {
                 permits.post(init.io);
                 dispatchFailed(&out, init.io, &group, e);
@@ -949,12 +1052,14 @@ pub fn main(init: std.process.Init) !void {
             out.eprint("request failed: {s}\n", .{@errorName(e)});
             std.process.exit(1);
         };
+        exitOnFailures(&out, failures.load(.monotonic), opts.count);
     } else {
         // Reuse one connection for all requests (keep-alive), sent sequentially.
-        sendRequestsReused(init.gpa, init.io, &opts, &data, sku_index, prng.random(), &out) catch |e| {
+        const failures = sendRequestsReused(init.gpa, init.io, &opts, &data, sku_index, prng.random(), &out) catch |e| {
             out.eprint("request failed: {s}\n", .{@errorName(e)});
             std.process.exit(1);
         };
+        exitOnFailures(&out, failures, opts.count);
     }
 }
 
@@ -1284,4 +1389,82 @@ test "the answer line carries the HwId only for v6" {
     var v5_buffer: [128]u8 = undefined;
     const v5_line = printOne(io, null, &v5_buffer);
     try std.testing.expect(std.mem.indexOf(u8, v5_line, "(") == null);
+}
+
+test "a server that closes after each request is reconnected" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var data = try kmsdata.parse(alloc, @embedFile("vlmcsd.kmd"));
+    defer data.deinit(alloc);
+
+    // A real loopback server, so `sendRequestsReused` exercises its actual
+    // socket path instead of a stub.
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try Io.net.IpAddress.listen(&addr, io, .{ .mode = .stream });
+    defer listener.deinit(io);
+
+    var cfg = kms.ServerConfig{ .data = &data };
+
+    const Server = struct {
+        fn nowUnix(context: ?*anyopaque) i64 {
+            _ = context;
+            return 1_700_000_000;
+        }
+
+        /// Serve every connection until the group is canceled. Each one answers
+        /// BIND plus one request and then closes — the `--disconnect-per-request`
+        /// shape the client has to reconnect through.
+        fn run(
+            io_: Io,
+            listener_: *Io.net.Server,
+            alloc_: Allocator,
+            cfg_: *const kms.ServerConfig,
+        ) void {
+            var prng: std.Random.DefaultPrng = .init(0x9e37_79b9);
+            while (true) {
+                const stream = listener_.accept(io_) catch return;
+                defer stream.close(io_);
+                var rbuf: [4096]u8 = undefined;
+                var wbuf: [4096]u8 = undefined;
+                var reader = stream.reader(io_, &rbuf);
+                var writer = stream.writer(io_, &wbuf);
+                _ = network.serveRpc(alloc_, &reader.interface, &writer.interface, prng.random(), .{
+                    .cfg = cfg_,
+                    .clock = .{ .nowUnix = nowUnix },
+                    .disconnect_per_request = true,
+                    .idle = .{ .peer = .{
+                        .io = io_,
+                        .handle = stream.socket.handle,
+                        .timeout = network.timeoutSeconds(5),
+                    } },
+                }) catch {};
+            }
+        }
+    };
+
+    var group: Io.Group = .init;
+    group.concurrent(io, Server.run, .{ io, &listener, alloc, &cfg }) catch |e| return e;
+    defer group.cancel(io);
+
+    var opts = ClientOptions{};
+    opts.host = "127.0.0.1";
+    opts.port = listener.socket.address.getPort();
+    opts.count = 3;
+    opts.timeout_seconds = default_timeout_seconds;
+
+    var unused_out: [64]u8 = undefined;
+    var unused_err: [64]u8 = undefined;
+    var output = Output.init(io, &unused_out, &unused_err);
+    var sink_buffer: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buffer);
+    output.test_out = &sink;
+
+    var prng: std.Random.DefaultPrng = .init(0x1234_5678);
+    const failures = try sendRequestsReused(alloc, io, &opts, &data, 0, prng.random(), &output);
+
+    // Every request activated, on its own connection: no failure, and one
+    // answer line per request (the dropped attempt leaves no output behind).
+    try std.testing.expectEqual(@as(u32, 0), failures);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, sink.buffered(), "\n"));
 }

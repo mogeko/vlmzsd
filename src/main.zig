@@ -550,6 +550,13 @@ fn notePoolThread(
     );
 }
 
+/// Wall clock for one connection's requests: `serveRpc` calls this before
+/// dispatching each REQUEST, so the timestamp checks see the current time.
+fn clientNowUnix(context: ?*anyopaque) i64 {
+    const ctx: *const ClientContext = @ptrCast(@alignCast(context.?));
+    return cli_helper.nowUnix(ctx.io);
+}
+
 /// Serve one connection as a pooled task (dispatched via `Group.concurrent`).
 /// Releases its admission slot and frees the context on exit.
 fn serveClientThread(ctx: *ClientContext) void {
@@ -573,15 +580,16 @@ fn serveClientThread(ctx: *ClientContext) void {
     notePoolThread(ctx.tally, ctx.log, true);
     if (!ctx.quiet) ctx.log.debug("connection from {s} accepted", .{ctx.peer});
 
-    const now_unix = cli_helper.nowUnix(ctx.io);
-
     var rbuf: [4096]u8 = undefined;
     var wbuf: [4096]u8 = undefined;
     var reader = ctx.stream.reader(ctx.io, &rbuf);
     var writer = ctx.stream.writer(ctx.io, &wbuf);
 
-    const end: network.ServeEnd = network.serveRpc(ctx.gpa, &reader.interface, &writer.interface, ctx.prng.random(), now_unix, .{
+    const end: network.ServeEnd = network.serveRpc(ctx.gpa, &reader.interface, &writer.interface, ctx.prng.random(), .{
         .cfg = ctx.cfg,
+        // Sampled per request, so `--check-client-time` and level-2 ePIDs follow
+        // a keep-alive connection instead of measuring against the accept time.
+        .clock = .{ .context = ctx, .nowUnix = clientNowUnix },
         .on_event = logProtocolEvent,
         .event_context = ctx,
         .secondary_address = ctx.port_str,

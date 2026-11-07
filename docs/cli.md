@@ -208,6 +208,10 @@ error rather than truncated. `--epid` overrides beat every level, and any other
   data; `2` rejects retail/preview products.
 - `--ip-protection`: `1` listens only on the host's private addresses — it
   replaces `--listen` — and `2` rejects clients whose address is public.
+- `--check-client-time` rejects a request whose timestamp differs from the
+  server's clock by more than four hours (`0xC004F06C`). The clock is read for
+  every request, not once per connection, so a keep-alive client that sends
+  requests hours apart is judged against the moment each one arrives.
 
 Bits outside those are ignored, so a value above the documented range is accepted
 and behaves like the levels it shares bits with.
@@ -343,7 +347,15 @@ bounded only by the kernel's own SYN timeout.
 one. Requests then run concurrently, roughly one per logical CPU — a request
 parked in a read holds a worker — so `--count 600` against a silent peer
 completes in waves rather than as 600 threads. Without it, all requests share one
-keep-alive connection and are sent sequentially.
+keep-alive connection and are sent sequentially; if the server closes that
+connection between requests (a server started with `--disconnect-per-request`),
+the client reconnects, re-binds, and sends the request again. The failed attempt
+never completed, so nothing is printed for it; a request whose response was lost
+after the server processed it would be counted twice by the server, which only
+affects its client count.
 
 The client exits `0` when all its requests succeeded, and `1` when one fails or
-an option is invalid.
+an option is invalid. A request "fails" when it cannot be sent, when the server
+rejects it (for example `0xC004F042` from a whitelist), or when the response
+fails verification; the per-request diagnostic goes to stderr, and a final
+`<n> of <count> request(s) failed` line summarizes it.
