@@ -34,11 +34,13 @@ fn writeHelp(w: *std.Io.Writer) !void {
     , .{});
 }
 
-fn errOut(io: Io, comptime fmt: []const u8, args: anytype) void {
+/// Report a fatal error on stderr and exit with status 1.
+fn fatal(io: Io, comptime fmt: []const u8, args: anytype) noreturn {
     var ebuf: [512]u8 = undefined;
     var ew = std.Io.File.writer(std.Io.File.stderr(), io, &ebuf);
     ew.interface.print(fmt, args) catch {};
     ew.interface.flush() catch {};
+    std.process.exit(1);
 }
 
 /// Derive the default output path: the input's stem plus `.json` (with `-r`)
@@ -95,24 +97,20 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--output")) {
             i += 1;
             if (i >= args.items.len) {
-                errOut(init.io, "kmdconv: error: -o/--output requires an argument\n", .{});
-                std.process.exit(1);
+                fatal(init.io, "kmdconv: error: -o/--output requires an argument\n", .{});
             }
             output_path = args.items[i];
         } else if (a.len > 0 and a[0] == '-' and !std.mem.eql(u8, a, "-")) {
-            errOut(init.io, "kmdconv: error: unknown option {s}\n", .{a});
-            std.process.exit(1);
+            fatal(init.io, "kmdconv: error: unknown option {s}\n", .{a});
         } else if (input == null) {
             input = a;
         } else {
-            errOut(init.io, "kmdconv: error: too many positional arguments\n", .{});
-            std.process.exit(1);
+            fatal(init.io, "kmdconv: error: too many positional arguments\n", .{});
         }
     }
 
     if (input == null) {
-        errOut(init.io, "kmdconv: error: missing input file (use - for stdin)\n", .{});
-        std.process.exit(1);
+        fatal(init.io, "kmdconv: error: missing input file (use - for stdin)\n", .{});
     }
 
     // Read input.
@@ -123,10 +121,8 @@ pub fn main(init: std.process.Init) !void {
         input_data = try readStdin(init.io, init.gpa);
         input_owned = true;
     } else {
-        input_data = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, input.?, init.gpa, .unlimited) catch |e| {
-            errOut(init.io, "kmdconv: error: cannot read {s}: {s}\n", .{ input.?, @errorName(e) });
-            std.process.exit(1);
-        };
+        input_data = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, input.?, init.gpa, .unlimited) catch |e|
+            fatal(init.io, "kmdconv: error: cannot read {s}: {s}\n", .{ input.?, @errorName(e) });
         input_owned = true;
     }
 
@@ -137,26 +133,26 @@ pub fn main(init: std.process.Init) !void {
     if (reverse) {
         var arena: std.heap.ArenaAllocator = .init(init.gpa);
         defer arena.deinit();
-        const data = kmsdata.parse(arena.allocator(), input_data) catch |e| {
-            errOut(init.io, "kmdconv: error: invalid .kmd data: {s} (is this a JSON file? remove -r to convert it to .kmd)\n", .{@errorName(e)});
-            std.process.exit(1);
-        };
-        output_data = kmsDataToJson(&data, init.gpa) catch |e| {
-            errOut(init.io, "kmdconv: error: cannot serialize JSON: {s}\n", .{@errorName(e)});
-            std.process.exit(1);
-        };
+        const data = kmsdata.parse(arena.allocator(), input_data) catch |e|
+            fatal(
+                init.io,
+                "kmdconv: error: invalid .kmd data: {s} (is this a JSON file? remove -r to convert it to .kmd)\n",
+                .{@errorName(e)},
+            );
+        output_data = kmsDataToJson(&data, init.gpa) catch |e|
+            fatal(init.io, "kmdconv: error: cannot serialize JSON: {s}\n", .{@errorName(e)});
         output_owned = true;
     } else {
         var arena: std.heap.ArenaAllocator = .init(init.gpa);
         defer arena.deinit();
-        const data = jsonToKmsData(arena.allocator(), input_data) catch |e| {
-            errOut(init.io, "kmdconv: error: invalid JSON input: {s} (is this a .kmd file? use -r to convert it to JSON)\n", .{@errorName(e)});
-            std.process.exit(1);
-        };
-        output_data = kmsdata.write(init.gpa, &data) catch |e| {
-            errOut(init.io, "kmdconv: error: cannot build .kmd data: {s}\n", .{@errorName(e)});
-            std.process.exit(1);
-        };
+        const data = jsonToKmsData(arena.allocator(), input_data) catch |e|
+            fatal(
+                init.io,
+                "kmdconv: error: invalid JSON input: {s} (is this a .kmd file? use -r to convert it to JSON)\n",
+                .{@errorName(e)},
+            );
+        output_data = kmsdata.write(init.gpa, &data) catch |e|
+            fatal(init.io, "kmdconv: error: cannot build .kmd data: {s}\n", .{@errorName(e)});
         output_owned = true;
     }
 
@@ -165,19 +161,15 @@ pub fn main(init: std.process.Init) !void {
     var derived: ?[]u8 = null;
     defer if (derived) |p| init.gpa.free(p);
     if (output_path == null and !std.mem.eql(u8, input.?, "-")) {
-        derived = deriveOutputPath(init.gpa, input.?, reverse) catch |e| {
-            errOut(init.io, "kmdconv: error: cannot derive output path: {s}\n", .{@errorName(e)});
-            std.process.exit(1);
-        };
+        derived = deriveOutputPath(init.gpa, input.?, reverse) catch |e|
+            fatal(init.io, "kmdconv: error: cannot derive output path: {s}\n", .{@errorName(e)});
     }
     const out_path: ?[]const u8 = output_path orelse derived;
 
     // Write output.
     if (out_path) |p| {
-        std.Io.Dir.writeFile(std.Io.Dir.cwd(), init.io, .{ .sub_path = p, .data = output_data }) catch |e| {
-            errOut(init.io, "kmdconv: error: cannot write {s}: {s}\n", .{ p, @errorName(e) });
-            std.process.exit(1);
-        };
+        std.Io.Dir.writeFile(std.Io.Dir.cwd(), init.io, .{ .sub_path = p, .data = output_data }) catch |e|
+            fatal(init.io, "kmdconv: error: cannot write {s}: {s}\n", .{ p, @errorName(e) });
     } else {
         var obuf: [8192]u8 = undefined;
         var ow = std.Io.File.writer(std.Io.File.stdout(), init.io, &obuf);
