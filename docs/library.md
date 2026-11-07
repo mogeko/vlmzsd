@@ -134,6 +134,11 @@ from type signatures alone:
   `items`, `host_builds`) with the allocator you pass in; call
   `data.deinit(allocator)` exactly once, or you leak / double-free. `write` is
   the inverse and returns a buffer you own.
+- **Hand-built data.** A `KmsData` assembled by hand (rather than by `parse`)
+  must pass `kmsdata.validate` before use — the count fields drive `apps()` /
+  `kms()` / `skus()`, and the record indices drive the server's lookups.
+  `kms.createResponseBase` re-checks the shapes it depends on and answers
+  `0x8007000D` instead of reading past them.
 - **Lifetime.** Parsing is zero-copy: every string in `KmsData` (CSVLC names,
   product names, host-build display names) is a slice of the `raw` buffer you
   passed to `parse`. Keep that buffer alive and unmodified for as long as the
@@ -182,6 +187,7 @@ tracked here; the CLI surface is specified in [`docs/cli.md`](./cli.md).
 | `kms.hasHostBuildForNdr64` | added | whether the data can supply a host build for the negotiated transfer syntax |
 | `kms.randomLcid` | added | one LCID from the internal list; level-1 pre-generation draws it once per run, level 2 still draws per request |
 | `kms.max_lcid`, `kms.max_build` | added | the largest `ServerConfig.lcid` (32767) and `build` (65535) the ePID generator can represent |
+| `kmsdata.validate` | added | the structural check `parse`/`write` apply, callable on a hand-built `KmsData` |
 | `rpc.BindNegotiation` | added | `ndr32_negotiated` / `ndr64_negotiated` and `hasNdr32()` / `hasNdr64()`; the ids alone cannot say whether a syntax was negotiated, since a client may propose `invalid_ctx` |
 | `kmsdata.parse`, `kmsdata.write` | behavior | structurally invalid data → `error.InvalidFormat` (offsets not the contiguous layout of [`docs/kmd-format.md`](./kmd-format.md) §2, counts overflowing or past the file, an empty CSVLC/App/KMS/SKU/HostBuild array, an item index outside its array, `MaxKeyId <= MinKeyId`, a negative `BuildNumber`/`PlatformId`) |
 | `kms.createResponseBase` | behavior | `n_policy > 1000`, `KmsData` counts that do not describe `items`, `lcid`/`build` above `kms.max_lcid`/`kms.max_build`, or an unusable CSVLC/ePID → `hresult.invalid_arg` (`0x8007000D`), still as a normal RESPONSE |
@@ -191,4 +197,5 @@ tracked here; the CLI surface is specified in [`docs/cli.md`](./cli.md).
 | `rpc.wrapKmsRequest` | behavior | a request too large for the 16-bit `frag_length` → `error.PacketTooLarge` |
 | `kms.unixTimeToFileTime` | behavior | a date before the FILETIME epoch saturates to `0` instead of trapping |
 | `kms.isValidHostBuild` | behavior | a negative `BuildNumber` in a hand-built `KmsData` is "no match", not a trap |
+| `kms.getPlatformId`, `kms.getReleaseDate` | behavior | a `KmsData` with no host builds returns `0` instead of indexing the empty table |
 | `kms.initClientLists` | behavior | a `lists` slice longer than `data.apps()` leaves the extra slots empty instead of indexing past the app table |

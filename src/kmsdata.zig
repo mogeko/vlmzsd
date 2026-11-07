@@ -98,10 +98,11 @@ fn checkedMul(a: usize, b: usize) error{InvalidFormat}!usize {
     return std.math.mul(usize, a, b) catch error.InvalidFormat;
 }
 
-/// Structural and index validation shared by `parse` and `write`.
-/// `parse` builds every array first, then rejects data that would make later
-/// array indexing or record iteration unsafe.
-fn validateData(data: *const KmsData) error{InvalidFormat}!void {
+/// Structural and index validation shared by `parse` and `write`, and the check
+/// a caller building a `KmsData` by hand must pass before using it: the count
+/// fields drive every accessor (`apps()` / `kms()` / `skus()`) and the record
+/// indices drive the server's lookups.
+pub fn validate(data: *const KmsData) error{InvalidFormat}!void {
     if (data.major_ver != 2) return error.InvalidFormat;
     if (data.csvlk.len == 0 or data.host_builds.len == 0) return error.InvalidFormat;
     if (data.app_count == 0 or data.kms_count == 0 or data.sku_count == 0) return error.InvalidFormat;
@@ -255,7 +256,7 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
         .sku_count = sku_count,
         .host_builds = host_builds,
     };
-    try validateData(&data);
+    try validate(&data);
     return data;
 }
 
@@ -264,7 +265,7 @@ pub fn parse(allocator: Allocator, raw: []const u8) !KmsData {
 /// semantically identical to the source but not necessarily byte-identical.
 /// The caller owns the returned slice.
 pub fn write(allocator: Allocator, data: *const KmsData) ![]u8 {
-    try validateData(data);
+    try validate(data);
     const csvlk_count = data.csvlk.len;
     const total_items = data.items.len;
     const hb_count = data.host_builds.len;
@@ -591,4 +592,28 @@ test "write rejects illegal data" {
     data.items[data.app_count].epid_index = 0;
     data.app_count = 0;
     try std.testing.expectError(error.InvalidFormat, write(alloc, &data));
+}
+
+test "validate rejects a hand-built KmsData whose counts do not match its items" {
+    // `parse` and `write` run this check themselves; a library caller that
+    // builds a `KmsData` by hand has to run it before the accessors are used.
+    const alloc = std.testing.allocator;
+    var data = try parse(alloc, @embedFile("vlmcsd.kmd"));
+    defer data.deinit(alloc);
+
+    try validate(&data);
+
+    // Counts that describe more items than the array holds.
+    const app_count = data.app_count;
+    data.app_count = data.items.len + 1;
+    try std.testing.expectError(error.InvalidFormat, validate(&data));
+    data.app_count = app_count;
+
+    // Counts that leave the SKU view empty while claiming one.
+    const sku_count = data.sku_count;
+    data.sku_count = sku_count + 1;
+    try std.testing.expectError(error.InvalidFormat, validate(&data));
+    data.sku_count = sku_count;
+
+    try validate(&data);
 }

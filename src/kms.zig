@@ -345,6 +345,7 @@ pub fn getPlatformId(data: *const kmsdata.KmsData, host_build: i32) i32 {
     for (data.host_builds) |hb| {
         if (hb.build_number <= host_build) return hb.platform_id;
     }
+    if (data.host_builds.len == 0) return 0;
     return data.host_builds[data.host_builds.len - 1].platform_id;
 }
 
@@ -355,6 +356,7 @@ pub fn getReleaseDate(data: *const kmsdata.KmsData, host_build: i32) i64 {
         i -= 1;
         if (data.host_builds[i].build_number >= host_build) return data.host_builds[i].release_date;
     }
+    if (data.host_builds.len == 0) return 0;
     return data.host_builds[0].release_date;
 }
 
@@ -1748,4 +1750,19 @@ test "initClientLists tolerates a list slice longer than the app table" {
     // Every app got its prefill; the extra slot stays empty.
     try std.testing.expect(lists.lists[0].max_count == td.data.apps()[0].n_count_policy);
     try std.testing.expectEqual(@as(usize, 0), lists.lists[td.data.app_count].max_count);
+}
+
+test "host-build lookups tolerate a data file with no host builds" {
+    // Both lookups fall back to an entry at the ends of the table; with an empty
+    // table that fallback would index out of bounds. `generateRandomPid` checks
+    // first, but these are public entry points of their own.
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+    const saved = td.data.host_builds;
+    td.data.host_builds = &.{};
+    defer td.data.host_builds = saved;
+
+    try std.testing.expectEqual(@as(i32, 0), getPlatformId(&td.data, 17763));
+    try std.testing.expectEqual(@as(i64, 0), getReleaseDate(&td.data, 17763));
 }

@@ -275,8 +275,9 @@ pub fn aesCmacV4(message: []const u8, out: *Block) void {
     out.* = mac;
 }
 
-/// AES-encrypt one block with a 16- or 20-byte key. `is_v6` selects the
-/// non-standard v6 key-schedule modification (16-byte keys only).
+/// AES-encrypt one block. `key` must be 16 or 20 bytes (anything else has no
+/// AES key schedule); `is_v6` selects the non-standard v6 key-schedule
+/// modification (16-byte keys only).
 pub fn aesEncryptBlock(key: []const u8, is_v6: bool, block: Block) Block {
     return switch (key.len) {
         16 => blk: {
@@ -291,7 +292,8 @@ pub fn aesEncryptBlock(key: []const u8, is_v6: bool, block: Block) Block {
     };
 }
 
-/// AES-decrypt one block (inverse of `aesEncryptBlock`).
+/// AES-decrypt one block (inverse of `aesEncryptBlock`). `key` must be 16 or
+/// 20 bytes.
 pub fn aesDecryptBlock(key: []const u8, is_v6: bool, block: Block) Block {
     return switch (key.len) {
         16 => blk: {
@@ -353,7 +355,8 @@ fn cbcDecrypt(comptime nk: usize, rk: []const u8, iv: ?*const Block, data: []u8)
 }
 
 /// CBC-encrypt `data[0..len]` in place with PKCS#7 padding (always pads).
-/// `data` must have capacity for the padded length. Returns the padded length.
+/// `key` must be 16 or 20 bytes; `data` must hold the padded length. Returns the
+/// padded length.
 pub fn aesCbcEncrypt(key: []const u8, is_v6: bool, iv: ?*const Block, data: []u8, len: usize) usize {
     const pad: usize = if (len % 16 == 0) 16 else 16 - (len % 16);
     const new_len = len + pad;
@@ -373,7 +376,8 @@ pub fn aesCbcEncrypt(key: []const u8, is_v6: bool, iv: ?*const Block, data: []u8
     return new_len;
 }
 
-/// CBC-decrypt `data[0..len]` in place. `len` must be a multiple of 16.
+/// CBC-decrypt `data[0..len]` in place. `key` must be 16 or 20 bytes and `len`
+/// a multiple of 16 no longer than `data`.
 pub fn aesCbcDecrypt(key: []const u8, is_v6: bool, iv: ?*const Block, data: []u8, len: usize) void {
     switch (key.len) {
         16 => {
