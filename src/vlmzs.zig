@@ -229,8 +229,10 @@ fn formatUtc(unix: i64, buf: []u8) []const u8 {
     const yad = epoch.getEpochDay().calculateYearDay();
     const mad = yad.calculateMonthDay();
     const day_secs: u64 = secs % 86400;
+    // A four-digit year is what the fixed-width format holds; clamp a broken
+    // clock instead of overflowing the caller's buffer.
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
-        @as(u32, yad.year),
+        @as(u32, @min(yad.year, 9999)),
         @as(u32, mad.month.numeric()),
         @as(u32, mad.day_index) + 1,
         @as(u32, @intCast(day_secs / 3600)),
@@ -319,29 +321,49 @@ fn parseHostPort(host_arg: []const u8) !struct { host: []const u8, port: u16 } {
     return .{ .host = host_arg, .port = default_port };
 }
 
-fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
+/// Parse an integer option, recording which option and value failed so the
+/// caller can name them (`--count: invalid value "abc"`).
+fn intValue(comptime T: type, res: *const cli_helper.Result, spelling: []const u8, diag: *cli_helper.Diag) !?T {
+    const text = res.get(spelling[2..]) orelse return null;
+    return std.fmt.parseInt(T, text, 10) catch |e| {
+        diag.* = .{ .spelling = spelling, .value = text };
+        return e;
+    };
+}
+
+fn guidValue(res: *const cli_helper.Result, spelling: []const u8, diag: *cli_helper.Diag) !?[16]u8 {
+    const text = res.get(spelling[2..]) orelse return null;
+    return cli_helper.parseGuid(text) catch |e| {
+        diag.* = .{ .spelling = spelling, .value = text };
+        return e;
+    };
+}
+
+fn resolveOptions(res: *const cli_helper.Result, diag: *cli_helper.Diag) !ClientOptions {
     var opts = ClientOptions{};
 
     // Positional HOST[:PORT]; a second word is a mistyped flag value.
     if (res.positionals.items.len > 1) return error.UnexpectedPositional;
     if (res.positionals.items.len > 0) {
-        const hp = try parseHostPort(res.positionals.items[0]);
+        const hp = parseHostPort(res.positionals.items[0]) catch |e| {
+            diag.* = .{ .spelling = "HOST[:PORT]", .value = res.positionals.items[0] };
+            return e;
+        };
         opts.host = hp.host;
         opts.port = hp.port;
     }
 
     opts.product = res.get("product");
     opts.data_file = res.get("data");
-    opts.protocol = if (res.get("protocol")) |s| blk: {
-        const version = try std.fmt.parseInt(u16, s, 10);
+    opts.protocol = if (try intValue(u16, res, "--protocol", diag)) |version| blk: {
         if (version != 4 and version != 5 and version != 6) return error.InvalidProtocol;
         break :blk version;
     } else 0;
-    if (res.get("app-id")) |s| opts.app_id = try cli_helper.parseGuid(s);
-    if (res.get("sku-id")) |s| opts.sku_id = try cli_helper.parseGuid(s);
-    if (res.get("kms-id")) |s| opts.kms_id = try cli_helper.parseGuid(s);
-    if (res.get("cmid")) |s| opts.cmid = try cli_helper.parseGuid(s);
-    if (res.get("prev-cmid")) |s| opts.prev_cmid = try cli_helper.parseGuid(s);
+    if (try guidValue(res, "--app-id", diag)) |g| opts.app_id = g;
+    if (try guidValue(res, "--sku-id", diag)) |g| opts.sku_id = g;
+    if (try guidValue(res, "--kms-id", diag)) |g| opts.kms_id = g;
+    if (try guidValue(res, "--cmid", diag)) |g| opts.cmid = g;
+    if (try guidValue(res, "--prev-cmid", diag)) |g| opts.prev_cmid = g;
     opts.workstation = res.get("workstation");
     if (opts.workstation) |name| {
         // The request field is UTF-16; the option is UTF-8. Reject a name that
@@ -349,19 +371,22 @@ fn resolveOptions(res: *const cli_helper.Result) !ClientOptions {
         if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidWorkstation;
     }
     opts.vm = res.hasFlag("vm");
-    opts.count = if (res.get("count")) |s| try std.fmt.parseInt(u32, s, 10) else 1;
-    opts.virtual_clients = if (res.get("virtual-clients")) |s| try std.fmt.parseInt(u32, s, 10) else 0;
-    opts.grace = if (res.get("grace")) |s| try std.fmt.parseInt(u32, s, 10) else default_grace_minutes;
-    opts.address_family = if (res.get("address-family")) |s| try std.fmt.parseInt(u8, s, 10) else 0;
+    opts.count = (try intValue(u32, res, "--count", diag)) orelse 1;
+    opts.virtual_clients = (try intValue(u32, res, "--virtual-clients", diag)) orelse 0;
+    opts.grace = (try intValue(u32, res, "--grace", diag)) orelse default_grace_minutes;
+    opts.address_family = (try intValue(u8, res, "--address-family", diag)) orelse 0;
     if (opts.address_family != 0 and opts.address_family != 4 and opts.address_family != 6) {
         return error.InvalidAddressFamily;
     }
     opts.list_products = res.hasFlag("list-products");
-    opts.license_status = if (res.get("license-status")) |s| try std.fmt.parseInt(u32, s, 10) else 1;
+    opts.license_status = (try intValue(u32, res, "--license-status", diag)) orelse 1;
     if (opts.license_status > max_license_status) return error.InvalidLicenseStatus;
     opts.reconnect_per_request = res.hasFlag("reconnect-per-request");
     opts.timeout_seconds = if (res.get("timeout")) |s|
-        std.math.cast(u32, try cli_helper.parseDurationSeconds(s)) orelse return error.InvalidTimeout
+        std.math.cast(u32, cli_helper.parseDurationSeconds(s) catch |e| {
+            diag.* = .{ .spelling = "--timeout", .value = s };
+            return e;
+        }) orelse return error.InvalidTimeout
     else
         default_timeout_seconds;
     opts.multiplexed = !res.hasFlag("no-multiplexed");
@@ -993,15 +1018,17 @@ pub fn main(init: std.process.Init) !void {
         try args_list.append(init.gpa, arg);
     }
 
-    var res = cli_helper.parse(init.gpa, &vlmzs_opts, args_list.items) catch |err| {
-        // Short diagnostic; the full help is one `--help` away.
-        cli_helper.fatalStderr(init.io, "vlmzs", "{s}", .{@errorName(err)});
+    var diag: cli_helper.Diag = .{};
+    var res = cli_helper.parseWithDiag(init.gpa, &vlmzs_opts, args_list.items, &diag) catch |err| {
+        // Short diagnostic naming the argument; the full help is one `--help` away.
+        var ebuf: [128]u8 = undefined;
+        cli_helper.fatalStderr(init.io, "vlmzs", "{s}", .{cli_helper.parseErrorMessage(err, diag, &ebuf)});
     };
     defer res.deinit();
 
     if (res.hasFlag("help")) {
         var hbuf: [4096]u8 = undefined;
-        var hw = std.Io.File.writer(std.Io.File.stderr(), init.io, &hbuf);
+        var hw = std.Io.File.writer(std.Io.File.stdout(), init.io, &hbuf);
         try cli_helper.writeHelp(&hw.interface, "vlmzs", &vlmzs_opts, "[HOST[:PORT]]");
         try hw.interface.flush();
         return;
@@ -1018,12 +1045,21 @@ pub fn main(init: std.process.Init) !void {
     var err_buf: [4096]u8 = undefined;
     var out: Output = .init(init.io, &out_buf, &err_buf);
 
-    var opts = resolveOptions(&res) catch |e| switch (e) {
+    var opts = resolveOptions(&res, &diag) catch |e| switch (e) {
         error.UnexpectedPositional => fatal(&out, "error: at most one HOST[:PORT] argument is accepted\n", .{}),
         error.InvalidProtocol => fatal(&out, "error: --protocol must be 4, 5, or 6\n", .{}),
         error.InvalidLicenseStatus => fatal(&out, "error: --license-status must be 0..{d}\n", .{max_license_status}),
         error.InvalidWorkstation => fatal(&out, "error: --workstation must be valid UTF-8\n", .{}),
-        else => fatal(&out, "error: {s}\n", .{@errorName(e)}),
+        error.InvalidAddressFamily => fatal(&out, "error: --address-family must be 4 or 6\n", .{}),
+        error.InvalidTimeout => fatal(&out, "error: --timeout must be at most {d} seconds\n", .{std.math.maxInt(u32)}),
+        else => {
+            var vbuf: [128]u8 = undefined;
+            if (diag.spelling.len > 0) {
+                const text = std.fmt.bufPrint(&vbuf, "{s}: invalid value \"{s}\"", .{ diag.spelling, diag.value }) catch @errorName(e);
+                fatal(&out, "error: {s}\n", .{text});
+            }
+            fatal(&out, "error: {s}\n", .{@errorName(e)});
+        },
     };
 
     // Load the KMS data: explicit path (--data) → FHS/XDG search → embedded
@@ -1380,7 +1416,8 @@ test "resolveOptions rejects out-of-range selections" {
     for (cases) |case| {
         var res = try cli_helper.parse(gpa, &vlmzs_opts, case.args);
         defer res.deinit();
-        try std.testing.expectError(case.expected, resolveOptions(&res));
+        var diag: cli_helper.Diag = .{};
+        try std.testing.expectError(case.expected, resolveOptions(&res, &diag));
     }
 }
 
@@ -1391,7 +1428,8 @@ test "resolveOptions accepts the documented selection limits" {
     for (accepted) |version| {
         var res = try cli_helper.parse(gpa, &vlmzs_opts, &.{ "--protocol", version });
         defer res.deinit();
-        const opts = try resolveOptions(&res);
+        var diag: cli_helper.Diag = .{};
+        const opts = try resolveOptions(&res, &diag);
         try std.testing.expectEqual(try std.fmt.parseInt(u16, version, 10), opts.protocol);
     }
 
@@ -1399,7 +1437,8 @@ test "resolveOptions accepts the documented selection limits" {
         "--protocol", "6", "--license-status", "6", "127.0.0.1:1689",
     });
     defer res.deinit();
-    const opts = try resolveOptions(&res);
+    var diag: cli_helper.Diag = .{};
+    const opts = try resolveOptions(&res, &diag);
     try std.testing.expectEqual(@as(u32, 6), opts.license_status);
     try std.testing.expectEqual(@as(u16, 1689), opts.port);
 }
@@ -1615,11 +1654,36 @@ test "the workstation name is UTF-16, not raw UTF-8 bytes" {
     }
 }
 
+test "a bad option value names the option it came from" {
+    const gpa = std.testing.allocator;
+    const Case = struct {
+        args: []const []const u8,
+        expected: anyerror,
+        spelling: []const u8,
+        value: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .args = &.{ "--count", "abc" }, .expected = error.InvalidCharacter, .spelling = "--count", .value = "abc" },
+        .{ .args = &.{ "--grace", "-1" }, .expected = error.Overflow, .spelling = "--grace", .value = "-1" },
+        .{ .args = &.{ "--cmid", "zz" }, .expected = error.InvalidGuid, .spelling = "--cmid", .value = "zz" },
+        .{ .args = &.{ "--timeout", "9q" }, .expected = error.InvalidDuration, .spelling = "--timeout", .value = "9q" },
+    };
+    for (cases) |case| {
+        var res = try cli_helper.parse(gpa, &vlmzs_opts, case.args);
+        defer res.deinit();
+        var diag: cli_helper.Diag = .{};
+        try std.testing.expectError(case.expected, resolveOptions(&res, &diag));
+        try std.testing.expectEqualStrings(case.spelling, diag.spelling);
+        try std.testing.expectEqualStrings(case.value, diag.value);
+    }
+}
+
 test "an invalid UTF-8 workstation name is a configuration error" {
     const gpa = std.testing.allocator;
     var res = try cli_helper.parse(gpa, &vlmzs_opts, &.{ "--workstation", "\xff\xfe" });
     defer res.deinit();
-    try std.testing.expectError(error.InvalidWorkstation, resolveOptions(&res));
+    var diag: cli_helper.Diag = .{};
+    try std.testing.expectError(error.InvalidWorkstation, resolveOptions(&res, &diag));
 }
 
 test "a timestamp before the Unix epoch prints as the epoch" {

@@ -118,80 +118,169 @@ fn envGet(env: *const EnvironMap, name: []const u8) ?[]const u8 {
     return env.get(name);
 }
 
-/// Resolve a single boolean flag: the flag flips the default; the env var
-/// supplies an explicit value.
-fn resolveFlag(
-    cli_flag: bool,
+/// One option's value across the three tiers: built-in default < `VLMZSD_*` <
+/// CLI flag. Closes over the parsed CLI, the environment map and the
+/// diagnostic, so `resolveOptions` reads as a list of option names and defaults
+/// instead of a repeated lookup dance.
+///
+/// The names are `comptime`, which is what lets the environment variable be
+/// derived from the flag (`max-clients` → `VLMZSD_MAX_CLIENTS`, the convention
+/// `docs/cli.md` documents) rather than written twice and drifting apart. The
+/// two "disable" flags invert the meaning and pass their variable explicitly.
+const Resolver = struct {
+    gpa: Allocator,
     env: *const EnvironMap,
-    env_name: []const u8,
-    default: bool,
-) !bool {
-    if (cli_flag) return !default;
-    if (envGet(env, env_name)) |s| return cli_helper.parseBool(s);
-    return default;
-}
+    res: *const cli_helper.Result,
+    diag: *cli_helper.Diag,
 
-/// Resolve the log level across the three-tier sources. Repeatable `-v`/`-q`
-/// are the CLI surface; `VLMZSD_LOG_LEVEL` replaces the deprecated
+    /// `port` → `--port`.
+    fn flagSpelling(comptime name: []const u8) []const u8 {
+        return "--" ++ name;
+    }
+
+    /// `max-clients` → `VLMZSD_MAX_CLIENTS`.
+    fn envSpelling(comptime name: []const u8) []const u8 {
+        return comptime blk: {
+            var out: []const u8 = "VLMZSD_";
+            for (name) |c| out = out ++ .{if (c == '-') '_' else std.ascii.toUpper(c)};
+            break :blk out;
+        };
+    }
+
+    /// The value as given, CLI first. `null` when neither source has it.
+    fn raw(self: Resolver, comptime name: []const u8, comptime env_name: []const u8) ?[]const u8 {
+        return self.res.get(name) orelse envGet(self.env, env_name);
+    }
+
+    /// Record `value` as rejected, under the spelling that supplied it.
+    fn reject(self: Resolver, comptime name: []const u8, comptime env_name: []const u8, value: []const u8) void {
+        self.diag.* = .{
+            .spelling = if (self.res.get(name) != null) flagSpelling(name) else env_name,
+            .value = value,
+        };
+    }
+
+    fn int(self: Resolver, comptime T: type, comptime name: []const u8, default: T) !T {
+        const env_name = comptime envSpelling(name);
+        const text = self.raw(name, env_name) orelse return default;
+        return std.fmt.parseInt(T, text, 10) catch |e| {
+            self.reject(name, env_name, text);
+            return e;
+        };
+    }
+
+    fn str(self: Resolver, comptime name: []const u8, default: ?[]const u8) ?[]const u8 {
+        return self.raw(name, envSpelling(name)) orelse default;
+    }
+
+    /// A duration in whole minutes (the KMS protocol's native unit).
+    fn minutes(self: Resolver, comptime name: []const u8, default: []const u8) !u32 {
+        const env_name = comptime envSpelling(name);
+        const text = self.raw(name, env_name) orelse default;
+        const total = cli_helper.parseDurationSeconds(text) catch |e| {
+            self.reject(name, env_name, text);
+            return e;
+        };
+        return std.math.cast(u32, total / 60) orelse error.IntervalOutOfRange;
+    }
+
+    /// A duration in whole seconds (`--timeout`).
+    fn seconds(self: Resolver, comptime name: []const u8, default: []const u8) !u32 {
+        const env_name = comptime envSpelling(name);
+        const text = self.raw(name, env_name) orelse default;
+        const total = cli_helper.parseDurationSeconds(text) catch |e| {
+            self.reject(name, env_name, text);
+            return e;
+        };
+        return std.math.cast(u32, total) orelse error.TimeoutOutOfRange;
+    }
+
+    /// A boolean the presence of a flag turns on (`--maintain-clients`).
+    fn enabled(self: Resolver, comptime name: []const u8) !bool {
+        return self.flagValue(name, envSpelling(name), false);
+    }
+
+    /// A boolean the presence of a flag turns off (`--no-ndr64`). Its variable
+    /// keeps the positive name, so the caller passes it.
+    fn disabled(self: Resolver, comptime name: []const u8, comptime env_name: []const u8, default: bool) !bool {
+        return self.flagValue(name, env_name, default);
+    }
+
+    fn flagValue(self: Resolver, comptime name: []const u8, comptime env_name: []const u8, default: bool) !bool {
+        if (self.res.hasFlag(name)) return !default;
+        const text = envGet(self.env, env_name) orelse return default;
+        return cli_helper.parseBool(text) catch |e| {
+            self.diag.* = .{ .spelling = env_name, .value = text };
+            return e;
+        };
+    }
+
+    /// A repeatable option: CLI occurrences win, else the environment variable
+    /// split on commas, else `default`. `from_env` says which, so a rejected
+    /// value can be attributed to the right spelling.
+    fn list(self: Resolver, comptime name: []const u8, backing: *?[]const []const u8, default: []const []const u8) !List {
+        const cli = self.res.getAll(name);
+        if (cli.len > 0) return .{ .items = cli, .from_env = false };
+        const text = envGet(self.env, envSpelling(name)) orelse
+            return .{ .items = default, .from_env = false };
+        backing.* = try splitList(self.gpa, text);
+        // A value with no non-empty segment leaves the default in place.
+        const items = backing.*.?;
+        if (items.len == 0) return .{ .items = default, .from_env = false };
+        return .{ .items = items, .from_env = true };
+    }
+
+    const List = struct {
+        items: []const []const u8,
+        from_env: bool,
+    };
+};
+
+/// The log level is the one setting with no flag to derive an environment
+/// variable from: `-v`/`-q` are its CLI surface, so its variable is spelled
+/// here (docs/cli.md §5 Logging). The two deprecated names are kept as a
+/// lower-priority fallback and are read literally for the same reason.
+const log_level_env = "VLMZSD_LOG_LEVEL";
+const deprecated_verbose_env = "VLMZSD_VERBOSE";
+const deprecated_quiet_env = "VLMZSD_QUIET";
+
+/// The log level across the three-tier sources. Repeatable `-v`/`-q` are the
+/// CLI surface; `VLMZSD_LOG_LEVEL` replaces the deprecated
 /// `VLMZSD_VERBOSE`/`VLMZSD_QUIET`, which remain as a lower-priority fallback.
 /// Any `-q` wins over `-v`: `-q` → warn, `-qq`+ → err; `-v` → debug, `-vv`+ →
 /// trace.
 ///
-/// An unrecognized `VLMZSD_LOG_LEVEL` is not fatal: it is recorded in
-/// `invalid_log_level` for `main` to warn about, and the level stays `info`.
-/// The value is validated even when the CLI overrides it, so a typo is never
-/// silent.
-fn resolveLogLevel(
-    res: *const cli_helper.Result,
-    env: *const EnvironMap,
-    invalid_log_level: *?[]const u8,
-    legacy_verbose_present: *bool,
-    legacy_quiet_present: *bool,
-) !cli_helper.Level {
-    legacy_verbose_present.* = envGet(env, "VLMZSD_VERBOSE") != null;
-    legacy_quiet_present.* = envGet(env, "VLMZSD_QUIET") != null;
+/// An unrecognized `VLMZSD_LOG_LEVEL` is not fatal: it is recorded on `opts` for
+/// `main` to warn about, and the level stays `info`. The value is validated even
+/// when the CLI overrides it, so a typo is never silent. The deprecated
+/// variables' presence is recorded the same way, so `main` can warn about them
+/// too.
+fn resolveLogLevel(r: Resolver, opts: *ServerOptions) !cli_helper.Level {
+    opts.legacy_verbose_present = envGet(r.env, deprecated_verbose_env) != null;
+    opts.legacy_quiet_present = envGet(r.env, deprecated_quiet_env) != null;
 
     var env_level: ?cli_helper.Level = null;
-    if (envGet(env, "VLMZSD_LOG_LEVEL")) |s| {
+    if (envGet(r.env, log_level_env)) |s| {
         env_level = cli_helper.parseLevel(s) catch blk: {
-            invalid_log_level.* = s;
+            opts.invalid_log_level = s;
             break :blk null;
         };
     }
 
-    const quiet_count = res.flagCount("quiet");
+    const quiet_count = r.res.flagCount("quiet");
     if (quiet_count > 0) return if (quiet_count == 1) .warn else .err;
-    const verbose_count = res.flagCount("verbose");
+    const verbose_count = r.res.flagCount("verbose");
     if (verbose_count > 0) return if (verbose_count == 1) .debug else .trace;
 
     if (env_level) |level| return level;
-    if (invalid_log_level.* != null) return .info;
+    if (opts.invalid_log_level != null) return .info;
 
     // Deprecated variables keep their historical quiet-beats-verbose rule.
-    const quiet = if (envGet(env, "VLMZSD_QUIET")) |s| try cli_helper.parseBool(s) else false;
+    const quiet = if (envGet(r.env, deprecated_quiet_env)) |s| try cli_helper.parseBool(s) else false;
     if (quiet) return .warn;
-    const verbose = if (envGet(env, "VLMZSD_VERBOSE")) |s| try cli_helper.parseBool(s) else false;
+    const verbose = if (envGet(r.env, deprecated_verbose_env)) |s| try cli_helper.parseBool(s) else false;
     if (verbose) return .debug;
     return .info;
-}
-
-fn resolveInt(comptime T: type, cli_val: ?[]const u8, env: *const EnvironMap, name: []const u8, default: T) !T {
-    if (cli_val) |v| return std.fmt.parseInt(T, v, 10);
-    if (envGet(env, name)) |s| return std.fmt.parseInt(T, s, 10);
-    return default;
-}
-
-fn resolveStr(cli_val: ?[]const u8, env: *const EnvironMap, name: []const u8, default: ?[]const u8) ?[]const u8 {
-    if (cli_val) |v| return v;
-    if (envGet(env, name)) |s| return s;
-    return default;
-}
-
-/// Resolve a duration option into minutes (the KMS protocol's native unit).
-fn resolveDurationMinutes(cli_val: ?[]const u8, env: *const EnvironMap, name: []const u8, default: []const u8) !u32 {
-    const raw = cli_val orelse envGet(env, name) orelse default;
-    const seconds = try cli_helper.parseDurationSeconds(raw);
-    return std.math.cast(u32, seconds / 60) orelse error.IntervalOutOfRange;
 }
 
 /// Split a comma-separated env-var value into a trimmed list. The returned
@@ -217,67 +306,69 @@ fn splitList(gpa: Allocator, s: []const u8) ![]const []const u8 {
     return out;
 }
 
-fn resolveOptions(gpa: Allocator, env: *const EnvironMap, res: *const cli_helper.Result) !ServerOptions {
+/// Resolve every option into a `ServerOptions`. The whole configuration surface
+/// is the list below: one name and one default per option.
+fn resolveOptions(r: Resolver) !ServerOptions {
     // `vlmzsd` takes options only; a stray word is a mistyped flag value, not
     // something to ignore.
-    if (res.positionals.items.len > 0) return error.UnexpectedPositional;
+    if (r.res.positionals.items.len > 0) return error.UnexpectedPositional;
 
+    const gpa = r.gpa;
     var opts = ServerOptions{};
     // The env-var lists own memory, so every error below releases them.
     errdefer opts.deinit(gpa);
 
-    opts.port = try resolveInt(u16, res.get("port"), env, "VLMZSD_PORT", default_port);
+    opts.port = try r.int(u16, "port", default_port);
 
-    // --listen (repeatable) > VLMZSD_LISTEN (comma-separated) > default.
-    const listen = res.getAll("listen");
-    if (listen.len > 0) {
-        opts.listen = listen;
-    } else if (envGet(env, "VLMZSD_LISTEN")) |s| {
-        opts.listen_backing = try splitList(gpa, s);
-        const split = opts.listen_backing.?;
-        // A value without a single address stays unset, so the default applies.
-        if (split.len > 0) opts.listen = split;
+    const listen = try r.list("listen", &opts.listen_backing, &.{"::"});
+    opts.listen = listen.items;
+    // Each entry must be an IP literal: the port has its own option, so a
+    // value that parses only as `address:port` is a mistake to report here
+    // rather than at bind time.
+    for (opts.listen) |addr| {
+        _ = Io.net.IpAddress.parse(addr, opts.port) catch {
+            r.diag.* = .{
+                .spelling = if (listen.from_env)
+                    Resolver.envSpelling("listen")
+                else
+                    Resolver.flagSpelling("listen"),
+                .value = addr,
+            };
+            return error.InvalidListenAddress;
+        };
     }
 
-    opts.timeout_seconds = blk: {
-        const raw = res.get("timeout") orelse envGet(env, "VLMZSD_TIMEOUT") orelse "30s";
-        const seconds = try cli_helper.parseDurationSeconds(raw);
-        break :blk std.math.cast(u32, seconds) orelse return error.TimeoutOutOfRange;
-    };
+    opts.timeout_seconds = try r.seconds("timeout", "30s");
+    opts.max_clients = try r.int(u32, "max-clients", default_client_cap);
+    opts.data_file = r.str("data", null);
 
-    opts.max_clients = try resolveInt(u32, res.get("max-clients"), env, "VLMZSD_MAX_CLIENTS", default_client_cap);
-    opts.data_file = resolveStr(res.get("data"), env, "VLMZSD_DATA", null);
+    const epids = try r.list("epid", &opts.epid_backing, &.{});
+    opts.epids = epids.items;
 
-    const epids = res.getAll("epid");
-    if (epids.len > 0) {
-        opts.epids = epids;
-    } else if (envGet(env, "VLMZSD_EPID")) |s| {
-        opts.epid_backing = try splitList(gpa, s);
-        opts.epids = opts.epid_backing.?;
-    }
-
-    opts.randomize = try resolveInt(u8, res.get("randomize"), env, "VLMZSD_RANDOMIZE", 1);
-    opts.lcid = try resolveInt(u32, res.get("lcid"), env, "VLMZSD_LCID", 0);
+    opts.randomize = try r.int(u8, "randomize", 1);
+    opts.lcid = try r.int(u32, "lcid", 0);
     if (opts.lcid > kms.max_lcid) return error.LcidOutOfRange;
-    opts.build = try resolveInt(u32, res.get("build"), env, "VLMZSD_BUILD", 0);
+    opts.build = try r.int(u32, "build", 0);
     if (opts.build > kms.max_build) return error.BuildOutOfRange;
 
-    opts.activation_interval_minutes = try resolveDurationMinutes(res.get("activation-interval"), env, "VLMZSD_ACTIVATION_INTERVAL", "2h");
-    opts.renewal_interval_minutes = try resolveDurationMinutes(res.get("renewal-interval"), env, "VLMZSD_RENEWAL_INTERVAL", "7d");
-    opts.whitelist = try resolveInt(u32, res.get("whitelist"), env, "VLMZSD_WHITELIST", 0);
-    opts.ip_protection = try resolveInt(u8, res.get("ip-protection"), env, "VLMZSD_IP_PROTECTION", 0);
+    opts.activation_interval_minutes = try r.minutes("activation-interval", "2h");
+    opts.renewal_interval_minutes = try r.minutes("renewal-interval", "7d");
+    opts.whitelist = try r.int(u32, "whitelist", 0);
+    opts.ip_protection = try r.int(u8, "ip-protection", 0);
 
-    opts.check_client_time = try resolveFlag(res.hasFlag("check-client-time"), env, "VLMZSD_CHECK_CLIENT_TIME", false);
-    opts.maintain_clients = try resolveFlag(res.hasFlag("maintain-clients"), env, "VLMZSD_MAINTAIN_CLIENTS", false);
-    opts.start_empty = try resolveFlag(res.hasFlag("start-empty"), env, "VLMZSD_START_EMPTY", false);
+    opts.check_client_time = try r.enabled("check-client-time");
+    opts.maintain_clients = try r.enabled("maintain-clients");
+    opts.start_empty = try r.enabled("start-empty");
 
-    opts.ndr64 = try resolveFlag(res.hasFlag("no-ndr64"), env, "VLMZSD_NDR64", true);
-    opts.btfn = try resolveFlag(res.hasFlag("no-btfn"), env, "VLMZSD_BTFN", true);
-    opts.disconnect_per_request = try resolveFlag(res.hasFlag("disconnect-per-request"), env, "VLMZSD_DISCONNECT_PER_REQUEST", false);
+    // The "disable" flags read the positive variable (`--no-ndr64` ←
+    // `VLMZSD_NDR64`), so they spell it out.
+    opts.ndr64 = try r.disabled("no-ndr64", "VLMZSD_NDR64", true);
+    opts.btfn = try r.disabled("no-btfn", "VLMZSD_BTFN", true);
+    opts.disconnect_per_request = try r.enabled("disconnect-per-request");
 
-    opts.pid_file = resolveStr(res.get("pid-file"), env, "VLMZSD_PID_FILE", null);
-    opts.log_level = try resolveLogLevel(res, env, &opts.invalid_log_level, &opts.legacy_verbose_present, &opts.legacy_quiet_present);
-    opts.quiet_loopback = try resolveFlag(res.hasFlag("quiet-loopback"), env, "VLMZSD_QUIET_LOOPBACK", false);
+    opts.pid_file = r.str("pid-file", null);
+    opts.log_level = try resolveLogLevel(r, &opts);
+    opts.quiet_loopback = try r.enabled("quiet-loopback");
 
     return opts;
 }
@@ -1043,15 +1134,17 @@ pub fn main(init: std.process.Init) !void {
         try args_list.append(init.gpa, arg);
     }
 
-    var res = cli_helper.parse(init.gpa, &vlmzsd_opts, args_list.items) catch |err| {
-        // Short diagnostic; the full help is one `--help` away.
-        cli_helper.fatalStderr(init.io, "vlmzsd", "{s}", .{@errorName(err)});
+    var diag: cli_helper.Diag = .{};
+    var res = cli_helper.parseWithDiag(init.gpa, &vlmzsd_opts, args_list.items, &diag) catch |err| {
+        // Short diagnostic naming the argument; the full help is one `--help` away.
+        var ebuf: [128]u8 = undefined;
+        cli_helper.fatalStderr(init.io, "vlmzsd", "{s}", .{cli_helper.parseErrorMessage(err, diag, &ebuf)});
     };
     defer res.deinit();
 
     if (res.hasFlag("help")) {
         var hbuf: [4096]u8 = undefined;
-        var hw = std.Io.File.writer(std.Io.File.stderr(), init.io, &hbuf);
+        var hw = std.Io.File.writer(std.Io.File.stdout(), init.io, &hbuf);
         try cli_helper.writeHelp(&hw.interface, "vlmzsd", &vlmzsd_opts, "");
         try hw.interface.flush();
         return;
@@ -1083,13 +1176,24 @@ pub fn main(init: std.process.Init) !void {
         cli_helper.fatalStderr(init.io, "vlmzsd", "failed to start log writer task: {s}", .{@errorName(e)});
     };
 
-    var opts = resolveOptions(init.gpa, init.environ_map, &res) catch |e| switch (e) {
-        error.UnexpectedPositional => fatal(&log, init.io, "vlmzsd takes no positional arguments", .{}),
-        error.LcidOutOfRange => fatal(&log, init.io, "--lcid must be 0..{d} (0 = random)", .{kms.max_lcid}),
-        error.BuildOutOfRange => fatal(&log, init.io, "--build must be 0..{d} (0 = random)", .{kms.max_build}),
-        error.TimeoutOutOfRange => fatal(&log, init.io, "--timeout must be at most {d} seconds", .{std.math.maxInt(u32)}),
-        error.IntervalOutOfRange => fatal(&log, init.io, "policy interval must be at most {d} minutes", .{std.math.maxInt(u32)}),
-        else => fatal(&log, init.io, "invalid configuration: {s}", .{@errorName(e)}),
+    const resolver: Resolver = .{ .gpa = init.gpa, .env = init.environ_map, .res = &res, .diag = &diag };
+    var opts = resolveOptions(resolver) catch |e| switch (e) {
+        error.UnexpectedPositional => cli_helper.fatalStderr(init.io, "vlmzsd", "takes no positional arguments", .{}),
+        error.LcidOutOfRange => cli_helper.fatalStderr(init.io, "vlmzsd", "--lcid must be 0..{d} (0 = random)", .{kms.max_lcid}),
+        error.BuildOutOfRange => cli_helper.fatalStderr(init.io, "vlmzsd", "--build must be 0..{d} (0 = random)", .{kms.max_build}),
+        error.TimeoutOutOfRange => cli_helper.fatalStderr(init.io, "vlmzsd", "--timeout must be at most {d} seconds", .{std.math.maxInt(u32)}),
+        error.IntervalOutOfRange => cli_helper.fatalStderr(init.io, "vlmzsd", "policy interval must be at most {d} minutes", .{std.math.maxInt(u32)}),
+        error.InvalidListenAddress => cli_helper.fatalStderr(init.io, "vlmzsd", "{s}: \"{s}\" is not an IP address (the port comes from --port)", .{ diag.spelling, diag.value }),
+        else => blk: {
+            var vbuf: [128]u8 = undefined;
+            if (diag.spelling.len > 0) {
+                const text = std.fmt.bufPrint(&vbuf, "{s}: invalid value \"{s}\"", .{ diag.spelling, diag.value }) catch @errorName(e);
+                cli_helper.fatalStderr(init.io, "vlmzsd", "{s}", .{text});
+            }
+            // Not about one value (e.g. an unknown .kmd field): name the error.
+            cli_helper.fatalStderr(init.io, "vlmzsd", "{s}", .{@errorName(e)});
+            break :blk {};
+        },
     };
     defer opts.deinit(init.gpa);
 
@@ -1100,9 +1204,9 @@ pub fn main(init: std.process.Init) !void {
     log.debug("log writer task started", .{});
     // Configuration notices are ordinary `warn` lines and obey the resolved
     // level: `-q` (warn) shows them, `-qq` (err) silences them.
-    if (opts.invalid_log_level) |value| log.warn("ignoring invalid VLMZSD_LOG_LEVEL \"{s}\" (expected trace, debug, info, warn, or err)", .{value});
-    if (opts.legacy_verbose_present) log.warn("VLMZSD_VERBOSE is deprecated; use VLMZSD_LOG_LEVEL instead", .{});
-    if (opts.legacy_quiet_present) log.warn("VLMZSD_QUIET is deprecated; use VLMZSD_LOG_LEVEL instead", .{});
+    if (opts.invalid_log_level) |value| log.warn("ignoring invalid {s} \"{s}\" (expected trace, debug, info, warn, or err)", .{ log_level_env, value });
+    if (opts.legacy_verbose_present) log.warn("{s} is deprecated; use {s} instead", .{ deprecated_verbose_env, log_level_env });
+    if (opts.legacy_quiet_present) log.warn("{s} is deprecated; use {s} instead", .{ deprecated_quiet_env, log_level_env });
 
     // Load the KMS data: explicit path (--data / VLMZSD_DATA) → FHS/XDG search
     // → embedded default.
@@ -1398,48 +1502,50 @@ test "resolveLogLevel: CLI flags, VLMZSD_LOG_LEVEL, and invalid values" {
     const gpa = std.testing.allocator;
     var env: EnvironMap = .init(gpa);
     defer env.deinit();
-
-    var invalid: ?[]const u8 = null;
-    var legacy_verbose = false;
-    var legacy_quiet = false;
+    var diag: cli_helper.Diag = .{};
 
     var no_flags = try cli_helper.parse(gpa, &vlmzsd_opts, &.{});
     defer no_flags.deinit();
+    var two_v = try cli_helper.parse(gpa, &vlmzsd_opts, &.{"-vv"});
+    defer two_v.deinit();
+    var both = try cli_helper.parse(gpa, &vlmzsd_opts, &.{ "-vv", "-q" });
+    defer both.deinit();
+
+    const plain: Resolver = .{ .gpa = gpa, .env = &env, .res = &no_flags, .diag = &diag };
+    const verbose: Resolver = .{ .gpa = gpa, .env = &env, .res = &two_v, .diag = &diag };
+    const mixed: Resolver = .{ .gpa = gpa, .env = &env, .res = &both, .diag = &diag };
+    var opts = ServerOptions{};
 
     // Default is info, with nothing recorded.
-    try std.testing.expectEqual(cli_helper.Level.info, try resolveLogLevel(&no_flags, &env, &invalid, &legacy_verbose, &legacy_quiet));
-    try std.testing.expectEqual(@as(?[]const u8, null), invalid);
+    try std.testing.expectEqual(cli_helper.Level.info, try resolveLogLevel(plain, &opts));
+    try std.testing.expectEqual(@as(?[]const u8, null), opts.invalid_log_level);
 
     // A valid env value is used, case-insensitively.
     try env.put("VLMZSD_LOG_LEVEL", "WaRn");
-    try std.testing.expectEqual(cli_helper.Level.warn, try resolveLogLevel(&no_flags, &env, &invalid, &legacy_verbose, &legacy_quiet));
+    try std.testing.expectEqual(cli_helper.Level.warn, try resolveLogLevel(plain, &opts));
 
     // An invalid env value is recorded (not fatal) and falls back to info.
     try env.put("VLMZSD_LOG_LEVEL", "loud");
-    invalid = null;
-    try std.testing.expectEqual(cli_helper.Level.info, try resolveLogLevel(&no_flags, &env, &invalid, &legacy_verbose, &legacy_quiet));
-    try std.testing.expectEqualStrings("loud", invalid.?);
+    opts.invalid_log_level = null;
+    try std.testing.expectEqual(cli_helper.Level.info, try resolveLogLevel(plain, &opts));
+    try std.testing.expectEqualStrings("loud", opts.invalid_log_level.?);
 
     // The CLI overrides the env value, but the typo is still recorded.
-    var two_v = try cli_helper.parse(gpa, &vlmzsd_opts, &.{"-vv"});
-    defer two_v.deinit();
-    invalid = null;
-    try std.testing.expectEqual(cli_helper.Level.trace, try resolveLogLevel(&two_v, &env, &invalid, &legacy_verbose, &legacy_quiet));
-    try std.testing.expectEqualStrings("loud", invalid.?);
+    opts.invalid_log_level = null;
+    try std.testing.expectEqual(cli_helper.Level.trace, try resolveLogLevel(verbose, &opts));
+    try std.testing.expectEqualStrings("loud", opts.invalid_log_level.?);
 
     // Any `-q` beats `-v`.
-    var both = try cli_helper.parse(gpa, &vlmzsd_opts, &.{ "-vv", "-q" });
-    defer both.deinit();
-    invalid = null;
-    try std.testing.expectEqual(cli_helper.Level.warn, try resolveLogLevel(&both, &env, &invalid, &legacy_verbose, &legacy_quiet));
+    opts.invalid_log_level = null;
+    try std.testing.expectEqual(cli_helper.Level.warn, try resolveLogLevel(mixed, &opts));
 
     // Deprecated booleans are the lowest-priority fallback; quiet beats verbose.
     _ = env.swapRemove("VLMZSD_LOG_LEVEL");
     try env.put("VLMZSD_VERBOSE", "true");
-    invalid = null;
-    try std.testing.expectEqual(cli_helper.Level.debug, try resolveLogLevel(&no_flags, &env, &invalid, &legacy_verbose, &legacy_quiet));
-    try std.testing.expect(legacy_verbose);
-    try std.testing.expect(!legacy_quiet);
+    opts.invalid_log_level = null;
+    try std.testing.expectEqual(cli_helper.Level.debug, try resolveLogLevel(plain, &opts));
+    try std.testing.expect(opts.legacy_verbose_present);
+    try std.testing.expect(!opts.legacy_quiet_present);
 }
 
 test "splitList returns an exactly-sized list and skips empty segments" {
@@ -1476,7 +1582,8 @@ test "resolveOptions: env lists, numeric limits, and positional arguments" {
     var default_listen = try cli_helper.parse(gpa, &vlmzsd_opts, &.{});
     defer default_listen.deinit();
     {
-        var opts = try resolveOptions(gpa, &env, &default_listen);
+        var diag: cli_helper.Diag = .{};
+        var opts = try resolveOptions(.{ .gpa = gpa, .env = &env, .res = &default_listen, .diag = &diag });
         defer opts.deinit(gpa);
         try std.testing.expectEqual(@as(usize, 1), opts.listen.len);
         try std.testing.expectEqualStrings("::", opts.listen[0]);
@@ -1485,7 +1592,8 @@ test "resolveOptions: env lists, numeric limits, and positional arguments" {
     // Gaps and padding are trimmed away, and the result owns its allocation.
     try env.put("VLMZSD_LISTEN", "127.0.0.1,, ::1");
     {
-        var opts = try resolveOptions(gpa, &env, &default_listen);
+        var diag: cli_helper.Diag = .{};
+        var opts = try resolveOptions(.{ .gpa = gpa, .env = &env, .res = &default_listen, .diag = &diag });
         defer opts.deinit(gpa);
         try std.testing.expectEqual(@as(usize, 2), opts.listen.len);
         try std.testing.expectEqualStrings("127.0.0.1", opts.listen[0]);
@@ -1502,7 +1610,8 @@ test "resolveOptions: env lists, numeric limits, and positional arguments" {
     });
     defer limits.deinit();
     {
-        var opts = try resolveOptions(gpa, &env, &limits);
+        var diag: cli_helper.Diag = .{};
+        var opts = try resolveOptions(.{ .gpa = gpa, .env = &env, .res = &limits, .diag = &diag });
         defer opts.deinit(gpa);
         try std.testing.expectEqual(kms.max_lcid, opts.lcid);
         try std.testing.expectEqual(kms.max_build, opts.build);
@@ -1523,7 +1632,68 @@ test "resolveOptions: env lists, numeric limits, and positional arguments" {
     for (cases) |case| {
         var res = try cli_helper.parse(gpa, &vlmzsd_opts, case.args);
         defer res.deinit();
-        try std.testing.expectError(case.expected, resolveOptions(gpa, &env, &res));
+        var diag: cli_helper.Diag = .{};
+        try std.testing.expectError(case.expected, resolveOptions(.{ .gpa = gpa, .env = &env, .res = &res, .diag = &diag }));
+    }
+}
+
+test "--listen must be an IP literal, and a bad value names the option" {
+    const gpa = std.testing.allocator;
+    var env = EnvironMap.init(gpa);
+    defer env.deinit();
+
+    // An address with a port is the mistake the message is written for: the
+    // port has its own option, and `ip:port` would otherwise fail at bind time
+    // with the address and the port glued together.
+    const bad = [_]struct { args: []const []const u8, spelling: []const u8, value: []const u8 }{
+        .{ .args = &.{ "--listen", "0.0.0.0:1688" }, .spelling = "--listen", .value = "0.0.0.0:1688" },
+        .{ .args = &.{ "--listen", "localhost" }, .spelling = "--listen", .value = "localhost" },
+        .{ .args = &.{ "--listen", "::1", "--listen", "300.1.1.1" }, .spelling = "--listen", .value = "300.1.1.1" },
+    };
+    for (bad) |case| {
+        var res = try cli_helper.parse(gpa, &vlmzsd_opts, case.args);
+        defer res.deinit();
+        var diag: cli_helper.Diag = .{};
+        try std.testing.expectError(error.InvalidListenAddress, resolveOptions(.{ .gpa = gpa, .env = &env, .res = &res, .diag = &diag }));
+        try std.testing.expectEqualStrings(case.spelling, diag.spelling);
+        try std.testing.expectEqualStrings(case.value, diag.value);
+    }
+
+    // Literals the protocol uses are accepted, including a bare IPv6 address
+    // whose colons are not a port separator.
+    var ok = try cli_helper.parse(gpa, &vlmzsd_opts, &.{ "--listen", "127.0.0.1", "--listen", "::1", "--listen", "::" });
+    defer ok.deinit();
+    var diag: cli_helper.Diag = .{};
+    var opts = try resolveOptions(.{ .gpa = gpa, .env = &env, .res = &ok, .diag = &diag });
+    defer opts.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 3), opts.listen.len);
+}
+
+test "--port: a bad value names the CLI spelling or the environment variable" {
+    const gpa = std.testing.allocator;
+    var env = EnvironMap.init(gpa);
+    defer env.deinit();
+
+    // From the CLI: the flag as typed.
+    {
+        var res = try cli_helper.parse(gpa, &vlmzsd_opts, &.{ "--port", "abc" });
+        defer res.deinit();
+        var diag: cli_helper.Diag = .{};
+        try std.testing.expectError(error.InvalidCharacter, resolveOptions(.{ .gpa = gpa, .env = &env, .res = &res, .diag = &diag }));
+        try std.testing.expectEqualStrings("--port", diag.spelling);
+        try std.testing.expectEqualStrings("abc", diag.value);
+    }
+
+    // From the environment: the variable name, so a supervisor's typo is
+    // traceable to the file that set it.
+    try env.put("VLMZSD_PORT", "70000");
+    {
+        var res = try cli_helper.parse(gpa, &vlmzsd_opts, &.{});
+        defer res.deinit();
+        var diag: cli_helper.Diag = .{};
+        try std.testing.expectError(error.Overflow, resolveOptions(.{ .gpa = gpa, .env = &env, .res = &res, .diag = &diag }));
+        try std.testing.expectEqualStrings("VLMZSD_PORT", diag.spelling);
+        try std.testing.expectEqualStrings("70000", diag.value);
     }
 }
 

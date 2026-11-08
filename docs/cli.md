@@ -106,9 +106,9 @@ Grouped by concern (help is rendered in these groups).
 | `--max-clients <n>` | `-m` | `1024` | `VLMZSD_MAX_CLIENTS` | concurrent client cap; `0` = unlimited |
 
 `--listen` takes an **IP literal only**, repeatable to bind several addresses;
-the port always comes from `--port`, so `--listen 0.0.0.0:1688` is rejected as an
-invalid address. The default `::` is a dual-stack socket covering IPv4 and IPv6,
-and falls back to `0.0.0.0` on a host without an IPv6 stack.
+the port always comes from `--port`, so `--listen 0.0.0.0:1688` is rejected as a
+configuration error. The default `::` is a dual-stack socket covering IPv4 and
+IPv6, and falls back to `0.0.0.0` on a host without an IPv6 stack.
 
 `--port 0` asks the kernel for an ephemeral port, which is useful for tests and
 side-by-side instances. The startup line reports the port that was actually
@@ -260,10 +260,13 @@ because a write to that sink would block the same way, so the status is the only
 cannot be caught.
 
 Exit status: `0` after a graceful shutdown, and `0` for `--help`/`--version`.
-Every startup failure — an unreadable or invalid `.kmd`, no usable `--listen`
-address, or an option that does not parse — reports one `error:` line and exits
-`1` (an argument error prints `vlmzsd: error: <reason>` without the log
-timestamp). A forced exit (second signal) uses `128 + signum` instead.
+Every startup failure — an unreadable or invalid `.kmd`, a `--listen` value that
+is not an IP literal, or an option that does not parse — reports one `error:`
+line and exits `1`. An option error names the option and value it rejected, in
+the spelling that supplied them (the flag, or the environment variable), and is
+printed without the log timestamp; a startup failure that needs the server's
+context keeps the timestamped logger. A forced exit (second signal) uses
+`128 + signum` instead.
 
 ### Logging
 
@@ -367,7 +370,18 @@ after the server processed it would be counted twice by the server, which only
 affects its client count.
 
 The client exits `0` when all its requests succeeded, and `1` when one fails or
-an option is invalid. A request "fails" when it cannot be sent, when the server
-rejects it (for example `0xC004F042` from a whitelist), or when the response
-fails verification; the per-request diagnostic goes to stderr, and a final
-`<n> of <count> request(s) failed` line summarizes it.
+an option is invalid. What a failure does next depends on how the requests are
+carried:
+
+- **Keep-alive (the default).** One connection carries every request, so a
+  request the server *answers* but rejects (for example `0xC004F042` from a
+  whitelist) or whose response fails verification is counted and the next
+  request follows. A **transport** failure — the connection cannot be opened,
+  breaks, or times out — ends the run immediately with one
+  `request failed: <reason>` line: the session is gone, and retrying a peer that
+  is not answering would cost the idle timeout once per remaining request.
+- **`--reconnect-per-request`.** Each request is independent, so a transport
+  failure fails only that request; the run continues.
+
+When requests are counted rather than abandoned, the per-request diagnostic goes
+to stderr and a final `<n> of <count> request(s) failed` line summarizes it.

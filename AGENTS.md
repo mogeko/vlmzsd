@@ -108,14 +108,17 @@ source linked above).
 
 ## CLI implementation decisions
 
-- **Argument parsing: data-driven, std-only.** Both binaries parse their CLI with `src/cli_helper.zig`
-  — a hand-written parser where a single `Opt` table drives parsing, `--help` rendering, and
-  validation (so the parse logic and help text cannot drift apart). The three-tier env-var
-  precedence is implemented as a thin layer on top of the parsed result — independent of the
-  parser choice.
-- **Two entry points share one module.** `src/main.zig` (`vlmzsd`) and `src/vlmzs.zig` (`vlmzs`)
-  both import the `vlmzsd` module; argument parsing and option-to-config mapping live in shared
-  code (e.g. `src/cli_helper.zig`).
+- **Argument parsing: data-driven, std-only.** All three binaries parse their CLI with
+  `src/cli_helper.zig` — a hand-written parser where a single `Opt` table drives parsing, `--help`
+  rendering, and validation (so the parse logic and help text cannot drift apart). `--long`,
+  `--long=value`, `-svalue` and a `--` terminator mean the same in each tool, and `--help` /
+  `--version` print to stdout and exit `0`. The three-tier env-var precedence is implemented as a
+  thin layer on top of the parsed result — independent of the parser choice (`vlmzsd` resolves its
+  options through `Resolver`, one call per option).
+- **Three entry points share one module.** `src/main.zig` (`vlmzsd`), `src/vlmzs.zig` (`vlmzs`) and
+  `src/kmdconv.zig` (`kmdconv`, a developer tool) all import the `vlmzsd` module; argument parsing
+  lives in shared code (`src/cli_helper.zig`), and each binary maps its options into its own config
+  struct.
 - **Logging: no external library.** Zig has no community-standard log library, and `std.log` does
   not match the "fixed format, timestamped, stdout/stderr split" requirement. The server uses a
   hand-written `cli_helper.Logger`; the client (`vlmzs`) is a CLI debugging tool and writes a bare

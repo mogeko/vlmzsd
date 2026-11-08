@@ -66,7 +66,7 @@ kmdconv data.json -o rebuilt.kmd
 | `-V`, `--version` | print version and exit |
 | `-` | read input from stdin instead of `<file>` |
 | `-r`, `--reverse` | reverse direction: read `.kmd`, write JSON |
-| `-o`, `--output <file>` | write output to `<file>` (default: derived sibling in the current directory) |
+| `-o`, `--output <file>` | write output to `<file>` (default: `<stem>` plus the matching suffix, in the current directory) |
 
 Errors print a one-line diagnostic to stderr and exit non-zero. If the input
 fails to parse in the chosen direction, the error hints at the opposite
