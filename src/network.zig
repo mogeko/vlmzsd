@@ -501,42 +501,46 @@ fn readPacket(allocator: Allocator, idle: ReadOptions, reader: *Io.Reader) ![]u8
 // Socket glue
 // ---------------------------------------------------------------------------
 
-/// Connect to `address:port`, accepting an IPv4/IPv6 literal or a host name
-/// (resolved via the Io DNS lookup). `address_family` (0 = any, 4 = IPv4-only,
+/// `--address-family` as the address family to keep, or null for either.
+fn familyFilter(address_family: u8) ?Io.net.IpAddress.Family {
+    return switch (address_family) {
+        4 => .ip4,
+        6 => .ip6,
+        else => null,
+    };
+}
+
+/// Connect to `address:port`, accepting an IPv4/IPv6 literal (scope ids
+/// included) or a host name. `address_family` (0 = any, 4 = IPv4-only,
 /// 6 = IPv6-only) filters the address family.
 pub fn connect(io: Io, address: []const u8, port: u16, address_family: u8) !Io.net.Stream {
-    if (Io.net.IpAddress.parse(address, port)) |ip| {
+    // Literals first: a `HostName` cannot carry an IPv6 literal.
+    if (Io.net.IpAddress.resolve(io, address, port)) |ip| {
         return connectIpAddress(io, ip, address_family);
     } else |_| {}
 
     const host = try Io.net.HostName.init(address);
+    // `HostName.connect` races every resolved address and returns the first
+    // success, but has no family filter; a filtered connect stays manual.
+    if (familyFilter(address_family) == null) {
+        return Io.net.HostName.connect(host, io, port, .{ .mode = .stream });
+    }
     return connectHostName(io, host, port, address_family);
 }
 
 /// Connect to a parsed IP literal, rejecting a mismatched address family.
 fn connectIpAddress(io: Io, ip: Io.net.IpAddress, address_family: u8) !Io.net.Stream {
-    switch (address_family) {
-        4 => switch (ip) {
-            .ip4 => {},
-            .ip6 => return error.AddressFamilyMismatch,
-        },
-        6 => switch (ip) {
-            .ip6 => {},
-            .ip4 => return error.AddressFamilyMismatch,
-        },
-        else => {},
+    if (familyFilter(address_family)) |wanted| {
+        if (std.meta.activeTag(ip) != wanted) return error.AddressFamilyMismatch;
     }
     return Io.net.IpAddress.connect(&ip, io, .{ .mode = .stream });
 }
 
 /// Resolve `host` and connect to the first reachable address, filtering by
-/// `address_family` (mirrors the C `getaddrinfo` `ai_family` behavior).
+/// `address_family` (mirrors the C `getaddrinfo` `ai_family` behavior). The
+/// standard `HostName.connect` cannot express this filter.
 fn connectHostName(io: Io, host: Io.net.HostName, port: u16, address_family: u8) !Io.net.Stream {
-    const family: ?Io.net.IpAddress.Family = switch (address_family) {
-        4 => .ip4,
-        6 => .ip6,
-        else => null,
-    };
+    const family = familyFilter(address_family);
 
     var canonical_buf: [Io.net.HostName.max_len]u8 = undefined;
     var result_buf: [32]Io.net.HostName.LookupResult = undefined;
@@ -570,7 +574,7 @@ fn connectHostName(io: Io, host: Io.net.HostName, port: u16, address_family: u8)
 
 /// Listen on `address:port`.
 pub fn listen(io: Io, address: []const u8, port: u16) !Io.net.Server {
-    const ip = try Io.net.IpAddress.parse(address, port);
+    const ip = try Io.net.IpAddress.resolve(io, address, port);
     return Io.net.IpAddress.listen(&ip, io, .{ .reuse_address = true });
 }
 
@@ -1731,4 +1735,18 @@ test "serveRpc reads through a read-ahead smaller than a header" {
     const served = try serveInput(alloc, io, &pair, &cfg, rng, both, null, &read_ahead, &out);
     try std.testing.expectEqual(ServeEnd.after_request, served.end);
     try expectBindAckAndResponse(served.responses);
+}
+
+// A literal is parsed before any socket work, so a mismatched `--address-family`
+// fails deterministically, and a string that is neither a literal nor a valid
+// host name fails as such instead of reaching the resolver.
+test "connect filters a literal by address family" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try std.testing.expectError(error.AddressFamilyMismatch, connect(io, "127.0.0.1", 1688, 6));
+    try std.testing.expectError(error.AddressFamilyMismatch, connect(io, "::1", 1688, 4));
+    try std.testing.expectError(error.InvalidHostName, connect(io, "-invalid", 1688, 0));
 }
