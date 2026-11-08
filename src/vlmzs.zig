@@ -1028,7 +1028,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (res.hasFlag("help")) {
         var hbuf: [4096]u8 = undefined;
-        var hw = std.Io.File.writer(std.Io.File.stderr(), init.io, &hbuf);
+        var hw = std.Io.File.writer(std.Io.File.stdout(), init.io, &hbuf);
         try cli_helper.writeHelp(&hw.interface, "vlmzs", &vlmzs_opts, "[HOST[:PORT]]");
         try hw.interface.flush();
         return;

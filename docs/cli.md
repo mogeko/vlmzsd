@@ -370,7 +370,18 @@ after the server processed it would be counted twice by the server, which only
 affects its client count.
 
 The client exits `0` when all its requests succeeded, and `1` when one fails or
-an option is invalid. A request "fails" when it cannot be sent, when the server
-rejects it (for example `0xC004F042` from a whitelist), or when the response
-fails verification; the per-request diagnostic goes to stderr, and a final
-`<n> of <count> request(s) failed` line summarizes it.
+an option is invalid. What a failure does next depends on how the requests are
+carried:
+
+- **Keep-alive (the default).** One connection carries every request, so a
+  request the server *answers* but rejects (for example `0xC004F042` from a
+  whitelist) or whose response fails verification is counted and the next
+  request follows. A **transport** failure — the connection cannot be opened,
+  breaks, or times out — ends the run immediately with one
+  `request failed: <reason>` line: the session is gone, and retrying a peer that
+  is not answering would cost the idle timeout once per remaining request.
+- **`--reconnect-per-request`.** Each request is independent, so a transport
+  failure fails only that request; the run continues.
+
+When requests are counted rather than abandoned, the per-request diagnostic goes
+to stderr and a final `<n> of <count> request(s) failed` line summarizes it.
