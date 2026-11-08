@@ -6,6 +6,7 @@
 //! given.
 
 const std = @import("std");
+const cli_helper = @import("cli_helper.zig");
 const vlmzsd = @import("vlmzsd");
 const kmsdata = vlmzsd.kmsdata;
 
@@ -16,20 +17,26 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Json = std.json;
 
+/// Options, in help order. One table drives parsing and the help text, so the
+/// two cannot drift apart (the same contract `vlmzsd`/`vlmzs` follow). `-` is a
+/// positional, described in the note below the table.
+const opts_table = [_]cli_helper.Opt{
+    .{ .name = "help", .short = 'h', .group = "Options", .desc = "print this help and exit" },
+    .{ .name = "version", .short = 'V', .group = "Options", .desc = "print version and exit" },
+    .{ .name = "reverse", .short = 'r', .group = "Options", .desc = "reverse: read a `.kmd` file, write JSON" },
+    .{ .name = "output", .short = 'o', .kind = .str, .hint = "file", .group = "Options", .desc = "write output to <file> (default: derived)" },
+};
+
 fn writeHelp(w: *std.Io.Writer) !void {
+    try cli_helper.writeHelp(w, "kmdconv", &opts_table, "<file>");
     try w.print(
-        \\Usage: kmdconv [OPTIONS] <file>
         \\
         \\Convert between the `.kmd` binary data format and JSON.
-        \\  <file>           input JSON file (or a `.kmd` file with -r); output
-        \\                   defaults to <stem>.<suffix> in the current directory
         \\
-        \\Options:
-        \\  -h, --help            print this help and exit
-        \\  -V, --version         print version and exit
-        \\  -                     read input from stdin (instead of <file>)
-        \\  -r, --reverse         reverse: read a `.kmd` file, write JSON
-        \\  -o, --output <file>   write output to <file> (default: derived)
+        \\Notes:
+        \\  <file>       input JSON file (or a `.kmd` file with -r); `-` reads stdin
+        \\  no -o        written in the current directory as <stem>.<suffix>:
+        \\               `data.json` -> `data.kmd`, `data.kmd` -> `data.json`
         \\
     , .{});
 }
@@ -73,56 +80,49 @@ pub fn main(init: std.process.Init) !void {
     _ = it.skip();
     while (it.next()) |a| try args.append(init.gpa, a);
 
-    var reverse = false;
-    var output_path: ?[]const u8 = null;
-    var input: ?[]const u8 = null;
+    var diag: cli_helper.Diag = .{};
+    var res = cli_helper.parseWithDiag(init.gpa, &opts_table, args.items, &diag) catch |err| {
+        var ebuf: [128]u8 = undefined;
+        fatal(init.io, "kmdconv: error: {s}\n", .{cli_helper.parseErrorMessage(err, diag, &ebuf)});
+    };
+    defer res.deinit();
 
-    var i: usize = 0;
-    while (i < args.items.len) : (i += 1) {
-        const a = args.items[i];
-        if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
-            var hbuf: [2048]u8 = undefined;
-            var hw = std.Io.File.writer(std.Io.File.stdout(), init.io, &hbuf);
-            try writeHelp(&hw.interface);
-            try hw.interface.flush();
-            return;
-        } else if (std.mem.eql(u8, a, "-V") or std.mem.eql(u8, a, "--version")) {
-            var vbuf: [64]u8 = undefined;
-            var vw = std.Io.File.writer(std.Io.File.stdout(), init.io, &vbuf);
-            try vw.interface.print("kmdconv {s}\n", .{version_display});
-            try vw.interface.flush();
-            return;
-        } else if (std.mem.eql(u8, a, "-r") or std.mem.eql(u8, a, "--reverse")) {
-            reverse = true;
-        } else if (std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--output")) {
-            i += 1;
-            if (i >= args.items.len) {
-                fatal(init.io, "kmdconv: error: -o/--output requires an argument\n", .{});
-            }
-            output_path = args.items[i];
-        } else if (a.len > 0 and a[0] == '-' and !std.mem.eql(u8, a, "-")) {
-            fatal(init.io, "kmdconv: error: unknown option {s}\n", .{a});
-        } else if (input == null) {
-            input = a;
-        } else {
-            fatal(init.io, "kmdconv: error: too many positional arguments\n", .{});
-        }
+    if (res.hasFlag("help")) {
+        var hbuf: [2048]u8 = undefined;
+        var hw = std.Io.File.writer(std.Io.File.stdout(), init.io, &hbuf);
+        try writeHelp(&hw.interface);
+        try hw.interface.flush();
+        return;
+    }
+    if (res.hasFlag("version")) {
+        var vbuf: [64]u8 = undefined;
+        var vw = std.Io.File.writer(std.Io.File.stdout(), init.io, &vbuf);
+        try vw.interface.print("kmdconv {s}\n", .{version_display});
+        try vw.interface.flush();
+        return;
     }
 
-    if (input == null) {
+    // Exactly one positional: the input file, or `-` for stdin.
+    if (res.positionals.items.len == 0) {
         fatal(init.io, "kmdconv: error: missing input file (use - for stdin)\n", .{});
     }
+    if (res.positionals.items.len > 1) {
+        fatal(init.io, "kmdconv: error: too many positional arguments\n", .{});
+    }
+    const input: []const u8 = res.positionals.items[0];
+    const reverse = res.hasFlag("reverse");
+    const output_path = res.get("output");
 
     // Read input.
     var input_data: []const u8 = undefined;
     var input_owned = false;
     defer if (input_owned) init.gpa.free(@constCast(input_data));
-    if (std.mem.eql(u8, input.?, "-")) {
+    if (std.mem.eql(u8, input, "-")) {
         input_data = try readStdin(init.io, init.gpa);
         input_owned = true;
     } else {
-        input_data = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, input.?, init.gpa, .unlimited) catch |e|
-            fatal(init.io, "kmdconv: error: cannot read {s}: {s}\n", .{ input.?, @errorName(e) });
+        input_data = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, input, init.gpa, .unlimited) catch |e|
+            fatal(init.io, "kmdconv: error: cannot read {s}: {s}\n", .{ input, @errorName(e) });
         input_owned = true;
     }
 
@@ -161,8 +161,8 @@ pub fn main(init: std.process.Init) !void {
     // input is a real file (not stdin).
     var derived: ?[]u8 = null;
     defer if (derived) |p| init.gpa.free(p);
-    if (output_path == null and !std.mem.eql(u8, input.?, "-")) {
-        derived = deriveOutputPath(init.gpa, input.?, reverse) catch |e|
+    if (output_path == null and !std.mem.eql(u8, input, "-")) {
+        derived = deriveOutputPath(init.gpa, input, reverse) catch |e|
             fatal(init.io, "kmdconv: error: cannot derive output path: {s}\n", .{@errorName(e)});
     }
     const out_path: ?[]const u8 = output_path orelse derived;
@@ -443,6 +443,43 @@ fn getStr(obj: Json.ObjectMap, key: []const u8) ![]const u8 {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "the option table accepts the documented spellings and nothing else" {
+    // One table drives parsing, so this pins the forms `docs/kmdconv.md` shows
+    // plus the ones the sibling binaries accept (`--opt=value`, clustered
+    // shorts), which a hand-rolled parser used to reject.
+    const gpa = std.testing.allocator;
+    const accepted = [_][]const u8{
+        "-h", "--help",
+        "-V", "--version",
+        "-r", "--reverse",
+        "-o", "--output",
+    };
+    for (accepted) |arg| {
+        const takes_value = std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output");
+        const args: []const []const u8 = if (takes_value) &.{ arg, "out.json" } else &.{arg};
+        var res = try cli_helper.parse(gpa, &opts_table, args);
+        defer res.deinit();
+        try std.testing.expectEqual(@as(usize, 0), res.positionals.items.len);
+    }
+
+    {
+        var res = try cli_helper.parse(gpa, &opts_table, &.{ "--output=out.json", "-r", "in.kmd" });
+        defer res.deinit();
+        try std.testing.expectEqualStrings("out.json", res.get("output").?);
+        try std.testing.expect(res.hasFlag("reverse"));
+        try std.testing.expectEqualStrings("in.kmd", res.positionals.items[0]);
+    }
+    {
+        // `-` is the stdin positional, not an option.
+        var res = try cli_helper.parse(gpa, &opts_table, &.{"-"});
+        defer res.deinit();
+        try std.testing.expectEqualStrings("-", res.positionals.items[0]);
+    }
+
+    try std.testing.expectError(error.UnknownOption, cli_helper.parse(gpa, &opts_table, &.{"--nope"}));
+    try std.testing.expectError(error.MissingValue, cli_helper.parse(gpa, &opts_table, &.{"--output"}));
+}
 
 test "JSON round-trip reproduces the embedded .kmd byte for byte" {
     // The converter's contract: `.kmd` → JSON → `.kmd` reproduces the input.
