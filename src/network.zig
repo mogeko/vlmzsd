@@ -26,9 +26,12 @@ const Io = std.Io;
 ///
 /// `Io.Reader.readSliceAll` alone does not bound the wait: it loops until `buf`
 /// is full, so a peer that delivers half a packet and then stalls parks the
-/// caller in the kernel. Split packets are the normal case here — `writePacket`
-/// sends the header and the body as two separate writes, and TCP may segment
-/// them further — which is why the deadline applies per refill, not per packet.
+/// caller in the kernel. Split packets are the normal case here — TCP may
+/// segment a packet anywhere, and a client may send the header first — which is
+/// why the deadline applies per refill, not per packet.
+///
+/// The server loop reads packets through `PacketReader`, which adds read-ahead
+/// on top of this and delegates here when there is no socket to read from.
 ///
 /// A dead peer surfaces as `error.Timeout`, and a shutdown signal as
 /// `error.Canceled` (the wait is a backend cancelation point; see `ReadOptions`).
@@ -104,6 +107,10 @@ pub const ServeOptions = struct {
     disconnect_per_request: bool = false,
     /// Read source and deadline for packet reads (C `ServerTimeout`).
     idle: ReadOptions = .{},
+    /// Read-ahead storage for packet reads: a header and its body usually
+    /// arrive in one TCP segment, and refilling through a buffer reads them
+    /// with one `net_receive` instead of two. Empty disables it.
+    read_ahead: []u8 = &.{},
     /// Optional sink for protocol-level events (see `Event`). When null, the
     /// events are simply not reported.
     on_event: ?*const fn (context: ?*anyopaque, event: Event) void = null,
@@ -118,8 +125,13 @@ fn writePacket(writer: *Io.Writer, packet_type: u8, call_id: u32, body: []const 
     std.debug.assert(frag_len <= std.math.maxInt(u16));
     var header: rpc.RpcHeader = undefined;
     rpc.createRpcHeader(&header, packet_type, @intCast(frag_len), call_id, flags);
-    try writeAll(writer, std.mem.asBytes(&header));
-    try writeAll(writer, body);
+    // One `writeVecAll` and one `flush` reach the socket as a single `net_write`
+    // (sendmsg with both iovecs). Flushing the header and then the body would
+    // leave in two segments, which Nagle can hold back until the peer's delayed
+    // ACK arrives — up to hundreds of milliseconds on a real network.
+    var parts: [2][]const u8 = .{ std.mem.asBytes(&header), body };
+    try writer.writeVecAll(&parts);
+    try writer.flush();
 }
 
 /// Where a packet's bytes come from, and how long a read may wait for them.
@@ -180,12 +192,61 @@ fn readSome(idle: ReadOptions, reader: *Io.Reader, buf: []u8) !usize {
     // empty case as EOF rather than spinning on it.
     if (received[1] == 0) return error.EndOfStream;
     const message = messages[0];
-    // The backend copies into `buf` itself, which is why `readAll` needs no
-    // second buffer (and no read-ahead accounting).
+    // The backend copies straight into `buf`; read-ahead, when enabled, is
+    // layered above this in `PacketReader`.
     std.debug.assert(message.data.ptr == buf.ptr);
     if (message.data.len == 0) return error.EndOfStream;
     return message.data.len;
 }
+
+const statelessReadAll = readAll;
+
+/// Packet reader with read-ahead. The server asks for a 16-byte header and then
+/// the body, and TCP normally delivers both in one segment: refilling through
+/// `buffer` reads them with one `net_receive` and serves the body from memory.
+/// The deadline still applies per refill, because each refill is one wait.
+///
+/// Without a socket (`idle.peer == null`: canned test input) the caller's
+/// `Io.Reader` is already the buffered source, and without a buffer there is
+/// nothing to read into, so both keep the stateless path.
+const PacketReader = struct {
+    idle: ReadOptions,
+    reader: *Io.Reader,
+    /// Read-ahead storage; a slice, so the caller keeps it alive for the whole
+    /// connection.
+    buffer: []u8,
+    /// Buffered bytes are `buffer[start..end]`; `start == end` means empty.
+    start: usize = 0,
+    end: usize = 0,
+
+    fn readAll(self: *PacketReader, dest: []u8) !void {
+        if (self.idle.peer == null or self.buffer.len == 0) {
+            return statelessReadAll(self.idle, self.reader, dest);
+        }
+        var off: usize = 0;
+        while (off < dest.len) {
+            if (self.start < self.end) {
+                const n = @min(self.end - self.start, dest.len - off);
+                @memcpy(dest[off..][0..n], self.buffer[self.start..][0..n]);
+                self.start += n;
+                off += n;
+                continue;
+            }
+            // A read at least as large as the buffer goes straight into `dest`:
+            // no copy, and it does not need the read-ahead at all.
+            if (dest.len - off >= self.buffer.len) {
+                const n = try readSome(self.idle, self.reader, dest[off..]);
+                if (n == 0) return error.EndOfStream;
+                off += n;
+                continue;
+            }
+            const n = try readSome(self.idle, self.reader, self.buffer);
+            if (n == 0) return error.EndOfStream;
+            self.start = 0;
+            self.end = n;
+        }
+    }
+};
 
 /// Why the server loop stopped. Every value is a normal end of the connection,
 /// and every exit path of `serveRpc` reports one, so the caller can log exactly
@@ -212,10 +273,15 @@ pub fn serveRpc(
     options: ServeOptions,
 ) !ServeEnd {
     var negotiation = rpc.BindNegotiation{};
+    var packet_reader: PacketReader = .{
+        .idle = options.idle,
+        .reader = reader,
+        .buffer = options.read_ahead,
+    };
 
     while (true) {
         var header: rpc.RpcHeader = undefined;
-        readAll(options.idle, reader, std.mem.asBytes(&header)) catch |err| switch (err) {
+        packet_reader.readAll(std.mem.asBytes(&header)) catch |err| switch (err) {
             error.EndOfStream => return .peer_closed,
             else => return err,
         };
@@ -246,7 +312,7 @@ pub fn serveRpc(
         if (frag_len < rpc.header_size) return error.InvalidPacket;
         const request_body = try allocator.alloc(u8, frag_len - rpc.header_size);
         defer allocator.free(request_body);
-        readAll(options.idle, reader, request_body) catch |err| switch (err) {
+        packet_reader.readAll(request_body) catch |err| switch (err) {
             error.EndOfStream => return .peer_closed,
             else => return err,
         };
@@ -1479,4 +1545,190 @@ test "a gracefully closed peer keeps its name" {
     const peer = formatPeer(pair.accepted.socket.handle, &buf);
     try std.testing.expect(std.mem.startsWith(u8, peer, "127.0.0.1:"));
     try std.testing.expect(isLoopbackPeer(pair.accepted.socket.handle));
+}
+
+const ServedPair = struct {
+    end: ServeEnd,
+    responses: []const u8,
+};
+
+/// Serve one connection over `pair`: write `input` from the client end — all at
+/// once, or split at `split_after` with a 100 ms gap — run `serveRpc` on the
+/// accepted end with `read_ahead` as the packet reader's storage, and return how
+/// the connection ended plus the response bytes.
+fn serveInput(
+    alloc: Allocator,
+    io: Io,
+    pair: *StreamPair,
+    cfg: *const kms.ServerConfig,
+    rng: std.Random,
+    input: []const u8,
+    split_after: ?usize,
+    read_ahead: []u8,
+    out: []u8,
+) !ServedPair {
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    if (split_after) |cut| {
+        const Split = struct {
+            io: Io,
+            pair: *StreamPair,
+            first: []const u8,
+            rest: []const u8,
+
+            fn run(self: @This()) Io.Cancelable!void {
+                self.pair.send(self.io, self.first) catch return;
+                try self.io.sleep(.{ .nanoseconds = 100 * 1_000_000 }, .awake);
+                self.pair.send(self.io, self.rest) catch return;
+            }
+        };
+        try group.concurrent(io, Split.run, .{Split{
+            .io = io,
+            .pair = pair,
+            .first = input[0..cut],
+            .rest = input[cut..],
+        }});
+    } else {
+        try pair.send(io, input);
+    }
+
+    var reader = emptyReader();
+    var writer = Io.Writer.fixed(out);
+    const end = try serveRpc(alloc, &reader, &writer, rng, .{
+        .cfg = cfg,
+        .clock = fixed_clock,
+        .disconnect_per_request = true,
+        .idle = pair.readOptions(io, ms(1_000)),
+        .read_ahead = read_ahead,
+    });
+    return .{ .end = end, .responses = writer.buffered() };
+}
+
+/// Assert that `responses` is exactly a BIND_ACK followed by a RESPONSE.
+fn expectBindAckAndResponse(responses: []const u8) !void {
+    const ack = parseHeader(responses);
+    try std.testing.expectEqual(rpc.packet_type.bind_ack, ack.packet_type);
+    const resp = parseHeader(responses[ack.frag_length..]);
+    try std.testing.expectEqual(rpc.packet_type.response, resp.packet_type);
+    try std.testing.expectEqual(
+        responses.len,
+        @as(usize, ack.frag_length) + @as(usize, resp.frag_length),
+    );
+}
+
+// The BIND and the REQUEST leave in one write, so they arrive in one segment:
+// the read-ahead must satisfy both the header and the body from that fill and
+// still produce both response packets in order.
+test "serveRpc reads BIND and REQUEST from one segment" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+    var cfg = kms.ServerConfig{ .data = &td.data };
+
+    var prng: std.Random.DefaultPrng = .init(0x2545_f491);
+    const rng = prng.random();
+    const base = makeBase(&td.data);
+    var request_v6: kms.RequestV6 = undefined;
+    kms.createRequestV6(&request_v6, &base, rng);
+    const rpc_req = try rpc.wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), false, 3);
+    defer alloc.free(rpc_req);
+    const bind_req = try rpc.buildBindRequest(alloc, rpc.packet_type.bind_req, 2, .{ .use_ndr64 = false });
+    defer alloc.free(bind_req);
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var pair = try StreamPair.init(io);
+    defer pair.deinit(io);
+
+    const both = try std.mem.concat(alloc, u8, &.{ bind_req, rpc_req });
+    defer alloc.free(both);
+
+    var read_ahead: [4096]u8 = undefined;
+    var out: [8192]u8 align(4) = undefined;
+    const served = try serveInput(alloc, io, &pair, &cfg, rng, both, null, &read_ahead, &out);
+    try std.testing.expectEqual(ServeEnd.after_request, served.end);
+    try expectBindAckAndResponse(served.responses);
+}
+
+// A packet that arrives in pieces must still complete: the deadline applies per
+// refill, so the 100 ms gap is well inside `--timeout`, and the read-ahead must
+// not turn a short refill into a failure.
+test "serveRpc reads a split packet through the read-ahead buffer" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+    var cfg = kms.ServerConfig{ .data = &td.data };
+
+    var prng: std.Random.DefaultPrng = .init(0x0bad_c0de);
+    const rng = prng.random();
+    const base = makeBase(&td.data);
+    var request_v6: kms.RequestV6 = undefined;
+    kms.createRequestV6(&request_v6, &base, rng);
+    const rpc_req = try rpc.wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), false, 3);
+    defer alloc.free(rpc_req);
+    const bind_req = try rpc.buildBindRequest(alloc, rpc.packet_type.bind_req, 2, .{ .use_ndr64 = false });
+    defer alloc.free(bind_req);
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var pair = try StreamPair.init(io);
+    defer pair.deinit(io);
+
+    // Split inside the REQUEST: its header arrives with the BIND, its body 100 ms
+    // later, so the body read needs a second refill.
+    const both = try std.mem.concat(alloc, u8, &.{ bind_req, rpc_req });
+    defer alloc.free(both);
+
+    var read_ahead: [4096]u8 = undefined;
+    var out: [8192]u8 align(4) = undefined;
+    const served = try serveInput(
+        alloc,
+        io,
+        &pair,
+        &cfg,
+        rng,
+        both,
+        bind_req.len,
+        &read_ahead,
+        &out,
+    );
+    try std.testing.expectEqual(ServeEnd.after_request, served.end);
+    try expectBindAckAndResponse(served.responses);
+}
+
+// The read-ahead is a caller-provided buffer of any size: smaller than a header
+// it still works, filling repeatedly and falling back to the direct read once
+// the request is larger than the buffer.
+test "serveRpc reads through a read-ahead smaller than a header" {
+    const alloc = std.testing.allocator;
+    var td = try loadTestData(alloc);
+    defer td.deinit(alloc);
+    var cfg = kms.ServerConfig{ .data = &td.data };
+
+    var prng: std.Random.DefaultPrng = .init(0x7a1d_b00c);
+    const rng = prng.random();
+    const base = makeBase(&td.data);
+    var request_v6: kms.RequestV6 = undefined;
+    kms.createRequestV6(&request_v6, &base, rng);
+    const rpc_req = try rpc.wrapKmsRequest(alloc, std.mem.asBytes(&request_v6), false, 3);
+    defer alloc.free(rpc_req);
+    const bind_req = try rpc.buildBindRequest(alloc, rpc.packet_type.bind_req, 2, .{ .use_ndr64 = false });
+    defer alloc.free(bind_req);
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var pair = try StreamPair.init(io);
+    defer pair.deinit(io);
+
+    const both = try std.mem.concat(alloc, u8, &.{ bind_req, rpc_req });
+    defer alloc.free(both);
+
+    var read_ahead: [4]u8 = undefined;
+    var out: [8192]u8 align(4) = undefined;
+    const served = try serveInput(alloc, io, &pair, &cfg, rng, both, null, &read_ahead, &out);
+    try std.testing.expectEqual(ServeEnd.after_request, served.end);
+    try expectBindAckAndResponse(served.responses);
 }

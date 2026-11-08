@@ -655,12 +655,17 @@ fn serveClientThread(ctx: *ClientContext) void {
     notePoolThread(ctx.tally, ctx.log, true);
     if (!ctx.quiet) ctx.log.debug("connection from {s} accepted", .{ctx.peer});
 
+    // `rbuf` is the packet reader's read-ahead (`.read_ahead` below): a header
+    // and its body usually arrive in one segment, so one read fills it and the
+    // rest of the packet is served from memory. Reads on a connected socket go
+    // through `.idle.peer`, so the `Io.Reader` argument is only the fallback
+    // for sources without one (the tests) and stays empty here.
     var rbuf: [4096]u8 = undefined;
     var wbuf: [4096]u8 = undefined;
-    var reader = ctx.stream.reader(ctx.io, &rbuf);
+    var reader = Io.Reader.fixed("");
     var writer = ctx.stream.writer(ctx.io, &wbuf);
 
-    const end: network.ServeEnd = network.serveRpc(ctx.gpa, &reader.interface, &writer.interface, ctx.prng.random(), .{
+    const end: network.ServeEnd = network.serveRpc(ctx.gpa, &reader, &writer.interface, ctx.prng.random(), .{
         .cfg = ctx.cfg,
         // Sampled per request, so `--check-client-time` and level-2 ePIDs follow
         // a keep-alive connection instead of measuring against the accept time.
@@ -680,6 +685,7 @@ fn serveClientThread(ctx: *ClientContext) void {
             .handle = ctx.stream.socket.handle,
             .timeout = network.timeoutSeconds(ctx.timeout_seconds),
         } },
+        .read_ahead = &rbuf,
     }) catch |e| switch (e) {
         error.Timeout => {
             // Nothing arrived for `--timeout` seconds (the C `SO_RCVTIMEO`).
