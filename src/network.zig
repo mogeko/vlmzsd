@@ -13,126 +13,12 @@ const vlmzsd = @import("vlmzsd");
 const rpc = vlmzsd.rpc;
 const kms = vlmzsd.kms;
 
-const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// `sendrecv` equivalents
+// Byte streams
 // ---------------------------------------------------------------------------
-
-/// Read exactly `buf.len` bytes, waiting for the peer before each refill so that
-/// no single read can block past the deadline in `idle` (the reference used
-/// `SO_RCVTIMEO` for the same purpose).
-///
-/// `Io.Reader.readSliceAll` alone does not bound the wait: it loops until `buf`
-/// is full, so a peer that delivers half a packet and then stalls parks the
-/// caller in the kernel. Split packets are the normal case here — TCP may
-/// segment a packet anywhere, and a client may send the header first — which is
-/// why the deadline applies per refill, not per packet.
-///
-/// The server loop reads packets through `PacketReader`, which adds read-ahead
-/// on top of this and delegates here when there is no socket to read from.
-///
-/// A dead peer surfaces as `error.Timeout`, and a shutdown signal as
-/// `error.Canceled` (the wait is a backend cancelation point; see `ReadOptions`).
-pub fn readAll(idle: ReadOptions, reader: *Io.Reader, buf: []u8) !void {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = readSome(idle, reader, buf[off..]) catch |err| switch (err) {
-            error.EndOfStream => return error.EndOfStream,
-            else => |e| return e,
-        };
-        // Zero bytes means the peer is gone: `readVec` only reports 0 when the
-        // reader is drained, and the socket path maps EOF to `EndOfStream`.
-        if (n == 0) return error.EndOfStream;
-        off += n;
-    }
-}
-
-/// Write all of `buf` (equivalent to `_send` in network.c). Flushes the
-/// writer so the bytes reach the socket — the `Io.Writer` is buffered and
-/// would otherwise hold them until the buffer fills.
-pub fn writeAll(writer: *Io.Writer, buf: []const u8) !void {
-    try writer.writeAll(buf);
-    try writer.flush();
-}
-
-// ---------------------------------------------------------------------------
-// Server
-// ---------------------------------------------------------------------------
-
-/// Protocol-level event reported to the caller via `ServeOptions.on_event`.
-/// This module reports what happened; the caller decides how to surface it
-/// (e.g. logging), keeping this module free of any logger dependency.
-pub const Event = union(enum) {
-    /// BIND/ALTER-CONTEXT negotiation; payload is true when NDR64 was selected.
-    bind_negotiated: bool,
-    /// A received PDU that is not a `REQUEST` (BIND, ALTER-CONTEXT, or a type
-    /// this server does not handle), reported as it arrives so the caller can
-    /// log what the peer actually sent.
-    packet: struct { packet_type: u8, frag_length: u16 },
-    /// A FAULT was sent; payload is the NCA status code.
-    fault: u32,
-    /// A KMS request was rejected; `major` is the request's major version
-    /// (0 = unparseable) and `hr` the HRESULT.
-    request_rejected: struct { major: u32, hr: u32 },
-    /// A KMS request was served; `major` is the version and `size` the
-    /// response byte length.
-    response: struct { major: u32, size: usize },
-};
-
-/// Wall clock for the per-request timestamp check (`--check-client-time`) and
-/// for level-2 ePID generation. `serveRpc` samples it once before each REQUEST:
-/// sampling it per connection would keep comparing against the moment the
-/// connection was accepted, which a keep-alive client can hold open for hours.
-pub const Clock = struct {
-    context: ?*anyopaque = null,
-    nowUnix: *const fn (context: ?*anyopaque) i64,
-};
-
-pub const ServeOptions = struct {
-    cfg: *const kms.ServerConfig,
-    /// Request clock (see `Clock`); required, so a caller cannot forget it.
-    clock: Clock,
-    /// Association group id echoed in BIND/ALTER-CONTEXT responses. The
-    /// reference assigns a random non-zero value at startup and increments it
-    /// per client (`network.c` `runServer`); callers should do the same.
-    rpc_assoc_group: u32 = 0,
-    /// Port-number string to embed in BIND responses ("" → none).
-    secondary_address: []const u8 = "",
-    use_ndr64: bool = false,
-    /// Bind-time feature negotiation is enabled (`UseServerRpcBTFN`).
-    use_btfn: bool = false,
-    /// Close the connection after each RESPONSE/FAULT (C `DisconnectImmediately`).
-    disconnect_per_request: bool = false,
-    /// Read source and deadline for packet reads (C `ServerTimeout`).
-    idle: ReadOptions = .{},
-    /// Read-ahead storage for packet reads: a header and its body usually
-    /// arrive in one TCP segment, and refilling through a buffer reads them
-    /// with one `net_receive` instead of two. Empty disables it.
-    read_ahead: []u8 = &.{},
-    /// Optional sink for protocol-level events (see `Event`). When null, the
-    /// events are simply not reported.
-    on_event: ?*const fn (context: ?*anyopaque, event: Event) void = null,
-    event_context: ?*anyopaque = null,
-};
-
-/// Write one RPC packet (header + body).
-fn writePacket(writer: *Io.Writer, packet_type: u8, call_id: u32, body: []const u8, flags: u8) !void {
-    // Every body this server sends is bounded by a request or a response struct,
-    // so the fragment length always fits its 16-bit field.
-    const frag_len = rpc.header_size + body.len;
-    std.debug.assert(frag_len <= std.math.maxInt(u16));
-    var header: rpc.RpcHeader = undefined;
-    rpc.createRpcHeader(&header, packet_type, @intCast(frag_len), call_id, flags);
-    // One `writeVecAll` and one `flush` reach the socket as a single `net_write`
-    // (sendmsg with both iovecs). Flushing the header and then the body would
-    // leave in two segments, which Nagle can hold back until the peer's delayed
-    // ACK arrives — up to hundreds of milliseconds on a real network.
-    var parts: [2][]const u8 = .{ std.mem.asBytes(&header), body };
-    try writer.writeVecAll(&parts);
-    try writer.flush();
-}
 
 /// Where a packet's bytes come from, and how long a read may wait for them.
 ///
@@ -140,7 +26,8 @@ fn writePacket(writer: *Io.Writer, packet_type: u8, call_id: u32, body: []const 
 /// `Io.operateTimeout(.net_receive)`: the **backend** owns both the deadline and
 /// the cancelation point, so a shutdown signal ends a parked read with
 /// `error.Canceled` without any self-pipe or wake fd.
-/// `peer` absent → read from the `Io.Reader` argument (canned input in tests).
+/// `peer` absent → read from the `Io.Reader` handed to `PacketReader` (canned
+/// input in tests).
 ///
 /// Both the server loop and the client use these options, so `--timeout` means
 /// the same on either side of the connection.
@@ -166,17 +53,13 @@ pub fn timeoutSeconds(seconds: u32) Io.Timeout {
     return .{ .duration = .{ .raw = .{ .nanoseconds = @as(i96, seconds) * 1_000_000_000 }, .clock = .awake } };
 }
 
-/// Read up to `buf.len` bytes into `buf`; returns how many arrived.
+/// One `net_receive` from `peer`; returns how many bytes arrived.
 /// `error.EndOfStream` means the peer closed the connection.
-fn readSome(idle: ReadOptions, reader: *Io.Reader, buf: []u8) !usize {
-    const peer = idle.peer orelse {
-        var vec: [1][]u8 = .{buf};
-        return reader.readVec(&vec);
-    };
-
-    // `net_receive` is message oriented: one call copies at most one message
-    // (never more than `buf.len` bytes) straight into `buf`, and reports EOF as
-    // a zero-length message rather than as an error.
+///
+/// `net_receive` is message oriented: one call copies at most one message
+/// (never more than `buf.len` bytes) straight into `buf`, and reports EOF as a
+/// zero-length message rather than as an error.
+fn readSome(peer: ReadOptions.Peer, buf: []u8) !usize {
     var messages = [1]Io.net.IncomingMessage{
         .{ .from = undefined, .data = undefined, .control = &.{}, .flags = undefined },
     };
@@ -199,30 +82,53 @@ fn readSome(idle: ReadOptions, reader: *Io.Reader, buf: []u8) !usize {
     return message.data.len;
 }
 
-const statelessReadAll = readAll;
+/// Read exactly `dest.len` bytes from `peer`, one `net_receive` per refill. Each
+/// refill waits with its own deadline, so a peer that sends half a packet and
+/// then stalls surfaces as `error.Timeout` instead of parking the caller in the
+/// kernel (the reference used `SO_RCVTIMEO` for the same purpose).
+fn readExactPeer(peer: ReadOptions.Peer, dest: []u8) !void {
+    var off: usize = 0;
+    while (off < dest.len) {
+        const n = try readSome(peer, dest[off..]);
+        if (n == 0) return error.EndOfStream;
+        off += n;
+    }
+}
 
-/// Packet reader with read-ahead. The server asks for a 16-byte header and then
-/// the body, and TCP normally delivers both in one segment: refilling through
-/// `buffer` reads them with one `net_receive` and serves the body from memory.
-/// The deadline still applies per refill, because each refill is one wait.
+/// Packet reader: reads an exact number of bytes from a connected peer or from a
+/// borrowed `Io.Reader` (canned test input), optionally through read-ahead.
 ///
-/// Without a socket (`idle.peer == null`: canned test input) the caller's
-/// `Io.Reader` is already the buffered source, and without a buffer there is
-/// nothing to read into, so both keep the stateless path.
-const PacketReader = struct {
+/// The server asks for a 16-byte header and then the body, and TCP normally
+/// delivers both in one segment: refilling through `buffer` reads them with one
+/// `net_receive` and serves the body from memory. The deadline still applies per
+/// refill, because each refill is one wait.
+///
+/// `Io.Reader.readSliceAll` cannot be used for the socket path: it loops until
+/// the buffer is full, so a peer that sends half a packet parks the caller in
+/// the kernel and no deadline can end that wait.
+///
+/// The state (`start`/`end`) must outlive one packet sequence, so a reader stays
+/// with its connection and is never copied after the first read.
+pub const PacketReader = struct {
+    /// Where the bytes come from and how long a read may wait.
     idle: ReadOptions,
+    /// Source used when `idle.peer` is null; the socket path bypasses it.
     reader: *Io.Reader,
-    /// Read-ahead storage; a slice, so the caller keeps it alive for the whole
-    /// connection.
+    /// Read-ahead storage, owned by the caller; empty disables read-ahead.
     buffer: []u8,
     /// Buffered bytes are `buffer[start..end]`; `start == end` means empty.
     start: usize = 0,
     end: usize = 0,
 
-    fn readAll(self: *PacketReader, dest: []u8) !void {
-        if (self.idle.peer == null or self.buffer.len == 0) {
-            return statelessReadAll(self.idle, self.reader, dest);
-        }
+    pub fn init(idle: ReadOptions, reader: *Io.Reader, buffer: []u8) PacketReader {
+        return .{ .idle = idle, .reader = reader, .buffer = buffer };
+    }
+
+    /// Read exactly `dest.len` bytes. `error.EndOfStream` means the peer closed,
+    /// possibly after some of `dest` was filled.
+    pub fn read(self: *PacketReader, dest: []u8) !void {
+        const peer = self.idle.peer orelse return self.readDirect(dest);
+        if (self.buffer.len == 0) return readExactPeer(peer, dest);
         var off: usize = 0;
         while (off < dest.len) {
             if (self.start < self.end) {
@@ -235,18 +141,138 @@ const PacketReader = struct {
             // A read at least as large as the buffer goes straight into `dest`:
             // no copy, and it does not need the read-ahead at all.
             if (dest.len - off >= self.buffer.len) {
-                const n = try readSome(self.idle, self.reader, dest[off..]);
+                const n = try readSome(peer, dest[off..]);
                 if (n == 0) return error.EndOfStream;
                 off += n;
                 continue;
             }
-            const n = try readSome(self.idle, self.reader, self.buffer);
+            const n = try readSome(peer, self.buffer);
             if (n == 0) return error.EndOfStream;
             self.start = 0;
             self.end = n;
         }
     }
+
+    /// No socket behind the reader: copy from the borrowed `Io.Reader`, which
+    /// may be an unbuffered source such as `Io.Reader.fixed`.
+    fn readDirect(self: *PacketReader, dest: []u8) !void {
+        var off: usize = 0;
+        while (off < dest.len) {
+            var vec: [1][]u8 = .{dest[off..]};
+            const n = try self.reader.readVec(&vec);
+            if (n == 0) return error.EndOfStream;
+            off += n;
+        }
+    }
 };
+
+/// Write all of `buf` and flush it (equivalent to `_send` in network.c). The
+/// `Io.Writer` is buffered, so the flush is what puts the bytes on the socket.
+pub fn writeAndFlush(writer: *Io.Writer, buf: []const u8) !void {
+    try writer.writeAll(buf);
+    try writer.flush();
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+/// Protocol-level event reported to the caller through `ServeOptions.events`.
+/// This module reports what happened; the caller decides how to surface it
+/// (e.g. logging), keeping this module free of any logger dependency.
+pub const Event = union(enum) {
+    /// BIND/ALTER-CONTEXT negotiation; payload is true when NDR64 was selected.
+    bind_negotiated: bool,
+    /// A received PDU that is not a `REQUEST` (BIND, ALTER-CONTEXT, or a type
+    /// this server does not handle), reported as it arrives so the caller can
+    /// log what the peer actually sent.
+    packet: struct { packet_type: u8, frag_length: u16 },
+    /// A FAULT was sent; payload is the NCA status code.
+    fault: u32,
+    /// A KMS request was rejected; `major` is the request's major version
+    /// (0 = unparseable) and `hr` the HRESULT.
+    request_rejected: struct { major: u32, hr: u32 },
+    /// A KMS request was served; `major` is the version and `size` the
+    /// response byte length.
+    response: struct { major: u32, size: usize },
+};
+
+/// Event callback and its context, clumped so the two cannot drift apart.
+/// `Clock` has the same shape for the wall clock.
+pub const EventSink = struct {
+    context: ?*anyopaque = null,
+    callback: ?*const fn (context: ?*anyopaque, event: Event) void = null,
+
+    /// Report `event`; a sink without a callback reports nothing.
+    pub fn notify(self: EventSink, event: Event) void {
+        if (self.callback) |callback| callback(self.context, event);
+    }
+};
+
+/// Wall clock for the per-request timestamp check (`--check-client-time`) and
+/// for level-2 ePID generation. The loop samples it once before each REQUEST:
+/// sampling it per connection would keep comparing against the moment the
+/// connection was accepted, which a keep-alive client can hold open for hours.
+pub const Clock = struct {
+    context: ?*anyopaque = null,
+    now_unix: *const fn (context: ?*anyopaque) i64,
+};
+
+/// Policy for one served connection. Resources (allocator, streams, RNG) travel
+/// in `ServeSession`, so this struct carries configuration only.
+pub const ServeOptions = struct {
+    cfg: *const kms.ServerConfig,
+    /// Request clock (see `Clock`); required, so a caller cannot forget it.
+    clock: Clock,
+    /// Association group id echoed in BIND/ALTER-CONTEXT responses. The
+    /// reference assigns a random non-zero value at startup and increments it
+    /// per client (`network.c` `runServer`); callers should do the same.
+    rpc_assoc_group: u32 = 0,
+    /// Port-number string to embed in BIND responses ("" → none).
+    secondary_address: []const u8 = "",
+    use_ndr64: bool = false,
+    /// Bind-time feature negotiation is enabled (`UseServerRpcBTFN`).
+    use_btfn: bool = false,
+    /// Close the connection after each RESPONSE/FAULT (C `DisconnectImmediately`).
+    disconnect_per_request: bool = false,
+    /// Optional sink for protocol-level events (see `Event`).
+    events: EventSink = .{},
+};
+
+/// What one served connection borrows: the allocator the RPC layer takes packet
+/// and response bodies from, the packet reader over its socket, the writer that
+/// answers, and the RNG for ePIDs.
+pub const ServeSession = struct {
+    allocator: Allocator,
+    packet_reader: *PacketReader,
+    writer: *Io.Writer,
+    rng: std.Random,
+};
+
+/// The header fields of a packet this module sends. The body travels separately
+/// so the fragment length can be derived from it.
+const Reply = struct {
+    packet_type: u8,
+    call_id: u32,
+    flags: u8,
+};
+
+/// Write one RPC packet (header + body).
+fn writePacket(writer: *Io.Writer, reply: Reply, body: []const u8) !void {
+    // Every body this server sends is bounded by a request or a response struct,
+    // so the fragment length always fits its 16-bit field.
+    const frag_len = rpc.header_size + body.len;
+    std.debug.assert(frag_len <= std.math.maxInt(u16));
+    var header: rpc.RpcHeader = undefined;
+    rpc.createRpcHeader(&header, reply.packet_type, @intCast(frag_len), reply.call_id, reply.flags);
+    // One `writeVecAll` and one `flush` reach the socket as a single `net_write`
+    // (sendmsg with both iovecs). Flushing the header and then the body would
+    // leave in two segments, which Nagle can hold back until the peer's delayed
+    // ACK arrives — up to hundreds of milliseconds on a real network.
+    var parts: [2][]const u8 = .{ std.mem.asBytes(&header), body };
+    try writer.writeVecAll(&parts);
+    try writer.flush();
+}
 
 /// Why the server loop stopped. Every value is a normal end of the connection,
 /// and every exit path of `serveRpc` reports one, so the caller can log exactly
@@ -262,194 +288,187 @@ pub const ServeEnd = enum {
     after_request,
 };
 
-/// Serve the RPC loop over a connected stream (equivalent to the C `rpcServer`),
-/// returning why the connection ended (`ServeEnd`). Failures — including
-/// `error.Timeout` when a read outlives `options.idle` — stay errors.
-pub fn serveRpc(
-    allocator: Allocator,
-    reader: *Io.Reader,
-    writer: *Io.Writer,
-    rng: std.Random,
+/// The C reference writes the server's global CallId (2) into FAULT headers, not
+/// the request's CallId.
+const fault_call_id: u32 = 2;
+
+/// What a received PDU asks the loop to do.
+const Kind = enum {
+    bind,
+    alter_context,
+    request,
+};
+
+/// One received PDU: its parsed header and the allocator-owned body.
+const Frame = struct {
+    header: rpc.RpcHeader,
+    body: []u8,
+};
+
+/// State of one served connection: the borrowed resources, the caller's policy
+/// and the contexts BIND negotiated. Everything the loop does lives on this
+/// struct, so the helpers below take one or two arguments.
+const Connection = struct {
+    session: ServeSession,
     options: ServeOptions,
-) !ServeEnd {
-    var negotiation = rpc.BindNegotiation{};
-    var packet_reader: PacketReader = .{
-        .idle = options.idle,
-        .reader = reader,
-        .buffer = options.read_ahead,
-    };
+    negotiation: rpc.BindNegotiation = .{},
 
-    while (true) {
-        var header: rpc.RpcHeader = undefined;
-        packet_reader.readAll(std.mem.asBytes(&header)) catch |err| switch (err) {
-            error.EndOfStream => return .peer_closed,
-            else => return err,
-        };
+    fn run(self: *Connection) !ServeEnd {
+        while (true) {
+            const header = self.readHeader() catch |err| switch (err) {
+                error.EndOfStream => return .peer_closed,
+                else => |e| return e,
+            };
 
-        // Report every PDU except a `REQUEST` (whose outcome the `response` /
-        // `request_rejected` events already describe). Without this a BIND
-        // followed by an ALTER-CONTEXT — or by a type dropped below — leaves no
-        // trace, and "BIND then nothing" is indistinguishable from "the peer
-        // went silent".
-        if (header.packet_type != rpc.packet_type.request) {
-            if (options.on_event) |cb| cb(options.event_context, .{ .packet = .{
-                .packet_type = header.packet_type,
-                .frag_length = header.frag_length,
-            } });
+            // Report every PDU except a `REQUEST` (whose outcome the `response`
+            // / `request_rejected` events already describe). Without this a BIND
+            // followed by an ALTER-CONTEXT — or by a type dropped below — leaves
+            // no trace, and "BIND then nothing" is indistinguishable from "the
+            // peer went silent".
+            if (header.packet_type != rpc.packet_type.request) {
+                self.options.events.notify(.{ .packet = .{
+                    .packet_type = header.packet_type,
+                    .frag_length = header.frag_length,
+                } });
+            }
+
+            const kind: Kind = switch (header.packet_type) {
+                rpc.packet_type.bind_req => .bind,
+                rpc.packet_type.request => .request,
+                rpc.packet_type.alter_context_req => .alter_context,
+                // Unsupported packet type: close the connection (C `rpcServer`
+                // returns from its `default:` arm). Reported through `ServeEnd`
+                // so the caller logs the close instead of losing it.
+                else => return .unsupported_packet,
+            };
+
+            const body = self.readBody(header) catch |err| switch (err) {
+                error.EndOfStream => return .peer_closed,
+                else => |e| return e,
+            };
+            defer self.session.allocator.free(body);
+
+            const frame: Frame = .{ .header = header, .body = body };
+            switch (kind) {
+                .bind, .alter_context => try self.serveBind(frame, kind),
+                .request => if (try self.serveRequest(frame)) |end| return end,
+            }
         }
+    }
 
-        const action: usize = switch (header.packet_type) {
-            rpc.packet_type.bind_req => 0,
-            rpc.packet_type.request => 1,
-            rpc.packet_type.alter_context_req => 2,
-            // Unsupported packet type: close the connection (C `rpcServer`
-            // returns from its `default:` arm). Report it through `ServeEnd` so
-            // the caller logs the close instead of losing it.
-            else => return .unsupported_packet,
-        };
+    fn readHeader(self: *Connection) !rpc.RpcHeader {
+        var header: rpc.RpcHeader = undefined;
+        try self.session.packet_reader.read(std.mem.asBytes(&header));
+        return header;
+    }
 
+    /// Read the body of `header` into an allocator-owned buffer.
+    fn readBody(self: *Connection, header: rpc.RpcHeader) ![]u8 {
         const frag_len: usize = header.frag_length;
         if (frag_len < rpc.header_size) return error.InvalidPacket;
-        const request_body = try allocator.alloc(u8, frag_len - rpc.header_size);
-        defer allocator.free(request_body);
-        packet_reader.readAll(request_body) catch |err| switch (err) {
-            error.EndOfStream => return .peer_closed,
-            else => return err,
-        };
+        const body = try self.session.allocator.alloc(u8, frag_len - rpc.header_size);
+        errdefer self.session.allocator.free(body);
+        try self.session.packet_reader.read(body);
+        return body;
+    }
 
-        if (action == 0 or action == 2) {
-            const resp_body = try rpc.buildBindResponse(allocator, request_body, options.rpc_assoc_group, .{
-                .use_ndr64 = options.use_ndr64,
-                .use_btfn = options.use_btfn,
+    /// Answer a BIND or ALTER-CONTEXT.
+    fn serveBind(self: *Connection, frame: Frame, kind: Kind) !void {
+        std.debug.assert(kind != .request);
+        const is_bind = kind == .bind;
+        const resp_body = try rpc.buildBindResponse(
+            self.session.allocator,
+            frame.body,
+            self.options.rpc_assoc_group,
+            .{
+                .use_ndr64 = self.options.use_ndr64,
+                .use_btfn = self.options.use_btfn,
                 // The local port string belongs in a BIND response only: the
                 // reference suppresses it for ALTER-CONTEXT (`rpc.c` `rpcBind`
                 // sets `SecondaryAddressLength = 0` when the packet type is
                 // `RPC_PT_ALTERCONTEXT_REQ`).
-                .secondary_address = if (action == 0) options.secondary_address else "",
-            }, &negotiation);
-            defer allocator.free(resp_body);
+                .secondary_address = if (is_bind) self.options.secondary_address else "",
+            },
+            &self.negotiation,
+        );
+        defer self.session.allocator.free(resp_body);
 
-            if (action == 0) {
-                if (options.on_event) |cb| {
-                    cb(options.event_context, .{ .bind_negotiated = negotiation.hasNdr64() });
-                }
-            }
+        if (is_bind) {
+            self.options.events.notify(.{ .bind_negotiated = self.negotiation.hasNdr64() });
+        }
 
-            const resp_packet: u8 = if (action == 0) rpc.packet_type.bind_ack else rpc.packet_type.alter_context_ack;
+        try writePacket(self.session.writer, .{
+            .packet_type = if (is_bind) rpc.packet_type.bind_ack else rpc.packet_type.alter_context_ack,
             // BIND_ACK echoes the request's packet flags (incl. MULTIPLEX);
             // ALTER_CONTEXT_ACK always uses FIRST|LAST (matches the reference).
-            const resp_flags: u8 = if (action == 0) header.packet_flags else rpc.packet_flags.first | rpc.packet_flags.last;
-            try writePacket(writer, resp_packet, header.call_id, resp_body, resp_flags);
+            .flags = if (is_bind) frame.header.packet_flags else rpc.packet_flags.first | rpc.packet_flags.last,
+            .call_id = frame.header.call_id,
+        }, resp_body);
+    }
+
+    /// Dispatch one REQUEST. Returns `.after_request` when `disconnect_per_request`
+    /// closes the connection, or null to keep serving.
+    fn serveRequest(self: *Connection, frame: Frame) !?ServeEnd {
+        const now_unix = self.options.clock.now_unix(self.options.clock.context);
+        const dispatch = try rpc.dispatchKmsRequest(
+            self.session.allocator,
+            frame.body,
+            &self.negotiation,
+            self.options.cfg,
+            self.session.rng,
+            now_unix,
+        );
+        switch (dispatch.kind) {
+            .fault => |nca| {
+                self.options.events.notify(.{ .fault = nca });
+                const fault_body = rpc.buildFault(nca);
+                try writePacket(self.session.writer, .{
+                    .packet_type = rpc.packet_type.fault,
+                    .call_id = fault_call_id,
+                    .flags = rpc.packet_flags.first | rpc.packet_flags.last | rpc.packet_flags.not_exec,
+                }, &fault_body);
+            },
+            .response => |resp_body| {
+                defer self.session.allocator.free(resp_body);
+                self.report(dispatch);
+                // RESPONSE echoes the request's packet flags (incl. MULTIPLEX).
+                try writePacket(self.session.writer, .{
+                    .packet_type = rpc.packet_type.response,
+                    .call_id = frame.header.call_id,
+                    .flags = frame.header.packet_flags,
+                }, resp_body);
+            },
+        }
+        return if (self.options.disconnect_per_request) .after_request else null;
+    }
+
+    /// Report a served or rejected request as one event.
+    fn report(self: *Connection, dispatch: rpc.DispatchResult) void {
+        if (dispatch.response_size < 0) {
+            self.options.events.notify(.{ .request_rejected = .{
+                .major = dispatch.major_version,
+                .hr = @bitCast(dispatch.response_size),
+            } });
         } else {
-            const now_unix = options.clock.nowUnix(options.clock.context);
-            const dispatch = try rpc.dispatchKmsRequest(allocator, request_body, &negotiation, options.cfg, rng, now_unix);
-            switch (dispatch.kind) {
-                .fault => |nca| {
-                    if (options.on_event) |cb| cb(options.event_context, .{ .fault = nca });
-                    const fault_body = rpc.buildFault(nca);
-                    // The C reference writes the server's global CallId (2)
-                    // into FAULT headers, not the request's CallId.
-                    try writePacket(
-                        writer,
-                        rpc.packet_type.fault,
-                        2,
-                        &fault_body,
-                        rpc.packet_flags.first | rpc.packet_flags.last | rpc.packet_flags.not_exec,
-                    );
-                    if (options.disconnect_per_request) return .after_request;
-                },
-                .response => |resp_body| {
-                    defer allocator.free(resp_body);
-                    if (options.on_event) |cb| {
-                        if (dispatch.response_size < 0) {
-                            cb(options.event_context, .{ .request_rejected = .{
-                                .major = dispatch.major_version,
-                                .hr = @bitCast(dispatch.response_size),
-                            } });
-                        } else {
-                            cb(options.event_context, .{ .response = .{
-                                .major = dispatch.major_version,
-                                .size = @intCast(dispatch.response_size),
-                            } });
-                        }
-                    }
-                    // RESPONSE echoes the request's packet flags (incl. MULTIPLEX).
-                    try writePacket(writer, rpc.packet_type.response, header.call_id, resp_body, header.packet_flags);
-                    if (options.disconnect_per_request) return .after_request;
-                },
-            }
+            self.options.events.notify(.{ .response = .{
+                .major = dispatch.major_version,
+                .size = @intCast(dispatch.response_size),
+            } });
         }
     }
+};
+
+/// Serve the RPC loop over a connected stream (equivalent to the C `rpcServer`),
+/// returning why the connection ended (`ServeEnd`). Failures — including
+/// `error.Timeout` when a read outlives the session's deadline — stay errors.
+pub fn serveRpc(session: ServeSession, options: ServeOptions) !ServeEnd {
+    var connection: Connection = .{ .session = session, .options = options };
+    return connection.run();
 }
 
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
-
-pub const ClientOptions = struct {
-    use_ndr64: bool = true,
-    use_btfn: bool = false,
-    multiplexed: bool = false,
-    /// Read source and deadline for the BIND reply and for every RESPONSE read.
-    /// The client has no *connect* deadline: `std.Io.Threaded` (0.17) still
-    /// panics on `ConnectOptions.timeout` ("TODO implement"), so a blackholed
-    /// host is bounded only by the kernel's own SYN timeout.
-    idle: ReadOptions = .{},
-};
-
-/// Perform the BIND handshake and return the negotiated transfer syntaxes.
-pub fn clientBind(
-    allocator: Allocator,
-    reader: *Io.Reader,
-    writer: *Io.Writer,
-    call_id: *u32,
-    options: ClientOptions,
-) !rpc.BindResult {
-    const req = try rpc.buildBindRequest(allocator, rpc.packet_type.bind_req, call_id.*, .{
-        .use_ndr64 = options.use_ndr64,
-        .use_btfn = options.use_btfn,
-        .multiplexed = options.multiplexed,
-    });
-    defer allocator.free(req);
-    call_id.* += 1;
-
-    try writeAll(writer, req);
-
-    const resp_body = try readPacket(allocator, options.idle, reader);
-    defer allocator.free(resp_body);
-
-    return rpc.parseBindResponse(resp_body);
-}
-
-/// Bind the presentation context the BIND left out. The reference client
-/// (`rpcBindClient`) always wants NDR32 for its first request and adds it with
-/// an ALTER-CONTEXT when the server NACKed it — which a server does whenever
-/// NDR64 is available (Microsoft behavior), so this is also the sequence the
-/// Windows KMS client sends.
-pub fn clientAlterContext(
-    allocator: Allocator,
-    reader: *Io.Reader,
-    writer: *Io.Writer,
-    call_id: *u32,
-    options: ClientOptions,
-) !rpc.BindResult {
-    // `buildBindRequest` attaches the NDR64/BTFN contexts to a BIND only, so the
-    // request carries the single NDR32 item, as context id 0.
-    const req = try rpc.buildBindRequest(allocator, rpc.packet_type.alter_context_req, call_id.*, .{
-        .use_ndr64 = false,
-        .use_btfn = false,
-        .multiplexed = options.multiplexed,
-    });
-    defer allocator.free(req);
-    call_id.* += 1;
-
-    try writeAll(writer, req);
-
-    const resp_body = try readPacket(allocator, options.idle, reader);
-    defer allocator.free(resp_body);
-
-    return rpc.parseBindResponse(resp_body);
-}
 
 pub const SendResult = struct {
     /// Raw KMS response bytes (allocator-allocated).
@@ -458,44 +477,91 @@ pub const SendResult = struct {
     status: i32,
 };
 
-/// Send a raw KMS request and return the raw KMS response.
-pub fn clientSendRequest(
+/// One client connection: the byte streams, the requested transfer syntax and
+/// the CallId sequence. Keeping them together also makes the CallId increment
+/// impossible to forget at a call site.
+///
+/// The reader and the writer are borrowed, so a session must live in a stable
+/// location (a `var` in the caller's frame) and is never copied after `init`.
+pub const ClientSession = struct {
     allocator: Allocator,
-    reader: *Io.Reader,
+    packet_reader: PacketReader,
     writer: *Io.Writer,
-    call_id: *u32,
-    kms_request: []const u8,
-    use_ndr64: bool,
-    idle: ReadOptions,
-) !SendResult {
-    const req = try rpc.wrapKmsRequest(allocator, kms_request, use_ndr64, call_id.*);
-    defer allocator.free(req);
-    call_id.* += 1;
+    /// Next DCE/RPC CallId; BIND and ALTER-CONTEXT consume one each.
+    call_id: u32 = 2,
+    /// Transfer syntax the next request is wrapped in. Callers narrow it from
+    /// the BIND answer (the reference client sends its first request as NDR32).
+    use_ndr64: bool = true,
+    /// Requested in BIND; an ALTER-CONTEXT always asks for NDR32 only.
+    use_btfn: bool = false,
+    multiplexed: bool = false,
 
-    try writeAll(writer, req);
+    /// Perform the BIND handshake and return what the server negotiated.
+    pub fn bind(self: *ClientSession) !rpc.BindResult {
+        const req = try rpc.buildBindRequest(self.allocator, rpc.packet_type.bind_req, self.call_id, .{
+            .use_ndr64 = self.use_ndr64,
+            .use_btfn = self.use_btfn,
+            .multiplexed = self.multiplexed,
+        });
+        defer self.allocator.free(req);
+        const resp_body = try self.transact(req);
+        defer self.allocator.free(resp_body);
+        return rpc.parseBindResponse(resp_body);
+    }
 
-    const resp_body = try readPacket(allocator, idle, reader);
-    defer allocator.free(resp_body);
+    /// Bind the presentation context the BIND left out. The reference client
+    /// (`rpcBindClient`) always wants NDR32 for its first request and adds it
+    /// with an ALTER-CONTEXT when the server NACKed it — which a server does
+    /// whenever NDR64 is available (Microsoft behavior), so this is also the
+    /// sequence the Windows KMS client sends.
+    pub fn alterContext(self: *ClientSession) !rpc.BindResult {
+        // `buildBindRequest` attaches the NDR64/BTFN contexts to a BIND only, so
+        // the request carries the single NDR32 item, as context id 0.
+        const req = try rpc.buildBindRequest(self.allocator, rpc.packet_type.alter_context_req, self.call_id, .{
+            .use_ndr64 = false,
+            .use_btfn = false,
+            .multiplexed = self.multiplexed,
+        });
+        defer self.allocator.free(req);
+        const resp_body = try self.transact(req);
+        defer self.allocator.free(resp_body);
+        return rpc.parseBindResponse(resp_body);
+    }
 
-    const parsed = rpc.parseKmsResponse(resp_body, use_ndr64);
-    return .{
-        .data = try allocator.dupe(u8, parsed.data),
-        .status = parsed.status,
-    };
-}
+    /// Send a raw KMS request and return the raw KMS response.
+    pub fn sendRequest(self: *ClientSession, kms_request: []const u8) !SendResult {
+        const req = try rpc.wrapKmsRequest(self.allocator, kms_request, self.use_ndr64, self.call_id);
+        defer self.allocator.free(req);
+        const resp_body = try self.transact(req);
+        defer self.allocator.free(resp_body);
 
-/// Read one RPC packet (header + body) and return its body bytes.
-fn readPacket(allocator: Allocator, idle: ReadOptions, reader: *Io.Reader) ![]u8 {
-    var header: rpc.RpcHeader = undefined;
-    try readAll(idle, reader, std.mem.asBytes(&header));
+        const parsed = rpc.parseKmsResponse(resp_body, self.use_ndr64);
+        return .{
+            .data = try self.allocator.dupe(u8, parsed.data),
+            .status = parsed.status,
+        };
+    }
 
-    const frag_len: usize = header.frag_length;
-    if (frag_len < rpc.header_size) return error.InvalidPacket;
-    const body = try allocator.alloc(u8, frag_len - rpc.header_size);
-    errdefer allocator.free(body);
-    try readAll(idle, reader, body);
-    return body;
-}
+    /// Send one packet and return the reply body (allocator-owned).
+    fn transact(self: *ClientSession, request: []const u8) ![]u8 {
+        self.call_id += 1;
+        try writeAndFlush(self.writer, request);
+        return self.readPacket();
+    }
+
+    /// Read one RPC packet (header + body) and return its body bytes.
+    fn readPacket(self: *ClientSession) ![]u8 {
+        var header: rpc.RpcHeader = undefined;
+        try self.packet_reader.read(std.mem.asBytes(&header));
+
+        const frag_len: usize = header.frag_length;
+        if (frag_len < rpc.header_size) return error.InvalidPacket;
+        const body = try self.allocator.alloc(u8, frag_len - rpc.header_size);
+        errdefer self.allocator.free(body);
+        try self.packet_reader.read(body);
+        return body;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Socket glue
@@ -780,7 +846,7 @@ fn fixedNowUnix(context: ?*anyopaque) i64 {
     return test_now_unix;
 }
 
-const fixed_clock: Clock = .{ .nowUnix = fixedNowUnix };
+const fixed_clock: Clock = .{ .now_unix = fixedNowUnix };
 
 fn makeBase(data: *const kmsdata.KmsData) kms.Request {
     var base: kms.Request = std.mem.zeroes(kms.Request);
@@ -960,11 +1026,12 @@ test "serveRpc end-to-end (bind + v6 request)" {
     defer alloc.free(input);
 
     var reader = Io.Reader.fixed(input);
+    var packet_reader: PacketReader = .init(.{}, &reader, &.{});
     var output_buf: [4096]u8 align(4) = undefined;
     var writer = Io.Writer.fixed(&output_buf);
 
     // The stream ends after the request: `serveRpc` reports the peer close.
-    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, rng, .{ .cfg = &cfg, .clock = fixed_clock });
+    const end: ServeEnd = try serveRpc(.{ .allocator = alloc, .packet_reader = &packet_reader, .writer = &writer, .rng = rng }, .{ .cfg = &cfg, .clock = fixed_clock });
     try std.testing.expectEqual(ServeEnd.peer_closed, end);
 
     const output = writer.buffered();
@@ -1004,10 +1071,16 @@ test "ALTER-CONTEXT response carries no secondary address" {
     defer alloc.free(alter_req);
 
     var reader = Io.Reader.fixed(alter_req);
+    var packet_reader: PacketReader = .init(.{}, &reader, &.{});
     var output_buf: [4096]u8 align(4) = undefined;
     var writer = Io.Writer.fixed(&output_buf);
 
-    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, prng.random(), .{
+    const end: ServeEnd = try serveRpc(.{
+        .allocator = alloc,
+        .packet_reader = &packet_reader,
+        .writer = &writer,
+        .rng = prng.random(),
+    }, .{
         .cfg = &cfg,
         .clock = fixed_clock,
         .secondary_address = "1688",
@@ -1083,10 +1156,11 @@ test "disconnect-per-request ends the loop after the response" {
     defer alloc.free(input);
 
     var reader = Io.Reader.fixed(input);
+    var packet_reader: PacketReader = .init(.{}, &reader, &.{});
     var output_buf: [8192]u8 align(4) = undefined;
     var writer = Io.Writer.fixed(&output_buf);
 
-    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, rng, .{
+    const end: ServeEnd = try serveRpc(.{ .allocator = alloc, .packet_reader = &packet_reader, .writer = &writer, .rng = rng }, .{
         .cfg = &cfg,
         .clock = fixed_clock,
         .disconnect_per_request = true,
@@ -1140,6 +1214,7 @@ test "the request clock is sampled per request, not per connection" {
     defer alloc.free(input);
 
     var reader = Io.Reader.fixed(input);
+    var packet_reader: PacketReader = .init(.{}, &reader, &.{});
     var output_buf: [8192]u8 align(4) = undefined;
     var writer = Io.Writer.fixed(&output_buf);
 
@@ -1168,11 +1243,10 @@ test "the request clock is sampled per request, not per connection" {
     };
     var sink: Sink = .{};
 
-    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, rng, .{
+    const end: ServeEnd = try serveRpc(.{ .allocator = alloc, .packet_reader = &packet_reader, .writer = &writer, .rng = rng }, .{
         .cfg = &cfg,
-        .clock = .{ .context = &sink, .nowUnix = Sink.now },
-        .on_event = Sink.onEvent,
-        .event_context = &sink,
+        .clock = .{ .context = &sink, .now_unix = Sink.now },
+        .events = .{ .context = &sink, .callback = Sink.onEvent },
     });
     try std.testing.expectEqual(ServeEnd.peer_closed, end);
 
@@ -1211,10 +1285,11 @@ test "ALTER-CONTEXT lets an NDR32 request follow a NDR64-only BIND" {
     defer alloc.free(input);
 
     var reader = Io.Reader.fixed(input);
+    var packet_reader: PacketReader = .init(.{}, &reader, &.{});
     var output_buf: [8192]u8 align(4) = undefined;
     var writer = Io.Writer.fixed(&output_buf);
 
-    const end: ServeEnd = try serveRpc(alloc, &reader, &writer, rng, .{
+    const end: ServeEnd = try serveRpc(.{ .allocator = alloc, .packet_reader = &packet_reader, .writer = &writer, .rng = rng }, .{
         .cfg = &cfg,
         .clock = fixed_clock,
         .use_ndr64 = true,
@@ -1271,9 +1346,14 @@ test "client bind handshake" {
     var reader = Io.Reader.fixed(response_packet);
     var request_buf: [4096]u8 align(4) = undefined;
     var writer = Io.Writer.fixed(&request_buf);
-    var call_id: u32 = 2;
+    var session: ClientSession = .{
+        .allocator = alloc,
+        .packet_reader = .init(.{}, &reader, &.{}),
+        .writer = &writer,
+        .use_ndr64 = false,
+    };
 
-    const result = try clientBind(alloc, &reader, &writer, &call_id, .{ .use_ndr64 = false });
+    const result = try session.bind();
     try std.testing.expect(result.has_ndr32);
     try std.testing.expect(!result.has_ndr64);
 
@@ -1347,15 +1427,14 @@ fn elapsedMs(from: Io.Timestamp, io: Io) i96 {
     return @divTrunc(from.durationTo(Io.Timestamp.now(io, .awake)).nanoseconds, 1_000_000);
 }
 
-/// Test helper: park in `readAll` so the test can cancel it.
+/// Test helper: park in `PacketReader.read` so the test can cancel it.
 const ReadWaiter = struct {
-    idle: ReadOptions,
-    reader: *Io.Reader,
+    packet_reader: *PacketReader,
     buf: []u8,
     outcome: *?anyerror,
 
     fn run(self: ReadWaiter) Io.Cancelable!void {
-        readAll(self.idle, self.reader, self.buf) catch |err| {
+        self.packet_reader.read(self.buf) catch |err| {
             self.outcome.* = err;
             return;
         };
@@ -1384,10 +1463,11 @@ test "a silent peer hits the read deadline" {
     defer pair.deinit(io);
 
     var reader = emptyReader();
+    var packet_reader: PacketReader = .init(pair.readOptions(io, ms(300)), &reader, &.{});
     var buffer: [16]u8 = undefined;
 
     const started = Io.Timestamp.now(io, .awake);
-    const outcome = readAll(pair.readOptions(io, ms(300)), &reader, &buffer);
+    const outcome = packet_reader.read(&buffer);
     const dt = elapsedMs(started, io);
 
     // 300 ms is the deadline; allow scheduling slack but insist the wait ended
@@ -1410,14 +1490,14 @@ test "a cancelation request ends a parked read" {
     defer pair.deinit(io);
 
     var reader = emptyReader();
+    var packet_reader: PacketReader = .init(pair.readOptions(io, .none), &reader, &.{});
     var buffer: [16]u8 = undefined;
     var outcome: ?anyerror = null;
 
     var group: Io.Group = .init;
     defer group.cancel(io);
     try group.concurrent(io, ReadWaiter.run, .{ReadWaiter{
-        .idle = pair.readOptions(io, .none), // no deadline: wait forever
-        .reader = &reader,
+        .packet_reader = &packet_reader, // no deadline: wait forever
         .buf = &buffer,
         .outcome = &outcome,
     }});
@@ -1448,8 +1528,9 @@ test "a closed peer reads as end of stream" {
     pair.closeClient(io);
 
     var reader = emptyReader();
+    var packet_reader: PacketReader = .init(pair.readOptions(io, ms(500)), &reader, &.{});
     var buffer: [4]u8 = undefined;
-    try std.testing.expectError(error.EndOfStream, readAll(pair.readOptions(io, ms(500)), &reader, &buffer));
+    try std.testing.expectError(error.EndOfStream, packet_reader.read(&buffer));
     try std.testing.expectEqualStrings("ab", buffer[0..2]);
 }
 
@@ -1473,8 +1554,9 @@ test "a split packet arrives across refills" {
     try pair.send(io, "abc"); // first half now, second half after 100 ms
 
     var reader = emptyReader();
+    var packet_reader: PacketReader = .init(pair.readOptions(io, ms(1_000)), &reader, &.{});
     var buffer: [6]u8 = undefined;
-    try readAll(pair.readOptions(io, ms(1_000)), &reader, &buffer);
+    try packet_reader.read(&buffer);
     try std.testing.expectEqualStrings("abcdef", &buffer);
 }
 
@@ -1526,8 +1608,9 @@ test "a reset peer has no name and reads as a reset" {
     try std.testing.expect(!isLoopbackPeer(pair.accepted.socket.handle));
 
     var reader = emptyReader();
+    var packet_reader: PacketReader = .init(pair.readOptions(io, ms(1_000)), &reader, &.{});
     var packet: [8]u8 = undefined;
-    try std.testing.expectError(error.ConnectionResetByPeer, readAll(pair.readOptions(io, ms(1_000)), &reader, &packet));
+    try std.testing.expectError(error.ConnectionResetByPeer, packet_reader.read(&packet));
 }
 
 // The counterpart: a graceful close (FIN) leaves the address readable, so
@@ -1597,13 +1680,17 @@ fn serveInput(
     }
 
     var reader = emptyReader();
+    var packet_reader: PacketReader = .init(pair.readOptions(io, ms(1_000)), &reader, read_ahead);
     var writer = Io.Writer.fixed(out);
-    const end = try serveRpc(alloc, &reader, &writer, rng, .{
+    const end = try serveRpc(.{
+        .allocator = alloc,
+        .packet_reader = &packet_reader,
+        .writer = &writer,
+        .rng = rng,
+    }, .{
         .cfg = cfg,
         .clock = fixed_clock,
         .disconnect_per_request = true,
-        .idle = pair.readOptions(io, ms(1_000)),
-        .read_ahead = read_ahead,
     });
     return .{ .end = end, .responses = writer.buffered() };
 }

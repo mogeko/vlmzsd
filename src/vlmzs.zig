@@ -617,26 +617,6 @@ fn printResponseVerbose(base: *const kms.Response, hwid: ?*const [8]u8, result: 
     out.print("\n", .{});
 }
 
-/// A BIND-completed connection a request is sent over: the buffered streams
-/// (borrowed — they stay in the caller's frame), the transfer syntax the BIND
-/// reply negotiated, the CallId sequence, and the read timeout. The timeout
-/// travels with the connection because the deadline applies to the very socket
-/// the streams were opened on.
-const Conn = struct {
-    reader: *std.Io.Reader,
-    writer: *std.Io.Writer,
-    /// Negotiated syntax, which can be narrower than the requested one.
-    use_ndr64: bool,
-    /// Next DCE/RPC CallId; BIND consumed 2.
-    call_id: u32 = 2,
-    /// Applied to the BIND reply and to every RESPONSE read.
-    idle: network.ReadOptions,
-    /// The owner reconnects and resends when the peer closed the connection, so
-    /// this attempt's report is dropped instead of printing a header the retry
-    /// would print again.
-    retry_on_close: bool = false,
-};
-
 /// Transfer syntax for a request: the reference client sends the first request
 /// after BIND as NDR32 and later ones as NDR64 (`firstPacketSent` in
 /// `rpcSendRequest`) — the Windows KMS client behaves the same way. NDR64 is an
@@ -646,79 +626,70 @@ fn requestUseNdr64(bind: rpc.BindResult, first: bool, ndr64_allowed: bool) bool 
     return if (first) !bind.has_ndr32 and ndr64_ok else ndr64_ok;
 }
 
-/// Bind the presentation contexts and report what the server accepted. Mirrors
-/// the reference `rpcBindClient`: the BIND is followed by an ALTER-CONTEXT
-/// whenever NDR32 was NACKed — which a server does while NDR64 is available
-/// (Microsoft behavior), so this is also the path a Windows KMS client takes.
-/// Without it the first request would have to go out as NDR64, and a server
-/// without NDR64 could not be served at all.
-fn bindContexts(
-    gpa: Allocator,
-    reader: *Io.Reader,
-    writer: *Io.Writer,
-    call_id: *u32,
-    opts: *const ClientOptions,
-    idle: network.ReadOptions,
-) !rpc.BindResult {
-    var bind = try network.clientBind(gpa, reader, writer, call_id, .{
-        .use_ndr64 = opts.ndr64,
-        .use_btfn = opts.btfn,
-        .multiplexed = opts.multiplexed,
-        .idle = idle,
-    });
-    if (!bind.has_ndr32) {
-        const alter = try network.clientAlterContext(gpa, reader, writer, call_id, .{
-            .multiplexed = opts.multiplexed,
-            .idle = idle,
-        });
-        if (alter.has_ndr32) bind.has_ndr32 = true;
-    }
-    // The reference reports `RPC_S_NO_PROTSEQS` here; fail before sending a
-    // request that no negotiated context could carry.
-    if (!bind.has_ndr32 and !bind.has_ndr64) return error.NoTransferSyntax;
-    return bind;
-}
-
 /// One client connection that outlives a single request: the socket, its
-/// buffers, and the negotiated transfer syntax.
+/// buffers, and the negotiation outcome.
 ///
-/// `Io.Reader`/`Io.Writer` find their owning struct with `@fieldParentPtr`, so a
-/// session must never be copied after `open` — it stays in the caller's frame as
-/// a single `var`, which is also what lets `reopen` re-address `conn` after a
-/// reconnection.
+/// The packet reader holds pointers into this struct, so a session must never be
+/// copied after `open` — it stays in the caller's frame as a single `var`, which
+/// is also what lets `reopen` re-address `conn` after a reconnection.
 const Session = struct {
     io: Io,
     stream: Io.net.Stream,
-    reader: Io.net.Stream.Reader,
+    /// Fallback source for the packet reader; socket reads go through
+    /// `conn.packet_reader`, so this stays empty.
+    reader: Io.Reader,
     writer: Io.net.Stream.Writer,
-    conn: Conn,
+    conn: network.ClientSession,
     /// BIND/ALTER-CONTEXT outcome, kept so later requests can widen to NDR64.
     bind: rpc.BindResult,
+    /// Read-ahead for the packet reader: a header and its body arrive together.
     rbuf: [4096]u8,
     wbuf: [4096]u8,
+    /// The owner reconnects and resends when the peer closed the connection, so
+    /// this attempt's report is dropped instead of printing its header again.
+    retry_on_close: bool = false,
 
     /// Connect and BIND, leaving `conn` ready to carry one REQUEST.
     fn open(self: *Session, gpa: Allocator, opts: *const ClientOptions) !void {
         const io = self.io;
         self.stream = try network.connect(io, opts.host.?, opts.port, opts.address_family);
-        self.reader = self.stream.reader(io, &self.rbuf);
+        self.reader = Io.Reader.fixed("");
         self.writer = self.stream.writer(io, &self.wbuf);
         self.conn = .{
-            .reader = &self.reader.interface,
-            .writer = &self.writer.interface,
-            .use_ndr64 = false,
-            .call_id = 2,
-            .idle = .{ .peer = .{
+            .allocator = gpa,
+            .packet_reader = .init(.{ .peer = .{
                 .io = io,
                 .handle = self.stream.socket.handle,
                 .timeout = network.timeoutSeconds(opts.timeout_seconds),
-            } },
-            // A reused session reconnects when the peer closed; a one-shot
-            // connection (`--reconnect-per-request`) has nothing to retry.
-            .retry_on_close = true,
+            } }, &self.reader, &self.rbuf),
+            .writer = &self.writer.interface,
+            .call_id = 2,
+            .use_ndr64 = opts.ndr64,
+            .use_btfn = opts.btfn,
+            .multiplexed = opts.multiplexed,
         };
-        self.bind = try bindContexts(gpa, &self.reader.interface, &self.writer.interface, &self.conn.call_id, opts, self.conn.idle);
+        // A reused session reconnects when the peer closed; a one-shot
+        // connection (`--reconnect-per-request`) has nothing to retry.
+        self.retry_on_close = true;
+        self.bind = try self.bindContexts();
         self.conn.use_ndr64 = requestUseNdr64(self.bind, true, opts.ndr64);
+    }
+
+    /// BIND, plus the ALTER-CONTEXT that binds NDR32 when the server NACKed it.
+    /// Mirrors the reference `rpcBindClient`: a server NACKs NDR32 while NDR64
+    /// is available (Microsoft behavior), so this is also the path a Windows KMS
+    /// client takes. Without it the first request would have to go out as NDR64,
+    /// and a server without NDR64 could not be served at all.
+    fn bindContexts(self: *Session) !rpc.BindResult {
+        var bind = try self.conn.bind();
+        if (!bind.has_ndr32) {
+            const alter = try self.conn.alterContext();
+            if (alter.has_ndr32) bind.has_ndr32 = true;
+        }
+        // The reference reports `RPC_S_NO_PROTSEQS` here; fail before sending a
+        // request that no negotiated context could carry.
+        if (!bind.has_ndr32 and !bind.has_ndr64) return error.NoTransferSyntax;
+        return bind;
     }
 
     fn close(self: *Session) void {
@@ -755,7 +726,7 @@ fn sendRequest(
     try session.open(gpa, opts);
     defer session.close();
 
-    return sendRequestOn(gpa, &session.conn, base, rng, out, data, opts.verbose);
+    return sendRequestOn(gpa, &session, base, rng, out, data, opts.verbose);
 }
 
 /// What one activation attempt produced. A server rejection and a failed
@@ -767,10 +738,10 @@ const Outcome = enum { activated, failed };
 /// Flag a send failure the caller will retry on a fresh connection, so the
 /// attempt's staged report is dropped instead of printing a request header the
 /// retry would print again. Returns the error unchanged.
-fn markRetryableSend(conn: *const Conn, discard_report: *bool, err: anyerror) anyerror {
+fn markRetryableSend(session: *const Session, discard_report: *bool, err: anyerror) anyerror {
     switch (err) {
         error.EndOfStream, error.ConnectionResetByPeer, error.SocketUnconnected => {
-            if (conn.retry_on_close) discard_report.* = true;
+            if (session.retry_on_close) discard_report.* = true;
         },
         else => {},
     }
@@ -780,7 +751,7 @@ fn markRetryableSend(conn: *const Conn, discard_report: *bool, err: anyerror) an
 /// Send one KMS request over an already-established connection (BIND done).
 fn sendRequestOn(
     gpa: Allocator,
-    conn: *Conn,
+    session: *Session,
     base: kms.Request,
     rng: std.Random,
     out: *Output,
@@ -808,15 +779,8 @@ fn sendRequestOn(
     if (proto == 4) {
         var req: kms.RequestV4 = undefined;
         kms.createRequestV4(&req, &base);
-        const sent = network.clientSendRequest(
-            gpa,
-            conn.reader,
-            conn.writer,
-            &conn.call_id,
-            std.mem.asBytes(&req),
-            conn.use_ndr64,
-            conn.idle,
-        ) catch |err| return markRetryableSend(conn, &discard_report, err);
+        const sent = session.conn.sendRequest(std.mem.asBytes(&req)) catch |err|
+            return markRetryableSend(session, &discard_report, err);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
             printRejection(sent.status, &report);
@@ -836,15 +800,8 @@ fn sendRequestOn(
     } else {
         var req: kms.RequestV6 = undefined;
         kms.createRequestV6(&req, &base, rng);
-        const sent = network.clientSendRequest(
-            gpa,
-            conn.reader,
-            conn.writer,
-            &conn.call_id,
-            std.mem.asBytes(&req),
-            conn.use_ndr64,
-            conn.idle,
-        ) catch |err| return markRetryableSend(conn, &discard_report, err);
+        const sent = session.conn.sendRequest(std.mem.asBytes(&req)) catch |err|
+            return markRetryableSend(session, &discard_report, err);
         defer gpa.free(sent.data);
         if (sent.status != 0) {
             printRejection(sent.status, &report);
@@ -954,10 +911,10 @@ fn sendOnSession(
     out: *Output,
     data: *const kmsdata.KmsData,
 ) !Outcome {
-    return sendRequestOn(gpa, &session.conn, base, rng, out, data, opts.verbose) catch |err| switch (err) {
+    return sendRequestOn(gpa, session, base, rng, out, data, opts.verbose) catch |err| switch (err) {
         error.EndOfStream, error.ConnectionResetByPeer, error.SocketUnconnected => {
             try session.reopen(gpa, opts);
-            return sendRequestOn(gpa, &session.conn, base, rng, out, data, opts.verbose);
+            return sendRequestOn(gpa, session, base, rng, out, data, opts.verbose);
         },
         else => |e| return e,
     };
@@ -1329,17 +1286,20 @@ test "a request that fails on the wire still emits a complete line" {
     var reader: std.Io.Reader = .fixed(&no_bytes);
     var sent: [4096]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&sent);
-    var conn = Conn{
-        .reader = &reader,
+    // Only `conn` and `retry_on_close` are touched by a send, so the socket
+    // fields of the session stay undefined here.
+    var session: Session = undefined;
+    session.conn = .{
+        .allocator = alloc,
+        .packet_reader = .init(.{}, &reader, &.{}),
         .writer = &writer,
         .use_ndr64 = true,
         // No socket behind these buffers, so the timeout stays off.
-        .idle = .{},
     };
 
     try std.testing.expectError(error.EndOfStream, sendRequestOn(
         alloc,
-        &conn,
+        &session,
         base,
         prng.random(),
         &output,
@@ -1352,7 +1312,7 @@ test "a request that fails on the wire still emits a complete line" {
 
 // A peer that completes the TCP handshake and then says nothing is the failure
 // mode `--timeout` exists for: without the deadline, the client blocks in
-// `read(2)` forever. Uses the real `clientBind` against a listening socket
+// `read(2)` forever. Uses the real `ClientSession.bind` against a listening socket
 // nobody accepts from, so the timeout is exercised on the actual packet read.
 test "--timeout bounds a peer that never answers" {
     const alloc = std.testing.allocator;
@@ -1371,23 +1331,23 @@ test "--timeout bounds a peer that never answers" {
 
     var rbuf: [4096]u8 = undefined;
     var wbuf: [4096]u8 = undefined;
-    var reader = stream.reader(io, &rbuf);
+    var reader = Io.Reader.fixed("");
     var writer = stream.writer(io, &wbuf);
-    var call_id: u32 = 2;
 
     // One second is the smallest `--timeout` (seconds are the unit), so this
     // test is as fast as the option itself allows.
-    try std.testing.expectError(error.Timeout, network.clientBind(
-        alloc,
-        &reader.interface,
-        &writer.interface,
-        &call_id,
-        .{ .use_ndr64 = false, .idle = .{ .peer = .{
+    var session: network.ClientSession = .{
+        .allocator = alloc,
+        .packet_reader = .init(.{ .peer = .{
             .io = io,
             .handle = stream.socket.handle,
             .timeout = network.timeoutSeconds(1),
-        } } },
-    ));
+        } }, &reader, &rbuf),
+        .writer = &writer.interface,
+        .use_ndr64 = false,
+    };
+    try std.testing.expectError(error.Timeout, session.bind());
+    _ = &wbuf;
 }
 
 test "incomplete KMS data is rejected by the client" {
@@ -1537,17 +1497,22 @@ test "a server that closes after each request is reconnected" {
                 defer stream.close(io_);
                 var rbuf: [4096]u8 = undefined;
                 var wbuf: [4096]u8 = undefined;
-                var reader = stream.reader(io_, &rbuf);
+                var reader = Io.Reader.fixed("");
                 var writer = stream.writer(io_, &wbuf);
-                _ = network.serveRpc(alloc_, &reader.interface, &writer.interface, prng.random(), .{
+                var packet_reader: network.PacketReader = .init(.{ .peer = .{
+                    .io = io_,
+                    .handle = stream.socket.handle,
+                    .timeout = network.timeoutSeconds(5),
+                } }, &reader, &rbuf);
+                _ = network.serveRpc(.{
+                    .allocator = alloc_,
+                    .packet_reader = &packet_reader,
+                    .writer = &writer.interface,
+                    .rng = prng.random(),
+                }, .{
                     .cfg = cfg_,
-                    .clock = .{ .nowUnix = nowUnix },
+                    .clock = .{ .now_unix = nowUnix },
                     .disconnect_per_request = true,
-                    .idle = .{ .peer = .{
-                        .io = io_,
-                        .handle = stream.socket.handle,
-                        .timeout = network.timeoutSeconds(5),
-                    } },
                 }) catch {};
             }
         }

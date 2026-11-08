@@ -183,8 +183,9 @@ GUIDs (serialized bytes, i.e. the `GUID` four little-endian words + 8-byte tail)
 ### 4.2 `src/rpc.zig` + `src/network.zig` (← `rpc.c` / `rpc.h`)
 
 - `rpc.zig` is pure wire format (no sockets): RPC header, BIND negotiation, NDR wrapping, FAULT, client parsing.
-- `network.zig` is byte-stream I/O (`std.Io` replacing `sendrecv`): `serveRpc` (server loop),
-  `clientBind` / `clientAlterContext` / `clientSendRequest` (client), socket glue (`connect`/`listen`).
+- `network.zig` is byte-stream I/O (`std.Io` replacing `sendrecv`): `serveRpc` (server loop) over
+  `ServeSession` + `ServeOptions`, `ClientSession` (`bind` / `alterContext` / `sendRequest`) for the
+  client, and socket glue (`connect`/`listen`).
 - **BIND negotiation**: context item 44B / result 24B; secondary address length includes NUL, 4-byte aligned
   (`results_offset = (10 + port_size + 3) & ~3`); the local port string is written **only** into a BIND
   response — an ALTER-CONTEXT response carries no secondary address (`rpcBind` sets `SecondaryAddressLength = 0`
