@@ -102,8 +102,8 @@ const vlmzsd_opts = [_]cli_helper.Opt{
 // ---------------------------------------------------------------------------
 
 /// Resolved server configuration (post three-tier precedence merge). Pure
-/// values: the only borrowed slices are the list options, which point at
-/// `OptionBacking` and at the process's own `argv`.
+/// values: the list options point into the config arena (or at the process's
+/// own `argv`), which the owner of the arena keeps alive.
 const ServerOptions = struct {
     port: u16 = default_port,
     listen: []const []const u8 = &.{"::"},
@@ -129,19 +129,6 @@ const ServerOptions = struct {
     quiet_loopback: bool = false,
 };
 
-/// Heap storage the list options may borrow: the split of an environment value,
-/// or a copy of the CLI occurrences. `ServerOptions.listen`/`.epids` point into
-/// it, so the backing must outlive every user of the options.
-const OptionBacking = struct {
-    listen: ?[]const []const u8 = null,
-    epid: ?[]const []const u8 = null,
-
-    fn deinit(self: *OptionBacking, gpa: Allocator) void {
-        if (self.listen) |b| gpa.free(b);
-        if (self.epid) |b| gpa.free(b);
-    }
-};
-
 /// What resolution wants the operator told once the log level is known: an
 /// unrecognized `VLMZSD_LOG_LEVEL`, and the deprecated
 /// `VLMZSD_VERBOSE`/`VLMZSD_QUIET` names, reported even when a higher-priority
@@ -152,16 +139,12 @@ const ResolveReport = struct {
     legacy_quiet_present: bool = false,
 };
 
-/// The three products of resolution. `deinit` frees `backing`, which is what
-/// `options` borrows; `report` goes to whoever starts the logger.
-const Resolved = struct {
+/// What resolution produces. A plain value: the list options point into the
+/// resolver's allocator (the `Run`'s config arena), which the caller owns, so
+/// nothing here needs freeing.
+const Resolution = struct {
     options: ServerOptions = .{},
-    backing: OptionBacking = .{},
     report: ResolveReport = .{},
-
-    fn deinit(self: *Resolved, gpa: Allocator) void {
-        self.backing.deinit(gpa);
-    }
 };
 
 /// One option's value across the three tiers: built-in default < `VLMZSD_*` <
@@ -268,21 +251,19 @@ const Resolver = struct {
     /// A repeatable option: CLI occurrences win, else the environment variable
     /// split on commas, else `default`. `from_env` says which, so a rejected
     /// value can be attributed to the right spelling.
-    fn list(self: Resolver, comptime name: []const u8, backing: *?[]const []const u8, default: []const []const u8) !List {
+    fn list(self: Resolver, comptime name: []const u8, default: []const []const u8) !List {
         const cli = self.res.getAll(name);
         if (cli.len > 0) {
             // Copy the occurrences so the options never borrow the parsed
             // result: resolution can then finish, and the result be freed, while
             // the options stay valid. (The strings themselves are `argv`, which
             // outlives everything here.)
-            backing.* = try self.gpa.dupe([]const u8, cli);
-            return .{ .items = backing.*.?, .from_env = false };
+            return .{ .items = try self.gpa.dupe([]const u8, cli), .from_env = false };
         }
         const text = self.env.get(envSpelling(name)) orelse
             return .{ .items = default, .from_env = false };
-        backing.* = try splitList(self.gpa, text);
+        const items = try splitList(self.gpa, text);
         // A value with no non-empty segment leaves the default in place.
-        const items = backing.*.?;
         if (items.len == 0) return .{ .items = default, .from_env = false };
         return .{ .items = items, .from_env = true };
     }
@@ -371,23 +352,18 @@ fn splitList(gpa: Allocator, s: []const u8) ![]const []const u8 {
 }
 
 /// Resolve every option into a `ServerOptions`. The whole configuration surface
-/// is the list below: one name and one default per option. The returned
-/// `Resolved` owns the list backing, so the parsed CLI result can be freed as
-/// soon as this returns.
-fn resolveOptions(r: Resolver) !Resolved {
+/// is the list below: one name and one default per option. List options are
+/// allocated with the resolver's allocator, which the caller owns.
+fn resolveOptions(r: Resolver) !Resolution {
     // `vlmzsd` takes options only; a stray word is a mistyped flag value, not
     // something to ignore.
     if (r.res.positionals.items.len > 0) return error.UnexpectedPositional;
 
-    const gpa = r.gpa;
-    var out: Resolved = .{};
-    // The lists own memory, so every error below releases what was built.
-    errdefer out.backing.deinit(gpa);
-
+    var out: Resolution = .{};
     const opts = &out.options;
     opts.port = try r.int(u16, "port", default_port);
 
-    const listen = try r.list("listen", &out.backing.listen, &.{"::"});
+    const listen = try r.list("listen", &.{"::"});
     opts.listen = listen.items;
     // Each entry must be an IP literal: the port has its own option, so a
     // value that parses only as `address:port` is a mistake to report here
@@ -406,7 +382,7 @@ fn resolveOptions(r: Resolver) !Resolved {
     opts.max_clients = try r.int(u32, "max-clients", default_client_cap);
     opts.data_file = r.str("data", null);
 
-    const epids = try r.list("epid", &out.backing.epid, &.{});
+    const epids = try r.list("epid", &.{});
     opts.epids = epids.items;
 
     opts.randomize = try r.int(u8, "randomize", 1);
@@ -1264,12 +1240,13 @@ fn fatal(log: *cli_helper.Logger, io: Io, comptime fmt: []const u8, args: anytyp
 const Run = struct {
     init: std.process.Init,
 
-    /// Resolved configuration, owned here: `ServerContext` and every
-    /// connection borrow `opts`, so it outlives `conn_group`.
+    /// Storage for the resolved options' list values, released in `deinit` once
+    /// the connection group has joined. One owner for every allocation the
+    /// configuration needs, so no option field is freed on its own.
+    arena: std.heap.ArenaAllocator,
+    /// Resolved configuration; its list values point into `arena`. `ServerContext`
+    /// and every connection borrow it, so it outlives `conn_group`.
     opts: ServerOptions = .{},
-    /// What `opts`' list options point into; freed in `deinit` once the
-    /// connection group has joined, since connection tasks are its borrowers.
-    backing: OptionBacking = .{},
     /// Configuration notices, logged by `startLogger` once the level is known.
     report: ResolveReport = .{},
 
@@ -1303,22 +1280,17 @@ const Run = struct {
     out_buf: [io_buffer_size]u8 = undefined,
     err_buf: [io_buffer_size]u8 = undefined,
 
-    /// Take ownership of the resolved configuration. Building the value is what
-    /// transfers the list backing, so it happens before any fallible step and
-    /// `deinit` can always release it.
-    fn new(init: std.process.Init, resolved: Resolved) Run {
-        return .{
-            .init = init,
-            .opts = resolved.options,
-            .backing = resolved.backing,
-            .report = resolved.report,
-        };
+    /// Take the process services and create the arena the options live in.
+    fn new(init: std.process.Init) Run {
+        return .{ .init = init, .arena = .init(init.gpa) };
     }
 
-    /// Build the process in startup order. Configuration and environment
-    /// failures exit through `fatal` (which drains the log queue); allocation
+    /// Build the process in startup order. A configuration error exits through
+    /// `reportOptionError` before the logger exists; a later environment or data
+    /// failure exits through `fatal`, which drains the log queue. Allocation
     /// errors propagate to `main`, whose `defer deinit` releases what was built.
-    fn start(self: *Run) !void {
+    fn start(self: *Run, res: *const cli_helper.Result, diag: *cli_helper.Diag) !void {
+        self.resolveConfig(res, diag);
         try self.startLogger();
         self.loadKmsData();
         self.prepareEpids();
@@ -1333,6 +1305,21 @@ const Run = struct {
             fatal(&self.log, self.init.io, "too many listen sockets (max {d})", .{max_listen_sockets});
         }
         self.installSignals();
+    }
+
+    /// Resolve the option tiers into `opts`. A configuration error happens before
+    /// the logger exists, so it goes straight to stderr; the list values are
+    /// allocated in `arena`, which is why `opts` has no `deinit` of its own.
+    fn resolveConfig(self: *Run, res: *const cli_helper.Result, diag: *cli_helper.Diag) void {
+        const resolver: Resolver = .{
+            .gpa = self.arena.allocator(),
+            .env = self.init.environ_map,
+            .res = res,
+            .diag = diag,
+        };
+        const resolution = resolveOptions(resolver) catch |e| reportOptionError(self.init.io, diag, e);
+        self.opts = resolution.options;
+        self.report = resolution.report;
     }
 
     /// Start the logger and its writer, then apply the resolved level.
@@ -1556,7 +1543,7 @@ const Run = struct {
         }
         // The last borrow of the option lists is a connection task, and those
         // have all ended above.
-        self.backing.deinit(gpa);
+        self.arena.deinit();
 
         if (self.log_started) {
             self.log.shutdown(io);
@@ -1625,17 +1612,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const resolved = resolveOptions(.{
-        .gpa = init.gpa,
-        .env = init.environ_map,
-        .res = &res,
-        .diag = &diag,
-    }) catch |e| reportOptionError(init.io, &diag, e);
-
-    var run: Run = .new(init, resolved);
+    var run: Run = .new(init);
     defer run.deinit();
 
-    try run.start();
+    try run.start(&res, &diag);
+
     try run.serve();
 }
 
@@ -1841,12 +1822,14 @@ test "splitList returns an exactly-sized list and skips empty segments" {
     try std.testing.expectEqualStrings("::", single[0]);
 }
 
-/// Parse `args` and resolve them against a private environment map, keeping the
-/// parsed result alive for the fixture's lifetime: the option strings may point
-/// into it.
+/// Parse `args` and resolve them against a private environment map and arena,
+/// keeping the parsed result alive for the fixture's lifetime: the option strings
+/// may point into it.
 const ConfigFixture = struct {
     gpa: Allocator,
     env: EnvironMap,
+    /// Where `resolve` allocates the list options, as `Run` does.
+    arena: std.heap.ArenaAllocator,
     res: cli_helper.Result,
     diag: cli_helper.Diag = .{},
 
@@ -1854,6 +1837,7 @@ const ConfigFixture = struct {
         return .{
             .gpa = gpa,
             .env = .init(gpa),
+            .arena = .init(gpa),
             .res = try cli_helper.parse(gpa, &vlmzsd_opts, &.{}),
         };
     }
@@ -1861,6 +1845,7 @@ const ConfigFixture = struct {
     fn deinit(self: *ConfigFixture) void {
         self.res.deinit();
         self.env.deinit();
+        self.arena.deinit();
     }
 
     fn setEnv(self: *ConfigFixture, name: []const u8, value: []const u8) !void {
@@ -1876,11 +1861,11 @@ const ConfigFixture = struct {
     }
 
     fn resolver(self: *ConfigFixture) Resolver {
-        return .{ .gpa = self.gpa, .env = &self.env, .res = &self.res, .diag = &self.diag };
+        return .{ .gpa = self.arena.allocator(), .env = &self.env, .res = &self.res, .diag = &self.diag };
     }
 
-    /// Parse and resolve in one step; the caller frees the result.
-    fn resolve(self: *ConfigFixture, args: []const []const u8) !Resolved {
+    /// Parse and resolve in one step; the fixture frees the storage.
+    fn resolve(self: *ConfigFixture, args: []const []const u8) !Resolution {
         return resolveOptions(try self.parse(args));
     }
 };
@@ -1892,8 +1877,7 @@ test "resolveOptions: env lists, numeric limits, and positional arguments" {
     // A list with no address leaves the default in place.
     try fx.setEnv("VLMZSD_LISTEN", " , ");
     {
-        var resolved = try fx.resolve(&.{});
-        defer resolved.deinit(fx.gpa);
+        const resolved = try fx.resolve(&.{});
         try std.testing.expectEqual(@as(usize, 1), resolved.options.listen.len);
         try std.testing.expectEqualStrings("::", resolved.options.listen[0]);
     }
@@ -1901,8 +1885,7 @@ test "resolveOptions: env lists, numeric limits, and positional arguments" {
     // Gaps and padding are trimmed away, and the result owns its allocation.
     try fx.setEnv("VLMZSD_LISTEN", "127.0.0.1,, ::1");
     {
-        var resolved = try fx.resolve(&.{});
-        defer resolved.deinit(fx.gpa);
+        const resolved = try fx.resolve(&.{});
         try std.testing.expectEqual(@as(usize, 2), resolved.options.listen.len);
         try std.testing.expectEqualStrings("127.0.0.1", resolved.options.listen[0]);
         try std.testing.expectEqualStrings("::1", resolved.options.listen[1]);
@@ -1911,13 +1894,12 @@ test "resolveOptions: env lists, numeric limits, and positional arguments" {
 
     // The documented limits are accepted ...
     {
-        var resolved = try fx.resolve(&.{
+        const resolved = try fx.resolve(&.{
             "--lcid",                "32767",
             "--build",               "65535",
             "--timeout",             "4294967295s",
             "--activation-interval", "4294967295m",
         });
-        defer resolved.deinit(fx.gpa);
         const opts = resolved.options;
         try std.testing.expectEqual(kms.max_lcid, opts.lcid);
         try std.testing.expectEqual(kms.max_build, opts.build);
@@ -1948,8 +1930,7 @@ test "CLI list occurrences are copied, not borrowed from the parsed result" {
     // slice would dangle; the resolver copies the occurrences instead.
     const resolver = try fx.parse(&.{ "--listen", "127.0.0.1", "--listen", "::1" });
     const parsed_ptr = resolver.res.getAll("listen").ptr;
-    var resolved = try resolveOptions(resolver);
-    defer resolved.deinit(fx.gpa);
+    const resolved = try resolveOptions(resolver);
     try std.testing.expectEqual(@as(usize, 2), resolved.options.listen.len);
     try std.testing.expect(resolved.options.listen.ptr != parsed_ptr);
     try std.testing.expectEqualStrings("::1", resolved.options.listen[1]);
@@ -1963,8 +1944,7 @@ test "the inverted flags read the positive environment variable" {
     // whose `false` turns the feature off.
     try fx.setEnv("VLMZSD_NDR64", "false");
     {
-        var resolved = try fx.resolve(&.{});
-        defer resolved.deinit(fx.gpa);
+        const resolved = try fx.resolve(&.{});
         try std.testing.expect(!resolved.options.ndr64);
         try std.testing.expect(resolved.options.btfn);
     }
@@ -1974,8 +1954,7 @@ test "the inverted flags read the positive environment variable" {
     // attributed to the variable, not to `--no-btfn`.
     try fx.setEnv("VLMZSD_BTFN", "0");
     {
-        var resolved = try fx.resolve(&.{"--no-ndr64"});
-        defer resolved.deinit(fx.gpa);
+        const resolved = try fx.resolve(&.{"--no-ndr64"});
         try std.testing.expect(!resolved.options.btfn);
         try std.testing.expect(!resolved.options.ndr64);
     }
@@ -2005,8 +1984,7 @@ test "--listen must be an IP literal, and a bad value names the option" {
 
     // Literals the protocol uses are accepted, including a bare IPv6 address
     // whose colons are not a port separator.
-    var resolved = try fx.resolve(&.{ "--listen", "127.0.0.1", "--listen", "::1", "--listen", "::" });
-    defer resolved.deinit(fx.gpa);
+    const resolved = try fx.resolve(&.{ "--listen", "127.0.0.1", "--listen", "::1", "--listen", "::" });
     try std.testing.expectEqual(@as(usize, 3), resolved.options.listen.len);
 }
 
@@ -2174,17 +2152,13 @@ test "--ip-protection levels select the two documented behaviours" {
     try std.testing.expect(listensOnPrivateOnly(3) and rejectsPublicPeers(3));
 }
 
-test "an --epid list that resolves to nothing keeps the default and frees its backing" {
+test "an --epid list that resolves to nothing keeps the default" {
     var fx = try ConfigFixture.init(std.testing.allocator);
     defer fx.deinit();
 
-    // The variable is set but has no segment, so a zero-length list is
-    // allocated and then found empty: the default (no overrides) wins, and the
-    // allocation is still the backing's to free — the testing allocator fails
-    // the test if it is dropped.
+    // The variable is set but has no segment, so the split yields nothing and
+    // the default (no overrides) wins.
     try fx.setEnv("VLMZSD_EPID", " , ");
-    var resolved = try fx.resolve(&.{});
-    defer resolved.deinit(fx.gpa);
+    const resolved = try fx.resolve(&.{});
     try std.testing.expectEqual(@as(usize, 0), resolved.options.epids.len);
-    try std.testing.expectEqual(@as(usize, 0), resolved.backing.epid.?.len);
 }
