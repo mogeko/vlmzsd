@@ -306,8 +306,7 @@ const Frame = struct {
 };
 
 /// State of one served connection: the borrowed resources, the caller's policy
-/// and the contexts BIND negotiated. Everything the loop does lives on this
-/// struct, so the helpers below take one or two arguments.
+/// and the contexts BIND negotiated.
 const Connection = struct {
     session: ServeSession,
     options: ServeOptions,
