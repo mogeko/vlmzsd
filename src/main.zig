@@ -13,7 +13,7 @@ const kmsdata = vlmzsd.kmsdata;
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const EnvironMap = std.process.Environ.Map;
+const Environ = std.process.Environ;
 
 const build_options = @import("build_options");
 const version = build_options.version;
@@ -158,7 +158,7 @@ const Resolution = struct {
 /// two "disable" flags invert the meaning and pass their variable explicitly.
 const Resolver = struct {
     gpa: Allocator,
-    env: *const EnvironMap,
+    env: *const Environ.Map,
     res: *const cli_helper.Result,
     diag: *cli_helper.Diag,
 
@@ -1238,7 +1238,12 @@ fn fatal(log: *cli_helper.Logger, io: Io, comptime fmt: []const u8, args: anytyp
 /// `log` keeps pointers into `out_buf`/`err_buf`, so a `Run` must not be copied
 /// after construction; `main` keeps it as a single `var`.
 const Run = struct {
-    init: std.process.Init,
+    gpa: Allocator,
+    io: Io,
+    /// The raw environment, for the FHS data-file search.
+    environ: Environ,
+    /// The same environment parsed into a map, for the option tiers.
+    environ_map: *Environ.Map,
 
     /// Storage for the resolved options' list values, released in `deinit` once
     /// the connection group has joined. One owner for every allocation the
@@ -1280,9 +1285,15 @@ const Run = struct {
     out_buf: [io_buffer_size]u8 = undefined,
     err_buf: [io_buffer_size]u8 = undefined,
 
-    /// Take the process services and create the arena the options live in.
-    fn new(init: std.process.Init) Run {
-        return .{ .init = init, .arena = .init(init.gpa) };
+    /// Borrow the process handles and create the arena the options live in.
+    fn new(gpa: Allocator, io: Io, environ: Environ, environ_map: *Environ.Map) Run {
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .environ = environ,
+            .environ_map = environ_map,
+            .arena = .init(gpa),
+        };
     }
 
     /// Build the process in startup order. A configuration error exits through
@@ -1302,7 +1313,7 @@ const Run = struct {
         // The reference checks this after the banner and the PID file, so keep
         // the startup output in the same order.
         if (self.listeners.items.len > max_listen_sockets) {
-            fatal(&self.log, self.init.io, "too many listen sockets (max {d})", .{max_listen_sockets});
+            fatal(&self.log, self.io, "too many listen sockets (max {d})", .{max_listen_sockets});
         }
         self.installSignals();
     }
@@ -1313,27 +1324,26 @@ const Run = struct {
     fn resolveConfig(self: *Run, res: *const cli_helper.Result, diag: *cli_helper.Diag) void {
         const resolver: Resolver = .{
             .gpa = self.arena.allocator(),
-            .env = self.init.environ_map,
+            .env = self.environ_map,
             .res = res,
             .diag = diag,
         };
-        const resolution = resolveOptions(resolver) catch |e| reportOptionError(self.init.io, diag, e);
+        const resolution = resolveOptions(resolver) catch |e| reportOptionError(self.io, diag, e);
         self.opts = resolution.options;
         self.report = resolution.report;
     }
 
     /// Start the logger and its writer, then apply the resolved level.
     fn startLogger(self: *Run) !void {
-        const init = self.init;
-        self.log = try cli_helper.Logger.init(init.gpa, init.io, &self.out_buf, &self.err_buf);
+        self.log = try cli_helper.Logger.init(self.gpa, self.io, &self.out_buf, &self.err_buf);
         self.log_started = true;
 
         // Start the writer before anything can log: `fatal` drains the queue on
         // the way out, and a queue with no consumer would block that drain.
-        self.log_group.concurrent(init.io, logWriterTask, .{ &self.log, &self.tally }) catch |e| {
+        self.log_group.concurrent(self.io, logWriterTask, .{ &self.log, &self.tally }) catch |e| {
             // No writer task means no consumer for the queue, so `fatal` would
             // block in `shutdown`: report without the logger and exit.
-            cli_helper.fatalStderr(init.io, "vlmzsd", "failed to start log writer task: {s}", .{@errorName(e)});
+            cli_helper.fatalStderr(self.io, "vlmzsd", "failed to start log writer task: {s}", .{@errorName(e)});
         };
 
         self.log.min_level = self.opts.log_level;
@@ -1354,26 +1364,25 @@ const Run = struct {
     /// Load the KMS data: explicit path (`--data` / `VLMZSD_DATA`) → FHS/XDG
     /// search → embedded default.
     fn loadKmsData(self: *Run) void {
-        const init = self.init;
         var loaded_from: ?[]const u8 = null; // null = embedded
         if (self.opts.data_file) |path| {
-            self.kmd_owned = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, path, init.gpa, .unlimited) catch |e| {
-                fatal(&self.log, init.io, "failed to read data file {s}: {s}", .{ path, @errorName(e) });
+            self.kmd_owned = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), self.io, path, self.gpa, .unlimited) catch |e| {
+                fatal(&self.log, self.io, "failed to read data file {s}: {s}", .{ path, @errorName(e) });
             };
             loaded_from = path;
         } else {
-            self.fhs = cli_helper.loadFhsKmd(init.io, init.gpa, init.minimal.environ) catch |e| {
-                fatal(&self.log, init.io, "failed to read FHS data file: {s}", .{@errorName(e)});
+            self.fhs = cli_helper.loadFhsKmd(self.io, self.gpa, self.environ) catch |e| {
+                fatal(&self.log, self.io, "failed to read FHS data file: {s}", .{@errorName(e)});
             };
             if (self.fhs) |*f| loaded_from = f.path;
         }
         const kmd_raw: []const u8 = if (self.kmd_owned) |raw| raw else if (self.fhs) |f| f.data else blk: {
-            if (embedded_kmd.len == 0) fatal(&self.log, init.io, "no KMS data found; specify --data <file>", .{});
+            if (embedded_kmd.len == 0) fatal(&self.log, self.io, "no KMS data found; specify --data <file>", .{});
             break :blk embedded_kmd;
         };
 
-        self.data = kmsdata.parse(init.gpa, kmd_raw) catch |e| {
-            fatal(&self.log, init.io, "invalid KMS data: {s}", .{@errorName(e)});
+        self.data = kmsdata.parse(self.gpa, kmd_raw) catch |e| {
+            fatal(&self.log, self.io, "invalid KMS data: {s}", .{@errorName(e)});
         };
         self.data_ready = true;
 
@@ -1383,21 +1392,20 @@ const Run = struct {
             self.log.debug("using embedded KMS data", .{});
         }
 
-        self.prng = .init(cli_helper.makeSeed(init.io));
+        self.prng = .init(cli_helper.makeSeed(self.io));
     }
 
     /// `--epid` overrides, level-1 pre-randomization, and the level-2 data check.
     fn prepareEpids(self: *Run) void {
-        const init = self.init;
         self.epid_overrides = buildEpidOverrides(
-            init.gpa,
+            self.gpa,
             &self.data,
             &self.opts,
             self.prng.random(),
-            cli_helper.nowUnix(init.io),
+            cli_helper.nowUnix(self.io),
             &self.log,
         ) catch |e| {
-            fatal(&self.log, init.io, "cannot initialize randomized ePIDs: {s}", .{@errorName(e)});
+            fatal(&self.log, self.io, "cannot initialize randomized ePIDs: {s}", .{@errorName(e)});
         };
         self.epid_ready = true;
 
@@ -1411,7 +1419,7 @@ const Run = struct {
                 break;
             };
             if (needs_random_pid and self.opts.build == 0 and !kms.hasHostBuildForNdr64(&self.data, self.opts.ndr64)) {
-                fatal(&self.log, init.io, "no host build matches the NDR64 setting for randomized ePIDs", .{});
+                fatal(&self.log, self.io, "no host build matches the NDR64 setting for randomized ePIDs", .{});
             }
         }
     }
@@ -1419,7 +1427,7 @@ const Run = struct {
     /// Client lists (strict mode): one per app, pre-filled unless `--start-empty`.
     fn prepareClientLists(self: *Run) !void {
         if (!self.opts.maintain_clients) return;
-        const storage = try self.init.gpa.alloc(kms.ClientList, self.data.apps().len);
+        const storage = try self.gpa.alloc(kms.ClientList, self.data.apps().len);
         self.client_lists_storage = storage;
         self.client_lists = .{ .lists = storage };
         kms.initClientLists(&self.client_lists, &self.data, self.opts.start_empty, self.prng.random());
@@ -1448,15 +1456,15 @@ const Run = struct {
     /// has said which address failed and why.
     fn openListeners(self: *Run) !void {
         const failure = try createListenSockets(.{
-            .gpa = self.init.gpa,
-            .io = self.init.io,
+            .gpa = self.gpa,
+            .io = self.io,
             .log = &self.log,
         }, &self.opts, &self.listeners);
         if (failure) |why| switch (why) {
-            .none => fatal(&self.log, self.init.io, "could not listen on any socket", .{}),
+            .none => fatal(&self.log, self.io, "could not listen on any socket", .{}),
             .address => |a| fatal(
                 &self.log,
-                self.init.io,
+                self.io,
                 "failed to listen on {s}:{d}: {s}",
                 .{ a.addr, self.opts.port, @errorName(a.err) },
             ),
@@ -1481,7 +1489,7 @@ const Run = struct {
         const path = self.opts.pid_file orelse return;
         var pid_buf: [pid_str_buffer_size]u8 = undefined;
         const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{std.c.getpid()}) catch unreachable;
-        std.Io.Dir.writeFile(std.Io.Dir.cwd(), self.init.io, .{
+        std.Io.Dir.writeFile(std.Io.Dir.cwd(), self.io, .{
             .sub_path = path,
             .data = pid_str,
         }) catch |e| self.log.warn("failed to write pid file {s}: {s}", .{ path, @errorName(e) });
@@ -1492,8 +1500,8 @@ const Run = struct {
     /// (see `deinit`).
     fn installSignals(self: *Run) void {
         installSignalHandlers() catch |e| switch (e) {
-            error.CreateShutdownPipe => fatal(&self.log, self.init.io, "failed to create shutdown pipe", .{}),
-            error.ConfigureShutdownPipe => fatal(&self.log, self.init.io, "failed to make shutdown pipe non-blocking", .{}),
+            error.CreateShutdownPipe => fatal(&self.log, self.io, "failed to create shutdown pipe", .{}),
+            error.ConfigureShutdownPipe => fatal(&self.log, self.io, "failed to make shutdown pipe non-blocking", .{}),
         };
         self.signals_installed = true;
     }
@@ -1503,8 +1511,8 @@ const Run = struct {
     /// saturated server leaves excess connections in the kernel backlog.
     fn serve(self: *Run) !void {
         var server: ServerContext = .{
-            .gpa = self.init.gpa,
-            .io = self.init.io,
+            .gpa = self.gpa,
+            .io = self.io,
             .opts = &self.opts,
             .log = &self.log,
             .cfg = &self.cfg,
@@ -1522,33 +1530,30 @@ const Run = struct {
     /// tasks log, so they finish before the log queue drains, and they borrow
     /// `opts`, whose backing is freed further down.
     fn deinit(self: *Run) void {
-        const gpa = self.init.gpa;
-        const io = self.init.io;
-
-        self.conn_group.cancel(io);
+        self.conn_group.cancel(self.io);
         if (self.signals_installed) {
-            shutdownPipeFile(.read).close(io);
-            shutdownPipeFile(.write).close(io);
+            shutdownPipeFile(.read).close(self.io);
+            shutdownPipeFile(.write).close(self.io);
         }
-        for (self.listeners.items) |*s| s.deinit(io);
-        self.listeners.deinit(gpa);
-        if (self.client_lists_storage) |storage| gpa.free(storage);
-        for (self.epid_overrides) |slot| if (slot) |s| gpa.free(s);
-        if (self.epid_ready) gpa.free(self.epid_overrides);
-        if (self.data_ready) self.data.deinit(gpa);
-        if (self.kmd_owned) |raw| gpa.free(raw);
+        for (self.listeners.items) |*s| s.deinit(self.io);
+        self.listeners.deinit(self.gpa);
+        if (self.client_lists_storage) |storage| self.gpa.free(storage);
+        for (self.epid_overrides) |slot| if (slot) |s| self.gpa.free(s);
+        if (self.epid_ready) self.gpa.free(self.epid_overrides);
+        if (self.data_ready) self.data.deinit(self.gpa);
+        if (self.kmd_owned) |raw| self.gpa.free(raw);
         if (self.fhs) |*f| {
-            gpa.free(f.path);
-            gpa.free(f.data);
+            self.gpa.free(f.path);
+            self.gpa.free(f.data);
         }
         // The last borrow of the option lists is a connection task, and those
         // have all ended above.
         self.arena.deinit();
 
         if (self.log_started) {
-            self.log.shutdown(io);
-            self.log_group.cancel(io);
-            self.log.deinit(gpa);
+            self.log.shutdown(self.io);
+            self.log_group.cancel(self.io);
+            self.log.deinit(self.gpa);
         }
     }
 };
@@ -1612,7 +1617,9 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var run: Run = .new(init);
+    const environ = init.minimal.environ;
+    const environ_map = init.environ_map;
+    var run: Run = .new(init.gpa, init.io, environ, environ_map);
     defer run.deinit();
 
     try run.start(&res, &diag);
@@ -1743,7 +1750,7 @@ test "a second shutdown signal forces an exit" {
 
 test "resolveLogLevel: CLI flags, VLMZSD_LOG_LEVEL, and invalid values" {
     const gpa = std.testing.allocator;
-    var env: EnvironMap = .init(gpa);
+    var env: Environ.Map = .init(gpa);
     defer env.deinit();
     var diag: cli_helper.Diag = .{};
 
@@ -1827,7 +1834,7 @@ test "splitList returns an exactly-sized list and skips empty segments" {
 /// may point into it.
 const ConfigFixture = struct {
     gpa: Allocator,
-    env: EnvironMap,
+    env: Environ.Map,
     /// Where `resolve` allocates the list options, as `Run` does.
     arena: std.heap.ArenaAllocator,
     res: cli_helper.Result,
@@ -2102,6 +2109,20 @@ test "an --epid entry with an empty ePID is ignored" {
 // `createListenSockets` reports failures as a value, so the listen path is
 // testable without exiting the test runner: a loopback literal binds, and a
 // host name (not an IP literal) comes back with the address and the cause.
+// `main` registers `defer run.deinit()` before `start`, so `deinit` must accept a
+// `Run` that never got past `new`: every other field is at its default, and the
+// groups and lists it releases are empty.
+test "a Run that never started can be deinited" {
+    var environ_map: Environ.Map = .init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    var run: Run = .new(std.testing.allocator, std.testing.io, .empty, &environ_map);
+    // The arena is the one resource `new` creates, so give it something to free:
+    // the testing allocator fails the test if `deinit` misses it.
+    _ = try run.arena.allocator().alloc(u8, 16);
+    run.deinit();
+}
+
 test "createListenSockets binds a literal and reports a bad one" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
