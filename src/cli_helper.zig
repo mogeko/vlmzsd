@@ -755,11 +755,11 @@ pub const FhsKmd = struct {
 /// `$HOME/.local/share/vlmzsd` → `/etc/vlmzsd` → `/var/lib/vlmzsd` →
 /// `/usr/local/share/vlmzsd` → `/usr/share/vlmzsd`); within a directory, the
 /// alphabetically greatest `*.kmd` name wins. On success the caller owns
-/// `path` and `data`. `environ` supplies `HOME`, passed in explicitly so this
-/// file needs no libc.
-pub fn loadFhsKmd(io: Io, gpa: Allocator, environ: std.process.Environ) !?FhsKmd {
+/// `path` and `data`. `environ_map` supplies `HOME`, passed in explicitly so this
+/// file needs no libc and no global state.
+pub fn loadFhsKmd(io: Io, gpa: Allocator, environ_map: *const std.process.Environ.Map) !?FhsKmd {
     // 1. User-level: $HOME/.local/share/vlmzsd
-    if (std.process.Environ.getPosix(environ, "HOME")) |home| {
+    if (environ_map.get("HOME")) |home| {
         const dir = try gpa.print("{s}/.local/share/vlmzsd", .{home});
         defer gpa.free(dir);
         if (try findLastKmd(io, gpa, dir)) |name| {

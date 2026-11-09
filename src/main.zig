@@ -13,7 +13,7 @@ const kmsdata = vlmzsd.kmsdata;
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const Environ = std.process.Environ;
+const EnvironMap = std.process.Environ.Map;
 
 const build_options = @import("build_options");
 const version = build_options.version;
@@ -158,7 +158,7 @@ const Resolution = struct {
 /// two "disable" flags invert the meaning and pass their variable explicitly.
 const Resolver = struct {
     gpa: Allocator,
-    env: *const Environ.Map,
+    env: *const EnvironMap,
     res: *const cli_helper.Result,
     diag: *cli_helper.Diag,
 
@@ -1240,10 +1240,9 @@ fn fatal(log: *cli_helper.Logger, io: Io, comptime fmt: []const u8, args: anytyp
 const Run = struct {
     gpa: Allocator,
     io: Io,
-    /// The raw environment, for the FHS data-file search.
-    environ: Environ,
-    /// The same environment parsed into a map, for the option tiers.
-    environ_map: *Environ.Map,
+    /// The process environment: the option tiers read it by name, and the FHS
+    /// data-file search reads `HOME` from it.
+    environ_map: *EnvironMap,
 
     /// Storage for the resolved options' list values, released in `deinit` once
     /// the connection group has joined. One owner for every allocation the
@@ -1286,11 +1285,10 @@ const Run = struct {
     err_buf: [io_buffer_size]u8 = undefined,
 
     /// Borrow the process handles and create the arena the options live in.
-    fn new(gpa: Allocator, io: Io, environ: Environ, environ_map: *Environ.Map) Run {
+    fn new(gpa: Allocator, io: Io, environ_map: *EnvironMap) Run {
         return .{
             .gpa = gpa,
             .io = io,
-            .environ = environ,
             .environ_map = environ_map,
             .arena = .init(gpa),
         };
@@ -1371,7 +1369,7 @@ const Run = struct {
             };
             loaded_from = path;
         } else {
-            self.fhs = cli_helper.loadFhsKmd(self.io, self.gpa, self.environ) catch |e| {
+            self.fhs = cli_helper.loadFhsKmd(self.io, self.gpa, self.environ_map) catch |e| {
                 fatal(&self.log, self.io, "failed to read FHS data file: {s}", .{@errorName(e)});
             };
             if (self.fhs) |*f| loaded_from = f.path;
@@ -1617,9 +1615,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const environ = init.minimal.environ;
-    const environ_map = init.environ_map;
-    var run: Run = .new(init.gpa, init.io, environ, environ_map);
+    var run: Run = .new(init.gpa, init.io, init.environ_map);
     defer run.deinit();
 
     try run.start(&res, &diag);
@@ -1750,7 +1746,7 @@ test "a second shutdown signal forces an exit" {
 
 test "resolveLogLevel: CLI flags, VLMZSD_LOG_LEVEL, and invalid values" {
     const gpa = std.testing.allocator;
-    var env: Environ.Map = .init(gpa);
+    var env: EnvironMap = .init(gpa);
     defer env.deinit();
     var diag: cli_helper.Diag = .{};
 
@@ -1834,7 +1830,7 @@ test "splitList returns an exactly-sized list and skips empty segments" {
 /// may point into it.
 const ConfigFixture = struct {
     gpa: Allocator,
-    env: Environ.Map,
+    env: EnvironMap,
     /// Where `resolve` allocates the list options, as `Run` does.
     arena: std.heap.ArenaAllocator,
     res: cli_helper.Result,
@@ -2106,17 +2102,14 @@ test "an --epid entry with an empty ePID is ignored" {
     );
 }
 
-// `createListenSockets` reports failures as a value, so the listen path is
-// testable without exiting the test runner: a loopback literal binds, and a
-// host name (not an IP literal) comes back with the address and the cause.
 // `main` registers `defer run.deinit()` before `start`, so `deinit` must accept a
 // `Run` that never got past `new`: every other field is at its default, and the
 // groups and lists it releases are empty.
 test "a Run that never started can be deinited" {
-    var environ_map: Environ.Map = .init(std.testing.allocator);
+    var environ_map: EnvironMap = .init(std.testing.allocator);
     defer environ_map.deinit();
 
-    var run: Run = .new(std.testing.allocator, std.testing.io, .empty, &environ_map);
+    var run: Run = .new(std.testing.allocator, std.testing.io, &environ_map);
     // The arena is the one resource `new` creates, so give it something to free:
     // the testing allocator fails the test if `deinit` misses it.
     _ = try run.arena.allocator().alloc(u8, 16);
