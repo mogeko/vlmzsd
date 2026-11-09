@@ -655,31 +655,40 @@ fn serveClientThread(ctx: *ClientContext) void {
     notePoolThread(ctx.tally, ctx.log, true);
     if (!ctx.quiet) ctx.log.debug("connection from {s} accepted", .{ctx.peer});
 
+    // `rbuf` is the packet reader's read-ahead: a header and its body usually
+    // arrive in one segment, so one read fills it and the rest of the packet is
+    // served from memory. Reads go through `.peer`; the `Io.Reader` argument is
+    // only the fallback for sources without a socket (the tests) and stays
+    // empty here.
     var rbuf: [4096]u8 = undefined;
     var wbuf: [4096]u8 = undefined;
-    var reader = ctx.stream.reader(ctx.io, &rbuf);
+    var reader = Io.Reader.fixed("");
     var writer = ctx.stream.writer(ctx.io, &wbuf);
+    // `Io.operateTimeout(.net_receive)` lets the backend own both the deadline
+    // and the cancelation point, so SIGINT/SIGTERM ends every parked read at
+    // once.
+    var packet_reader: network.PacketReader = .init(.{ .peer = .{
+        .io = ctx.io,
+        .handle = ctx.stream.socket.handle,
+        .timeout = network.timeoutSeconds(ctx.timeout_seconds),
+    } }, &reader, &rbuf);
 
-    const end: network.ServeEnd = network.serveRpc(ctx.gpa, &reader.interface, &writer.interface, ctx.prng.random(), .{
+    const end: network.ServeEnd = network.serveRpc(.{
+        .allocator = ctx.gpa,
+        .packet_reader = &packet_reader,
+        .writer = &writer.interface,
+        .rng = ctx.prng.random(),
+    }, .{
         .cfg = ctx.cfg,
         // Sampled per request, so `--check-client-time` and level-2 ePIDs follow
         // a keep-alive connection instead of measuring against the accept time.
-        .clock = .{ .context = ctx, .nowUnix = clientNowUnix },
-        .on_event = logProtocolEvent,
-        .event_context = ctx,
+        .clock = .{ .context = ctx, .now_unix = clientNowUnix },
+        .events = .{ .context = ctx, .callback = logProtocolEvent },
         .secondary_address = ctx.port_str,
         .rpc_assoc_group = ctx.rpc_assoc_group,
         .use_ndr64 = ctx.use_ndr64,
         .use_btfn = ctx.use_btfn,
         .disconnect_per_request = ctx.disconnect_per_request,
-        // Reads go through `Io.operateTimeout(.net_receive)`: the backend owns
-        // the deadline and the cancelation point, so SIGINT/SIGTERM ends every
-        // parked read at once.
-        .idle = .{ .peer = .{
-            .io = ctx.io,
-            .handle = ctx.stream.socket.handle,
-            .timeout = network.timeoutSeconds(ctx.timeout_seconds),
-        } },
     }) catch |e| switch (e) {
         error.Timeout => {
             // Nothing arrived for `--timeout` seconds (the C `SO_RCVTIMEO`).
