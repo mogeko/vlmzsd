@@ -20,25 +20,51 @@ const version = build_options.version;
 const version_display = build_options.version_display;
 const default_port: u16 = 1688;
 
+// ---------------------------------------------------------------------------
+// Defaults and constants
+// ---------------------------------------------------------------------------
+
 /// `--ip-protection` bit masks (docs/cli.md §5).
 const ip_protect_private_listen: u8 = 1; // listen only on private addresses
 const ip_protect_reject_public: u8 = 2; // reject clients with public IPs
 
+/// Level 1 (`--ip-protection 1`): listen only on the host's private addresses.
+fn listensOnPrivateOnly(level: u8) bool {
+    return level & ip_protect_private_listen != 0;
+}
+
+/// Level 2 (`--ip-protection 2`): refuse clients that arrive from a public
+/// address.
+fn rejectsPublicPeers(level: u8) bool {
+    return level & ip_protect_reject_public != 0;
+}
+
 /// Maximum listen sockets; also the width of the accept loop's armed-socket
-/// bit set, which is why its select result buffer is `max_listen_sockets + 2`.
+/// bit set.
 const max_listen_sockets = 64;
+
+/// Width of the accept loop's select result buffer: one `accept` task per
+/// listen socket, plus the shutdown reader and the admission-gate event.
+const select_slots = max_listen_sockets + 2;
+
+/// One page, the buffer size of every long-lived stream in the process: the log
+/// sinks, the serve read-ahead and write buffers, and the `--help` rendering.
+const io_buffer_size = 4096;
+
 /// Longest decimal PID string (generous upper bound).
 const pid_str_buffer_size = 16;
 
-/// Default `--max-clients` cap. Bounds the concurrent client tasks, and with
-/// them the pooled threads: `std.Io.Threaded` neither reclaims idle workers nor
-/// reports its options (see `ServerContext.in_flight`). `0` still means
-/// "unlimited" (docs/cli.md §5).
+/// Default `--max-clients` cap; `0` means unlimited (docs/cli.md §5). See
+/// `InFlight` for why the bound is the gate's and not the thread pool's.
 const default_client_cap: u32 = 1024;
 
 /// Embedded default `.kmd` data, unless built with `-Dno-embedded-data`
 /// (then `--data <file>` is required at runtime).
 const embedded_kmd: []const u8 = if (build_options.embedded_data) @embedFile("vlmcsd.kmd") else &.{};
+
+// ---------------------------------------------------------------------------
+// CLI surface
+// ---------------------------------------------------------------------------
 
 /// Data-driven option table for `vlmzsd` (docs/cli.md §5). Single source of
 /// truth: drives parsing, `--help` rendering, and validation alike. The
@@ -71,7 +97,13 @@ const vlmzsd_opts = [_]cli_helper.Opt{
     .{ .name = "quiet-loopback", .group = "Process", .desc = "Suppress debug logs for loopback (localhost) clients" },
 };
 
-/// Resolved server configuration (post three-tier precedence merge).
+// ---------------------------------------------------------------------------
+// Option resolution
+// ---------------------------------------------------------------------------
+
+/// Resolved server configuration (post three-tier precedence merge). Pure
+/// values: the only borrowed slices are the list options, which point at
+/// `OptionBacking` and at the process's own `argv`.
 const ServerOptions = struct {
     port: u16 = default_port,
     listen: []const []const u8 = &.{"::"},
@@ -94,29 +126,43 @@ const ServerOptions = struct {
     disconnect_per_request: bool = false,
     pid_file: ?[]const u8 = null,
     log_level: cli_helper.Level = .info,
-    /// Raw `VLMZSD_LOG_LEVEL` value when it is set but unrecognized, so `main`
-    /// can warn; the level then stays at the default `info`.
-    invalid_log_level: ?[]const u8 = null,
-    /// Set when the deprecated `VLMZSD_VERBOSE`/`VLMZSD_QUIET` is present in
-    /// the environment, so `main` can warn even when a higher-priority source
-    /// overrides it.
-    legacy_verbose_present: bool = false,
-    legacy_quiet_present: bool = false,
     quiet_loopback: bool = false,
+};
 
-    /// gpa-allocated backing for `listen`/`epids` (only when split from env).
-    listen_backing: ?[]const []const u8 = null,
-    epid_backing: ?[]const []const u8 = null,
+/// Heap storage the list options may borrow: the split of an environment value,
+/// or a copy of the CLI occurrences. `ServerOptions.listen`/`.epids` point into
+/// it, so the backing must outlive every user of the options.
+const OptionBacking = struct {
+    listen: ?[]const []const u8 = null,
+    epid: ?[]const []const u8 = null,
 
-    fn deinit(self: *ServerOptions, gpa: Allocator) void {
-        if (self.listen_backing) |b| gpa.free(b);
-        if (self.epid_backing) |b| gpa.free(b);
+    fn deinit(self: *OptionBacking, gpa: Allocator) void {
+        if (self.listen) |b| gpa.free(b);
+        if (self.epid) |b| gpa.free(b);
     }
 };
 
-fn envGet(env: *const EnvironMap, name: []const u8) ?[]const u8 {
-    return env.get(name);
-}
+/// What resolution wants the operator told once the log level is known: an
+/// unrecognized `VLMZSD_LOG_LEVEL`, and the deprecated
+/// `VLMZSD_VERBOSE`/`VLMZSD_QUIET` names, reported even when a higher-priority
+/// source overrides them.
+const ResolveReport = struct {
+    invalid_log_level: ?[]const u8 = null,
+    legacy_verbose_present: bool = false,
+    legacy_quiet_present: bool = false,
+};
+
+/// The three products of resolution. `deinit` frees `backing`, which is what
+/// `options` borrows; `report` goes to whoever starts the logger.
+const Resolved = struct {
+    options: ServerOptions = .{},
+    backing: OptionBacking = .{},
+    report: ResolveReport = .{},
+
+    fn deinit(self: *Resolved, gpa: Allocator) void {
+        self.backing.deinit(gpa);
+    }
+};
 
 /// One option's value across the three tiers: built-in default < `VLMZSD_*` <
 /// CLI flag. Closes over the parsed CLI, the environment map and the
@@ -148,37 +194,41 @@ const Resolver = struct {
     }
 
     /// The value as given, CLI first. `null` when neither source has it.
-    fn raw(self: Resolver, comptime name: []const u8, comptime env_name: []const u8) ?[]const u8 {
-        return self.res.get(name) orelse envGet(self.env, env_name);
+    fn raw(self: Resolver, comptime name: []const u8) ?[]const u8 {
+        return self.res.get(name) orelse self.env.get(envSpelling(name));
     }
 
-    /// Record `value` as rejected, under the spelling that supplied it.
-    fn reject(self: Resolver, comptime name: []const u8, comptime env_name: []const u8, value: []const u8) void {
-        self.diag.* = .{
-            .spelling = if (self.res.get(name) != null) flagSpelling(name) else env_name,
-            .value = value,
-        };
+    /// Record `value` as rejected under `spelling`, the source that supplied it.
+    fn reject(self: Resolver, spelling: []const u8, value: []const u8) void {
+        self.diag.* = .{ .spelling = spelling, .value = value };
+    }
+
+    /// The spelling the value of `name` came from: the flag as typed, or the
+    /// environment variable. Callers that resolve in two sources use it once
+    /// they know which one won.
+    fn spellingOf(self: Resolver, comptime name: []const u8, comptime env_name: []const u8) []const u8 {
+        return if (self.res.get(name) != null) flagSpelling(name) else env_name;
     }
 
     fn int(self: Resolver, comptime T: type, comptime name: []const u8, default: T) !T {
         const env_name = comptime envSpelling(name);
-        const text = self.raw(name, env_name) orelse return default;
+        const text = self.raw(name) orelse return default;
         return std.fmt.parseInt(T, text, 10) catch |e| {
-            self.reject(name, env_name, text);
+            self.reject(self.spellingOf(name, env_name), text);
             return e;
         };
     }
 
     fn str(self: Resolver, comptime name: []const u8, default: ?[]const u8) ?[]const u8 {
-        return self.raw(name, envSpelling(name)) orelse default;
+        return self.raw(name) orelse default;
     }
 
     /// A duration in whole minutes (the KMS protocol's native unit).
     fn minutes(self: Resolver, comptime name: []const u8, default: []const u8) !u32 {
         const env_name = comptime envSpelling(name);
-        const text = self.raw(name, env_name) orelse default;
+        const text = self.raw(name) orelse default;
         const total = cli_helper.parseDurationSeconds(text) catch |e| {
-            self.reject(name, env_name, text);
+            self.reject(self.spellingOf(name, env_name), text);
             return e;
         };
         return std.math.cast(u32, total / 60) orelse error.IntervalOutOfRange;
@@ -187,9 +237,9 @@ const Resolver = struct {
     /// A duration in whole seconds (`--timeout`).
     fn seconds(self: Resolver, comptime name: []const u8, default: []const u8) !u32 {
         const env_name = comptime envSpelling(name);
-        const text = self.raw(name, env_name) orelse default;
+        const text = self.raw(name) orelse default;
         const total = cli_helper.parseDurationSeconds(text) catch |e| {
-            self.reject(name, env_name, text);
+            self.reject(self.spellingOf(name, env_name), text);
             return e;
         };
         return std.math.cast(u32, total) orelse error.TimeoutOutOfRange;
@@ -208,9 +258,9 @@ const Resolver = struct {
 
     fn flagValue(self: Resolver, comptime name: []const u8, comptime env_name: []const u8, default: bool) !bool {
         if (self.res.hasFlag(name)) return !default;
-        const text = envGet(self.env, env_name) orelse return default;
+        const text = self.env.get(env_name) orelse return default;
         return cli_helper.parseBool(text) catch |e| {
-            self.diag.* = .{ .spelling = env_name, .value = text };
+            self.reject(env_name, text);
             return e;
         };
     }
@@ -220,8 +270,15 @@ const Resolver = struct {
     /// value can be attributed to the right spelling.
     fn list(self: Resolver, comptime name: []const u8, backing: *?[]const []const u8, default: []const []const u8) !List {
         const cli = self.res.getAll(name);
-        if (cli.len > 0) return .{ .items = cli, .from_env = false };
-        const text = envGet(self.env, envSpelling(name)) orelse
+        if (cli.len > 0) {
+            // Copy the occurrences so the options never borrow the parsed
+            // result: resolution can then finish, and the result be freed, while
+            // the options stay valid. (The strings themselves are `argv`, which
+            // outlives everything here.)
+            backing.* = try self.gpa.dupe([]const u8, cli);
+            return .{ .items = backing.*.?, .from_env = false };
+        }
+        const text = self.env.get(envSpelling(name)) orelse
             return .{ .items = default, .from_env = false };
         backing.* = try splitList(self.gpa, text);
         // A value with no non-empty segment leaves the default in place.
@@ -244,43 +301,50 @@ const log_level_env = "VLMZSD_LOG_LEVEL";
 const deprecated_verbose_env = "VLMZSD_VERBOSE";
 const deprecated_quiet_env = "VLMZSD_QUIET";
 
+/// The resolved level plus the notices that resolution produced.
+const LogSetting = struct {
+    level: cli_helper.Level,
+    report: ResolveReport = .{},
+};
+
 /// The log level across the three-tier sources. Repeatable `-v`/`-q` are the
 /// CLI surface; `VLMZSD_LOG_LEVEL` replaces the deprecated
 /// `VLMZSD_VERBOSE`/`VLMZSD_QUIET`, which remain as a lower-priority fallback.
 /// Any `-q` wins over `-v`: `-q` → warn, `-qq`+ → err; `-v` → debug, `-vv`+ →
 /// trace.
 ///
-/// An unrecognized `VLMZSD_LOG_LEVEL` is not fatal: it is recorded on `opts` for
-/// `main` to warn about, and the level stays `info`. The value is validated even
+/// An unrecognized `VLMZSD_LOG_LEVEL` is not fatal: it is reported back for the
+/// logger to warn about, and the level stays `info`. The value is validated even
 /// when the CLI overrides it, so a typo is never silent. The deprecated
-/// variables' presence is recorded the same way, so `main` can warn about them
-/// too.
-fn resolveLogLevel(r: Resolver, opts: *ServerOptions) !cli_helper.Level {
-    opts.legacy_verbose_present = envGet(r.env, deprecated_verbose_env) != null;
-    opts.legacy_quiet_present = envGet(r.env, deprecated_quiet_env) != null;
+/// variables' presence is reported the same way.
+fn resolveLogLevel(r: Resolver) !LogSetting {
+    var report: ResolveReport = .{
+        .legacy_verbose_present = r.env.get(deprecated_verbose_env) != null,
+        .legacy_quiet_present = r.env.get(deprecated_quiet_env) != null,
+    };
 
     var env_level: ?cli_helper.Level = null;
-    if (envGet(r.env, log_level_env)) |s| {
+    if (r.env.get(log_level_env)) |s| {
         env_level = cli_helper.parseLevel(s) catch blk: {
-            opts.invalid_log_level = s;
+            report.invalid_log_level = s;
             break :blk null;
         };
     }
 
     const quiet_count = r.res.flagCount("quiet");
-    if (quiet_count > 0) return if (quiet_count == 1) .warn else .err;
+    if (quiet_count > 0) return .{ .level = if (quiet_count == 1) .warn else .err, .report = report };
     const verbose_count = r.res.flagCount("verbose");
-    if (verbose_count > 0) return if (verbose_count == 1) .debug else .trace;
+    if (verbose_count > 0) return .{ .level = if (verbose_count == 1) .debug else .trace, .report = report };
 
-    if (env_level) |level| return level;
-    if (opts.invalid_log_level != null) return .info;
+    if (env_level) |level| return .{ .level = level, .report = report };
+    if (report.invalid_log_level != null) return .{ .level = .info, .report = report };
 
     // Deprecated variables keep their historical quiet-beats-verbose rule.
-    const quiet = if (envGet(r.env, deprecated_quiet_env)) |s| try cli_helper.parseBool(s) else false;
-    if (quiet) return .warn;
-    const verbose = if (envGet(r.env, deprecated_verbose_env)) |s| try cli_helper.parseBool(s) else false;
-    if (verbose) return .debug;
-    return .info;
+    const quiet = if (r.env.get(deprecated_quiet_env)) |s| try cli_helper.parseBool(s) else false;
+    if (quiet) return .{ .level = .warn, .report = report };
+    const verbose = if (r.env.get(deprecated_verbose_env)) |s| try cli_helper.parseBool(s) else false;
+    if (verbose) return .{ .level = .debug, .report = report };
+    return .{ .level = .info, .report = report };
 }
 
 /// Split a comma-separated env-var value into a trimmed list. The returned
@@ -307,33 +371,33 @@ fn splitList(gpa: Allocator, s: []const u8) ![]const []const u8 {
 }
 
 /// Resolve every option into a `ServerOptions`. The whole configuration surface
-/// is the list below: one name and one default per option.
-fn resolveOptions(r: Resolver) !ServerOptions {
+/// is the list below: one name and one default per option. The returned
+/// `Resolved` owns the list backing, so the parsed CLI result can be freed as
+/// soon as this returns.
+fn resolveOptions(r: Resolver) !Resolved {
     // `vlmzsd` takes options only; a stray word is a mistyped flag value, not
     // something to ignore.
     if (r.res.positionals.items.len > 0) return error.UnexpectedPositional;
 
     const gpa = r.gpa;
-    var opts = ServerOptions{};
-    // The env-var lists own memory, so every error below releases them.
-    errdefer opts.deinit(gpa);
+    var out: Resolved = .{};
+    // The lists own memory, so every error below releases what was built.
+    errdefer out.backing.deinit(gpa);
 
+    const opts = &out.options;
     opts.port = try r.int(u16, "port", default_port);
 
-    const listen = try r.list("listen", &opts.listen_backing, &.{"::"});
+    const listen = try r.list("listen", &out.backing.listen, &.{"::"});
     opts.listen = listen.items;
     // Each entry must be an IP literal: the port has its own option, so a
     // value that parses only as `address:port` is a mistake to report here
     // rather than at bind time.
     for (opts.listen) |addr| {
         _ = Io.net.IpAddress.parse(addr, opts.port) catch {
-            r.diag.* = .{
-                .spelling = if (listen.from_env)
-                    Resolver.envSpelling("listen")
-                else
-                    Resolver.flagSpelling("listen"),
-                .value = addr,
-            };
+            r.reject(if (listen.from_env)
+                Resolver.envSpelling("listen")
+            else
+                Resolver.flagSpelling("listen"), addr);
             return error.InvalidListenAddress;
         };
     }
@@ -342,7 +406,7 @@ fn resolveOptions(r: Resolver) !ServerOptions {
     opts.max_clients = try r.int(u32, "max-clients", default_client_cap);
     opts.data_file = r.str("data", null);
 
-    const epids = try r.list("epid", &opts.epid_backing, &.{});
+    const epids = try r.list("epid", &out.backing.epid, &.{});
     opts.epids = epids.items;
 
     opts.randomize = try r.int(u8, "randomize", 1);
@@ -367,11 +431,17 @@ fn resolveOptions(r: Resolver) !ServerOptions {
     opts.disconnect_per_request = try r.enabled("disconnect-per-request");
 
     opts.pid_file = r.str("pid-file", null);
-    opts.log_level = try resolveLogLevel(r, &opts);
+    const log = try resolveLogLevel(r);
+    opts.log_level = log.level;
+    out.report = log.report;
     opts.quiet_loopback = try r.enabled("quiet-loopback");
 
-    return opts;
+    return out;
 }
+
+// ---------------------------------------------------------------------------
+// ePID overrides
+// ---------------------------------------------------------------------------
 
 /// Find a CSVLC index by its human-readable name (used by `--epid name=epid`).
 fn findCsvlkByName(data: *const kmsdata.KmsData, name: []const u8) ?usize {
@@ -447,11 +517,21 @@ fn buildEpidOverrides(
     return overrides;
 }
 
+// ---------------------------------------------------------------------------
+// Admission and connections
+// ---------------------------------------------------------------------------
+
 /// Admission gate for concurrent client tasks, rather than a blocking
 /// `Io.Semaphore` wait: `Io.Semaphore` offers no non-blocking query, so the
 /// accept loop could not ask "is there room?" *before* arming an accept, and
 /// would sit in `waitUncancelable` (not a cancelation point) after every extra
 /// `accept`.
+///
+/// The bound has to be ours: `std.Io.Threaded` spawns a worker per task when
+/// none is idle and never reclaims one, and its `Init` does not expose the
+/// thread count, so the pool cannot express `--max-clients`. Holding the cap
+/// here also means live threads stay at one per client served, plus the fixed
+/// set of long-lived tasks.
 ///
 /// Invariant: the accept loop is the sole acquirer, which is what lets `peak`
 /// be a plain counter. A second acceptor would also need a CAS loop for it (and
@@ -507,10 +587,9 @@ const ClientContext = struct {
     /// because `--port 0` gives every listen socket its own port.
     port_str: []const u8,
     port_buf: [6]u8 = undefined,
-    use_ndr64: bool,
-    use_btfn: bool,
-    disconnect_per_request: bool,
-    timeout_seconds: u32,
+    /// The resolved options, borrowed from `ServerContext` (which borrows them
+    /// from the `Run`): a connection ends before either goes away.
+    opts: *const ServerOptions,
     /// Association group id echoed in this connection's BIND/ALTER-CONTEXT
     /// responses (non-zero, one per connection — C `RpcAssocGroup++`).
     rpc_assoc_group: u32,
@@ -521,9 +600,7 @@ const ClientContext = struct {
     /// protocol event can name the connection it belongs to.
     peer_buf: [64]u8 = undefined,
     peer: []const u8 = "",
-    /// Mirror of `ServerOptions.quiet_loopback` (the opt-in).
-    quiet_loopback: bool = false,
-    /// Computed per connection: `quiet_loopback` AND the peer is loopback.
+    /// Computed per connection: `--quiet-loopback` AND the peer is loopback.
     quiet: bool = false,
 };
 
@@ -561,70 +638,6 @@ fn logClosed(ctx: *ClientContext, comptime cause: []const u8, args: anytype) voi
     ctx.log.debug("connection from {s} closed " ++ cause, .{ctx.peer} ++ args);
 }
 
-/// The log writer's task. It is counted but not announced: it starts before the
-/// resolved log level is applied, so its own start line would be filtered out at
-/// `-v` (or, worse, appear at random depending on the schedule), and `main`
-/// announces the role once the level is known instead.
-fn logWriterTask(log: *cli_helper.Logger, tally: *ThreadTally) void {
-    stated_pool_thread = true;
-    _ = tally.total.fetchAdd(1, .monotonic);
-    cli_helper.Logger.writerLoop(log);
-}
-
-/// Which server tasks have already announced the calling thread. Every pool
-/// thread runs at least one of them, so counting first uses per thread counts
-/// the pool exactly, with no registry to keep and no lock on the path.
-threadlocal var stated_pool_thread = false;
-threadlocal var stated_client_thread = false;
-
-/// The pool's threads, as this process has observed them. `std.Io.Threaded`
-/// spawns a worker when a task is dispatched and none is idle, and never
-/// reclaims one, so a thread's first task is its only lifecycle event: it is
-/// created on demand and lives until the process exits. Counting first uses
-/// therefore yields the process's thread count after adding the main thread —
-/// no estimate, and no gap for the threads that only ever ran an `accept`, the
-/// shutdown read, or the log writer.
-const ThreadTally = struct {
-    /// Every pool thread that has run a server task.
-    total: std.atomic.Value(u32) = .init(0),
-    /// The subset that has served a client, which is what scales with load.
-    clients: std.atomic.Value(u32) = .init(0),
-};
-
-/// Report the calling thread when it runs a server task: once when the thread
-/// itself is first seen, and once more when it first serves a client. Both are
-/// needed — a thread usually starts out on an `accept` and is then handed the
-/// connection it accepted. Each event has exactly one wording, so `serving
-/// clients` lines count client worker threads and `started` lines count the
-/// pool's non-client threads. When a thread debuts on a connection the second
-/// line carries both facts and the first one is skipped.
-///
-/// The id is the OS thread id — `gettid` on Linux, so it matches `ps -L` and
-/// `/proc/<pid>/task/<tid>`, and `pthread_threadid_np` on macOS, the id
-/// `sample`/`spindump` and crash reports show.
-fn notePoolThread(tally: *ThreadTally, log: *cli_helper.Logger, comptime serving_client: bool) void {
-    const new_thread = !stated_pool_thread;
-    const new_client = serving_client and !stated_client_thread;
-    if (!new_thread and !new_client) return;
-
-    const thread_id = std.Thread.getCurrentId();
-    if (new_thread) {
-        stated_pool_thread = true;
-        _ = tally.total.fetchAdd(1, .monotonic);
-    }
-    const threads = tally.total.load(.monotonic);
-    if (!new_client) {
-        log.debug("pool worker {d} started (pool threads: {d})", .{ thread_id, threads });
-        return;
-    }
-    stated_client_thread = true;
-    const clients = tally.clients.fetchAdd(1, .monotonic) + 1;
-    log.debug(
-        "pool worker {d} serving clients (client workers: {d}, pool threads: {d})",
-        .{ thread_id, clients, threads },
-    );
-}
-
 /// Wall clock for one connection's requests: `serveRpc` calls this before
 /// dispatching each REQUEST, so the timestamp checks see the current time.
 fn clientNowUnix(context: ?*anyopaque) i64 {
@@ -648,11 +661,11 @@ fn serveClientThread(ctx: *ClientContext) void {
 
     // Only when --quiet-loopback is on, and only for loopback peers (the
     // container HEALTHCHECK): suppress debug chatter; warn/err still logs.
-    ctx.quiet = ctx.quiet_loopback and network.isLoopbackPeer(ctx.stream.socket.handle);
+    ctx.quiet = ctx.opts.quiet_loopback and network.isLoopbackPeer(ctx.stream.socket.handle);
     ctx.peer = network.formatPeer(ctx.stream.socket.handle, &ctx.peer_buf);
     // Before the connection line, and regardless of `quiet`: this reports the
     // thread, not the connection.
-    notePoolThread(ctx.tally, ctx.log, true);
+    notePoolThread(ctx.tally, ctx.log, .client);
     if (!ctx.quiet) ctx.log.debug("connection from {s} accepted", .{ctx.peer});
 
     // `rbuf` is the packet reader's read-ahead: a header and its body usually
@@ -660,8 +673,8 @@ fn serveClientThread(ctx: *ClientContext) void {
     // served from memory. Reads go through `.peer`; the `Io.Reader` argument is
     // only the fallback for sources without a socket (the tests) and stays
     // empty here.
-    var rbuf: [4096]u8 = undefined;
-    var wbuf: [4096]u8 = undefined;
+    var rbuf: [io_buffer_size]u8 = undefined;
+    var wbuf: [io_buffer_size]u8 = undefined;
     var reader = Io.Reader.fixed("");
     var writer = ctx.stream.writer(ctx.io, &wbuf);
     // `Io.operateTimeout(.net_receive)` lets the backend own both the deadline
@@ -670,7 +683,7 @@ fn serveClientThread(ctx: *ClientContext) void {
     var packet_reader: network.PacketReader = .init(.{ .peer = .{
         .io = ctx.io,
         .handle = ctx.stream.socket.handle,
-        .timeout = network.timeoutSeconds(ctx.timeout_seconds),
+        .timeout = network.timeoutSeconds(ctx.opts.timeout_seconds),
     } }, &reader, &rbuf);
 
     const end: network.ServeEnd = network.serveRpc(.{
@@ -686,15 +699,15 @@ fn serveClientThread(ctx: *ClientContext) void {
         .events = .{ .context = ctx, .callback = logProtocolEvent },
         .secondary_address = ctx.port_str,
         .rpc_assoc_group = ctx.rpc_assoc_group,
-        .use_ndr64 = ctx.use_ndr64,
-        .use_btfn = ctx.use_btfn,
-        .disconnect_per_request = ctx.disconnect_per_request,
+        .use_ndr64 = ctx.opts.ndr64,
+        .use_btfn = ctx.opts.btfn,
+        .disconnect_per_request = ctx.opts.disconnect_per_request,
     }) catch |e| switch (e) {
         error.Timeout => {
             // Nothing arrived for `--timeout` seconds (the C `SO_RCVTIMEO`).
             // The connection is not broken and the last request was answered:
             // this is an idle cleanup, not a failure.
-            logClosed(ctx, "after {d}s idle", .{ctx.timeout_seconds});
+            logClosed(ctx, "after {d}s idle", .{ctx.opts.timeout_seconds});
             return;
         },
         error.Canceled => {
@@ -728,6 +741,82 @@ fn serveClientThread(ctx: *ClientContext) void {
         .after_request => logClosed(ctx, "after request", .{}),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Logging and the thread census
+// ---------------------------------------------------------------------------
+
+/// The log writer's task. It is counted but not announced: it starts before the
+/// resolved log level is applied, so its own start line would be filtered out at
+/// `-v` (or, worse, appear at random depending on the schedule). `Run.startLogger`
+/// announces the role once the level is known.
+fn logWriterTask(log: *cli_helper.Logger, tally: *ThreadTally) void {
+    stated_pool_thread = true;
+    _ = tally.total.fetchAdd(1, .monotonic);
+    cli_helper.Logger.writerLoop(log);
+}
+
+/// Which server tasks have already announced the calling thread. Every pool
+/// thread runs at least one of them, so counting first uses per thread counts
+/// the pool exactly, with no registry to keep and no lock on the path.
+threadlocal var stated_pool_thread = false;
+threadlocal var stated_client_thread = false;
+
+/// The pool's threads, as this process has observed them. `std.Io.Threaded`
+/// spawns a worker when a task is dispatched and none is idle, and never
+/// reclaims one, so a thread's first task is its only lifecycle event: it is
+/// created on demand and lives until the process exits. Counting first uses
+/// therefore yields the process's thread count after adding the main thread —
+/// no estimate, and no gap for the threads that only ever ran an `accept`, the
+/// shutdown read, or the log writer.
+const ThreadTally = struct {
+    /// Every pool thread that has run a server task.
+    total: std.atomic.Value(u32) = .init(0),
+    /// The subset that has served a client, which is what scales with load.
+    clients: std.atomic.Value(u32) = .init(0),
+};
+
+/// Which server task is reporting. A connection also counts the thread as a
+/// client worker, the part of the census that scales with load.
+const Role = enum { pool, client };
+
+/// Report the calling thread when it runs a server task: once when the thread
+/// itself is first seen, and once more when it first serves a client. Both are
+/// needed — a thread usually starts out on an `accept` and is then handed the
+/// connection it accepted. Each event has exactly one wording, so `serving
+/// clients` lines count client worker threads and `started` lines count the
+/// pool's non-client threads. When a thread debuts on a connection the second
+/// line carries both facts and the first one is skipped.
+///
+/// The id is the OS thread id — `gettid` on Linux, so it matches `ps -L` and
+/// `/proc/<pid>/task/<tid>`, and `pthread_threadid_np` on macOS, the id
+/// `sample`/`spindump` and crash reports show.
+fn notePoolThread(tally: *ThreadTally, log: *cli_helper.Logger, comptime role: Role) void {
+    const new_thread = !stated_pool_thread;
+    const new_client = role == .client and !stated_client_thread;
+    if (!new_thread and !new_client) return;
+
+    const thread_id = std.Thread.getCurrentId();
+    if (new_thread) {
+        stated_pool_thread = true;
+        _ = tally.total.fetchAdd(1, .monotonic);
+    }
+    const threads = tally.total.load(.monotonic);
+    if (!new_client) {
+        log.debug("pool worker {d} started (pool threads: {d})", .{ thread_id, threads });
+        return;
+    }
+    stated_client_thread = true;
+    const clients = tally.clients.fetchAdd(1, .monotonic) + 1;
+    log.debug(
+        "pool worker {d} serving clients (client workers: {d}, pool threads: {d})",
+        .{ thread_id, clients, threads },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Signals and shutdown
+// ---------------------------------------------------------------------------
 
 /// Self-pipe write end (`[1]`): the SIGINT/SIGTERM handler writes one byte here
 /// (async-signal-safe) to announce the signal. The read end (`[0]`) is the
@@ -786,12 +875,20 @@ fn shutdownPipeFile(comptime end: enum { read, write }) Io.File {
     };
 }
 
+/// Process services the startup helpers need: an allocator, the `Io` handle,
+/// and the logger for the warnings they emit. Grouped so a helper does not
+/// repeat the triple, and so a test can build one without a whole `Run`.
+const Services = struct {
+    gpa: Allocator,
+    io: Io,
+    log: *cli_helper.Logger,
+};
+
 /// Create the self-pipe and install handlers so Ctrl-C / `docker stop` shut the
-/// server down cleanly.
-fn installSignalHandlers(io: Io, log: *cli_helper.Logger) void {
-    if (std.c.pipe(&shutdown_pipe) != 0) {
-        fatal(log, io, "failed to create shutdown pipe", .{});
-    }
+/// server down cleanly. Reports failure as a value; `Run.installSignals` decides
+/// how to surface it (this helper never exits).
+fn installSignalHandlers() error{ CreateShutdownPipe, ConfigureShutdownPipe }!void {
+    if (std.c.pipe(&shutdown_pipe) != 0) return error.CreateShutdownPipe;
     // Make the write end non-blocking so the handler never blocks when the
     // pipe is full (it only writes one byte, but correctness first). The
     // O_NONBLOCK bit lives at a platform-dependent offset — derive it instead
@@ -799,7 +896,7 @@ fn installSignalHandlers(io: Io, log: *cli_helper.Logger) void {
     const nonblock_mask: i32 = @as(i32, 1) << @intCast(@bitOffsetOf(std.posix.O, "NONBLOCK"));
     const flags = std.c.fcntl(shutdown_pipe[1], std.c.F.GETFL, @as(i32, 0));
     if (flags < 0 or std.c.fcntl(shutdown_pipe[1], std.c.F.SETFL, flags | nonblock_mask) < 0) {
-        fatal(log, io, "failed to make shutdown pipe non-blocking", .{});
+        return error.ConfigureShutdownPipe;
     }
 
     const act = std.posix.Sigaction{
@@ -811,50 +908,71 @@ fn installSignalHandlers(io: Io, log: *cli_helper.Logger) void {
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
 
+/// Why listening stopped, for the caller's startup message.
+const ListenFailure = union(enum) {
+    /// No socket could be opened at all: ip-protection level 1 found no
+    /// private address, or every bind failed.
+    none,
+    /// One address failed to bind. `addr` is the `--listen` value, or the
+    /// `0.0.0.0` retry after a failed dual-stack `::`.
+    address: struct { addr: []const u8, err: anyerror },
+};
+
+// ---------------------------------------------------------------------------
+// Listening and the accept loop
+// ---------------------------------------------------------------------------
+
 /// Create the listening sockets. ip-protection level 1 listens only on the
 /// host's private addresses; otherwise `--listen` (default ::, a dual-stack
 /// socket covering both IPv4 and IPv6).
+///
+/// Returns null on success, or why startup must not continue: the caller owns
+/// the decision and the message, so this helper stays testable.
 fn createListenSockets(
-    gpa: Allocator,
-    io: Io,
+    services: Services,
     opts: *const ServerOptions,
-    log: *cli_helper.Logger,
     servers: *std.ArrayList(Io.net.Server),
-) !void {
-    if (opts.ip_protection & ip_protect_private_listen != 0) {
-        const privates = try network.getPrivateIPAddresses(gpa);
-        defer gpa.free(privates);
-        if (privates.len == 0) log.warn("ip-protection level 1: no private IP addresses found", .{});
+) !?ListenFailure {
+    if (listensOnPrivateOnly(opts.ip_protection)) {
+        const privates = try network.getPrivateIPAddresses(services.gpa);
+        defer services.gpa.free(privates);
+        if (privates.len == 0) services.log.warn("ip-protection level 1: no private IP addresses found", .{});
         for (privates) |ip0| {
             var ip = ip0;
             ip.setPort(opts.port);
-            const s = Io.net.IpAddress.listen(&ip, io, .{ .reuse_address = true }) catch |e| {
-                log.warn("failed to listen on a private address: {s}", .{@errorName(e)});
+            const s = Io.net.IpAddress.listen(&ip, services.io, .{ .reuse_address = true }) catch |e| {
+                services.log.warn("failed to listen on a private address: {s}", .{@errorName(e)});
                 continue;
             };
-            try servers.append(gpa, s);
+            try servers.append(services.gpa, s);
         }
     } else {
         for (opts.listen) |addr| {
-            const s = network.listen(io, addr, opts.port) catch |e| {
-                // Fallback: a default dual-stack "::" listen fails when the
-                // host has no IPv6 stack; retry on IPv4 only.
-                if (std.mem.eql(u8, addr, "::") and e == error.AddressFamilyUnsupported) {
-                    const s4 = network.listen(io, "0.0.0.0", opts.port) catch |e4| {
-                        fatal(log, io, "failed to listen on 0.0.0.0:{d}: {s}", .{ opts.port, @errorName(e4) });
-                    };
-                    try servers.append(gpa, s4);
-                    continue;
-                }
-                fatal(log, io, "failed to listen on {s}:{d}: {s}", .{ addr, opts.port, @errorName(e) });
+            const s = network.listen(services.io, addr, opts.port) catch |e| {
+                // A dual-stack listen on a host without IPv6 cannot work; the
+                // IPv4-only retry still serves every client.
+                const retry = ipv4Fallback(addr, e) orelse
+                    return .{ .address = .{ .addr = addr, .err = e } };
+                const s4 = network.listen(services.io, retry, opts.port) catch |e4| {
+                    return .{ .address = .{ .addr = retry, .err = e4 } };
+                };
+                try servers.append(services.gpa, s4);
+                continue;
             };
-            try servers.append(gpa, s);
+            try servers.append(services.gpa, s);
         }
     }
 
-    if (servers.items.len == 0) {
-        fatal(log, io, "could not listen on any socket", .{});
-    }
+    return if (servers.items.len == 0) .none else null;
+}
+
+/// The address to bind instead after `addr` failed with `err`, or null to report
+/// the failure as it is. Only the default dual-stack `::` has a fallback, and
+/// only for a host with no IPv6 stack: every other failure names the address the
+/// operator asked for.
+fn ipv4Fallback(addr: []const u8, err: anyerror) ?[]const u8 {
+    if (err != error.AddressFamilyUnsupported) return null;
+    return if (std.mem.eql(u8, addr, "::")) "0.0.0.0" else null;
 }
 
 /// Bit `index` of the accept loop's armed-socket set.
@@ -885,7 +1003,7 @@ const AcceptOutcome = union(enum) {
 /// `accept` is a task whose thread the backend can interrupt, which is why it
 /// can be one of the select's waiters.
 fn acceptTask(self: *ServerContext, server_index: usize) AcceptOutcome {
-    notePoolThread(self.tally, self.log, false);
+    notePoolThread(self.tally, self.log, .pool);
     const stream = self.servers[server_index].accept(self.io) catch |err| return .{
         .failed = .{ .server = server_index, .err = err },
     };
@@ -896,7 +1014,7 @@ fn acceptTask(self: *ServerContext, server_index: usize) AcceptOutcome {
 /// a cancelable `Io` operation, so the select's cancel path ends it if the loop
 /// stops without a signal; the byte itself is irrelevant, only its arrival is.
 fn shutdownTask(io: Io, pipe: Io.File, tally: *ThreadTally, log: *cli_helper.Logger) [1]u8 {
-    notePoolThread(tally, log, false);
+    notePoolThread(tally, log, .pool);
     var byte: [1]u8 = .{0};
     var buffer: [1]u8 = undefined;
     var reader = pipe.readerStreaming(io, &buffer);
@@ -906,7 +1024,7 @@ fn shutdownTask(io: Io, pipe: Io.File, tally: *ThreadTally, log: *cli_helper.Log
 
 /// Park until a client task frees an admission slot.
 fn slotFreeTask(io: Io, gate: *InFlight, tally: *ThreadTally, log: *cli_helper.Logger) void {
-    notePoolThread(tally, log, false);
+    notePoolThread(tally, log, .pool);
     gate.slot_free.wait(io) catch {};
 }
 
@@ -947,7 +1065,7 @@ const ServerContext = struct {
         // One result slot per possibly-outstanding task: the shutdown read,
         // one `accept` per listen socket, and at most one gate wait. An
         // undersized buffer would deadlock `Select.cancel`.
-        var wakes: [max_listen_sockets + 2]AcceptWake = undefined;
+        var wakes: [select_slots]AcceptWake = undefined;
         var select: Io.Select(AcceptWake) = .init(self.io, &wakes);
         defer {
             // `cancel` rather than `cancelDiscard`: a completed accept may still
@@ -1063,7 +1181,7 @@ const ServerContext = struct {
     /// leaves the slot count unchanged.
     fn admit(self: *ServerContext, server_index: usize, stream: Io.net.Stream) void {
         // ip-protection level 2: reject clients with a public IP.
-        if (self.opts.ip_protection & ip_protect_reject_public != 0) {
+        if (rejectsPublicPeers(self.opts.ip_protection)) {
             if (!network.isClientPrivate(stream.socket.handle)) {
                 stream.close(self.io);
                 self.log.debug("client with public IP address rejected", .{});
@@ -1093,15 +1211,11 @@ const ServerContext = struct {
             .cfg = self.cfg,
             .prng = std.Random.DefaultPrng.init(self.prng.int(u64)),
             .port_str = "",
-            .use_ndr64 = self.opts.ndr64,
-            .use_btfn = self.opts.btfn,
-            .disconnect_per_request = self.opts.disconnect_per_request,
-            .timeout_seconds = self.opts.timeout_seconds,
+            .opts = self.opts,
             .rpc_assoc_group = self.assoc_group,
             .in_flight = &self.in_flight,
             .tally = self.tally,
             .log = self.log,
-            .quiet_loopback = self.opts.quiet_loopback,
         };
         // The BIND_ACK advertises the local port the client reached. It comes
         // from the listen socket that accepted the connection, because
@@ -1124,6 +1238,10 @@ const ServerContext = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+
 /// Report a fatal startup error and exit. `std.process.exit` skips the deferred
 /// cleanup, so the log queue is drained explicitly — otherwise the message the
 /// operator needs would still be sitting in the queue.
@@ -1133,11 +1251,352 @@ fn fatal(log: *cli_helper.Logger, io: Io, comptime fmt: []const u8, args: anytyp
     std.process.exit(1);
 }
 
+/// Everything the server owns after startup: the process services, the resolved
+/// configuration, the loaded data, the listeners and the two task groups.
+///
+/// `start` builds those pieces in dependency order, `serve` runs the accept loop,
+/// and `deinit` releases them so that no phase frees something a later phase
+/// still reads. `main` creates one `Run`, calls `start` then `serve`, and lets
+/// `deinit` run on the way out.
+///
+/// `log` keeps pointers into `out_buf`/`err_buf`, so a `Run` must not be copied
+/// after construction; `main` keeps it as a single `var`.
+const Run = struct {
+    init: std.process.Init,
+
+    /// Resolved configuration, owned here: `ServerContext` and every
+    /// connection borrow `opts`, so it outlives `conn_group`.
+    opts: ServerOptions = .{},
+    /// What `opts`' list options point into; freed in `deinit` once the
+    /// connection group has joined, since connection tasks are its borrowers.
+    backing: OptionBacking = .{},
+    /// Configuration notices, logged by `startLogger` once the level is known.
+    report: ResolveReport = .{},
+
+    log: cli_helper.Logger = undefined,
+    /// Set once `log` may be shut down (the queue exists, even with no writer).
+    log_started: bool = false,
+    /// The log writer's group: shut down after the connection group, so lines
+    /// logged while connections stop are still drained.
+    log_group: Io.Group = .init,
+    tally: ThreadTally = .{},
+
+    data: kmsdata.KmsData = undefined,
+    data_ready: bool = false,
+    epid_overrides: []const ?[]const u8 = &.{},
+    /// Set once `epid_overrides` is the allocator-owned table (even when empty).
+    epid_ready: bool = false,
+    client_lists: kms.ClientLists = undefined,
+    client_lists_storage: ?[]kms.ClientList = null,
+    cfg: kms.ServerConfig = undefined,
+    prng: std.Random.DefaultPrng = undefined,
+
+    listeners: std.ArrayList(Io.net.Server) = .empty,
+    conn_group: Io.Group = .init,
+    signals_installed: bool = false,
+
+    /// Allocator-owned resources that outlive the phase that created them.
+    fhs: ?cli_helper.FhsKmd = null,
+    kmd_owned: ?[]u8 = null,
+
+    /// Backing for `log`, owned here so the pointers stay with the struct.
+    out_buf: [io_buffer_size]u8 = undefined,
+    err_buf: [io_buffer_size]u8 = undefined,
+
+    /// Take ownership of the resolved configuration. Building the value is what
+    /// transfers the list backing, so it happens before any fallible step and
+    /// `deinit` can always release it.
+    fn new(init: std.process.Init, resolved: Resolved) Run {
+        return .{
+            .init = init,
+            .opts = resolved.options,
+            .backing = resolved.backing,
+            .report = resolved.report,
+        };
+    }
+
+    /// Build the process in startup order. Configuration and environment
+    /// failures exit through `fatal` (which drains the log queue); allocation
+    /// errors propagate to `main`, whose `defer deinit` releases what was built.
+    fn start(self: *Run) !void {
+        try self.startLogger();
+        self.loadKmsData();
+        self.prepareEpids();
+        try self.prepareClientLists();
+        self.buildServiceConfig();
+        try self.openListeners();
+        self.announce();
+        self.writePidFile();
+        // The reference checks this after the banner and the PID file, so keep
+        // the startup output in the same order.
+        if (self.listeners.items.len > max_listen_sockets) {
+            fatal(&self.log, self.init.io, "too many listen sockets (max {d})", .{max_listen_sockets});
+        }
+        self.installSignals();
+    }
+
+    /// Start the logger and its writer, then apply the resolved level.
+    fn startLogger(self: *Run) !void {
+        const init = self.init;
+        self.log = try cli_helper.Logger.init(init.gpa, init.io, &self.out_buf, &self.err_buf);
+        self.log_started = true;
+
+        // Start the writer before anything can log: `fatal` drains the queue on
+        // the way out, and a queue with no consumer would block that drain.
+        self.log_group.concurrent(init.io, logWriterTask, .{ &self.log, &self.tally }) catch |e| {
+            // No writer task means no consumer for the queue, so `fatal` would
+            // block in `shutdown`: report without the logger and exit.
+            cli_helper.fatalStderr(init.io, "vlmzsd", "failed to start log writer task: {s}", .{@errorName(e)});
+        };
+
+        self.log.min_level = self.opts.log_level;
+        // The writer task started before the level was known, so its own start
+        // line was filtered by the default; this line announces the role, which
+        // keeps the thread census complete for a `-v` reader.
+        self.log.debug("log writer task started", .{});
+        // Configuration notices are ordinary `warn` lines and obey the resolved
+        // level: `-q` (warn) shows them, `-qq` (err) silences them.
+        if (self.report.invalid_log_level) |value| self.log.warn(
+            "ignoring invalid {s} \"{s}\" (expected trace, debug, info, warn, or err)",
+            .{ log_level_env, value },
+        );
+        if (self.report.legacy_verbose_present) self.log.warn("{s} is deprecated; use {s} instead", .{ deprecated_verbose_env, log_level_env });
+        if (self.report.legacy_quiet_present) self.log.warn("{s} is deprecated; use {s} instead", .{ deprecated_quiet_env, log_level_env });
+    }
+
+    /// Load the KMS data: explicit path (`--data` / `VLMZSD_DATA`) → FHS/XDG
+    /// search → embedded default.
+    fn loadKmsData(self: *Run) void {
+        const init = self.init;
+        var loaded_from: ?[]const u8 = null; // null = embedded
+        if (self.opts.data_file) |path| {
+            self.kmd_owned = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, path, init.gpa, .unlimited) catch |e| {
+                fatal(&self.log, init.io, "failed to read data file {s}: {s}", .{ path, @errorName(e) });
+            };
+            loaded_from = path;
+        } else {
+            self.fhs = cli_helper.loadFhsKmd(init.io, init.gpa, init.minimal.environ) catch |e| {
+                fatal(&self.log, init.io, "failed to read FHS data file: {s}", .{@errorName(e)});
+            };
+            if (self.fhs) |*f| loaded_from = f.path;
+        }
+        const kmd_raw: []const u8 = if (self.kmd_owned) |raw| raw else if (self.fhs) |f| f.data else blk: {
+            if (embedded_kmd.len == 0) fatal(&self.log, init.io, "no KMS data found; specify --data <file>", .{});
+            break :blk embedded_kmd;
+        };
+
+        self.data = kmsdata.parse(init.gpa, kmd_raw) catch |e| {
+            fatal(&self.log, init.io, "invalid KMS data: {s}", .{@errorName(e)});
+        };
+        self.data_ready = true;
+
+        if (loaded_from) |path| {
+            self.log.info("loaded KMS data from {s}", .{path});
+        } else {
+            self.log.debug("using embedded KMS data", .{});
+        }
+
+        self.prng = .init(cli_helper.makeSeed(init.io));
+    }
+
+    /// `--epid` overrides, level-1 pre-randomization, and the level-2 data check.
+    fn prepareEpids(self: *Run) void {
+        const init = self.init;
+        self.epid_overrides = buildEpidOverrides(
+            init.gpa,
+            &self.data,
+            &self.opts,
+            self.prng.random(),
+            cli_helper.nowUnix(init.io),
+            &self.log,
+        ) catch |e| {
+            fatal(&self.log, init.io, "cannot initialize randomized ePIDs: {s}", .{@errorName(e)});
+        };
+        self.epid_ready = true;
+
+        // Level 2 generates each ePID at request time. Reject a data file that
+        // cannot supply a host build for the negotiated transfer syntax now,
+        // instead of rejecting every request later.
+        if (self.opts.randomize == 2) {
+            var needs_random_pid = false;
+            for (self.epid_overrides) |slot| if (slot == null) {
+                needs_random_pid = true;
+                break;
+            };
+            if (needs_random_pid and self.opts.build == 0 and !kms.hasHostBuildForNdr64(&self.data, self.opts.ndr64)) {
+                fatal(&self.log, init.io, "no host build matches the NDR64 setting for randomized ePIDs", .{});
+            }
+        }
+    }
+
+    /// Client lists (strict mode): one per app, pre-filled unless `--start-empty`.
+    fn prepareClientLists(self: *Run) !void {
+        if (!self.opts.maintain_clients) return;
+        const storage = try self.init.gpa.alloc(kms.ClientList, self.data.apps().len);
+        self.client_lists_storage = storage;
+        self.client_lists = .{ .lists = storage };
+        kms.initClientLists(&self.client_lists, &self.data, self.opts.start_empty, self.prng.random());
+    }
+
+    /// Capture the options that do not change after startup into the protocol
+    /// layer's config struct.
+    fn buildServiceConfig(self: *Run) void {
+        self.cfg = .{
+            .data = &self.data,
+            .vl_activation_interval = self.opts.activation_interval_minutes,
+            .vl_renewal_interval = self.opts.renewal_interval_minutes,
+            .check_client_time = self.opts.check_client_time,
+            .whitelisting_level = self.opts.whitelist,
+            .randomization_level = self.opts.randomize,
+            .lcid = @truncate(self.opts.lcid),
+            .build = self.opts.build,
+            .epid_overrides = self.epid_overrides,
+            .use_ndr64 = self.opts.ndr64,
+            .maintain_clients = self.opts.maintain_clients,
+            .client_lists = if (self.client_lists_storage != null) &self.client_lists else null,
+        };
+    }
+
+    /// Open the listening sockets; a failure is reported here, after the helper
+    /// has said which address failed and why.
+    fn openListeners(self: *Run) !void {
+        const failure = try createListenSockets(.{
+            .gpa = self.init.gpa,
+            .io = self.init.io,
+            .log = &self.log,
+        }, &self.opts, &self.listeners);
+        if (failure) |why| switch (why) {
+            .none => fatal(&self.log, self.init.io, "could not listen on any socket", .{}),
+            .address => |a| fatal(
+                &self.log,
+                self.init.io,
+                "failed to listen on {s}:{d}: {s}",
+                .{ a.addr, self.opts.port, @errorName(a.err) },
+            ),
+        };
+    }
+
+    /// Report the bound port (not the requested `0`) and the client cap.
+    fn announce(self: *Run) void {
+        // With `--port 0` the kernel picks the port, so report the one actually
+        // bound instead of echoing "0".
+        const bound_port: u16 = if (self.opts.port != 0) self.opts.port else self.listeners.items[0].socket.address.getPort();
+        self.log.info("vlmzsd {s} listening on port {d}", .{ version, bound_port });
+        if (self.opts.max_clients == 0) {
+            self.log.warn("client cap disabled: concurrent client tasks are unbounded", .{});
+        } else {
+            self.log.info("client cap: {d} concurrent clients", .{self.opts.max_clients});
+        }
+    }
+
+    /// Best effort; mirrors the C `writePidFile`, which only logs on failure.
+    fn writePidFile(self: *Run) void {
+        const path = self.opts.pid_file orelse return;
+        var pid_buf: [pid_str_buffer_size]u8 = undefined;
+        const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{std.c.getpid()}) catch unreachable;
+        std.Io.Dir.writeFile(std.Io.Dir.cwd(), self.init.io, .{
+            .sub_path = path,
+            .data = pid_str,
+        }) catch |e| self.log.warn("failed to write pid file {s}: {s}", .{ path, @errorName(e) });
+    }
+
+    /// Signals are installed after the listeners and before the accept loop, so
+    /// the pipe outlives its waiters and closes after the connection group joins
+    /// (see `deinit`).
+    fn installSignals(self: *Run) void {
+        installSignalHandlers() catch |e| switch (e) {
+            error.CreateShutdownPipe => fatal(&self.log, self.init.io, "failed to create shutdown pipe", .{}),
+            error.ConfigureShutdownPipe => fatal(&self.log, self.init.io, "failed to make shutdown pipe non-blocking", .{}),
+        };
+        self.signals_installed = true;
+    }
+
+    /// Accept and dispatch clients until SIGINT/SIGTERM arrives. `--max-clients`
+    /// is enforced before an accept task is armed (see `InFlight`), so a
+    /// saturated server leaves excess connections in the kernel backlog.
+    fn serve(self: *Run) !void {
+        var server: ServerContext = .{
+            .gpa = self.init.gpa,
+            .io = self.init.io,
+            .opts = &self.opts,
+            .log = &self.log,
+            .cfg = &self.cfg,
+            .servers = self.listeners.items,
+            .in_flight = .{ .cap = self.opts.max_clients },
+            .tally = &self.tally,
+            .conn_group = &self.conn_group,
+            .prng = self.prng.random(),
+            .assoc_group = self.prng.random().int(u32) | 1,
+        };
+        try server.run();
+    }
+
+    /// Release everything in reverse startup order, connection group first: its
+    /// tasks log, so they finish before the log queue drains, and they borrow
+    /// `opts`, whose backing is freed further down.
+    fn deinit(self: *Run) void {
+        const gpa = self.init.gpa;
+        const io = self.init.io;
+
+        self.conn_group.cancel(io);
+        if (self.signals_installed) {
+            shutdownPipeFile(.read).close(io);
+            shutdownPipeFile(.write).close(io);
+        }
+        for (self.listeners.items) |*s| s.deinit(io);
+        self.listeners.deinit(gpa);
+        if (self.client_lists_storage) |storage| gpa.free(storage);
+        for (self.epid_overrides) |slot| if (slot) |s| gpa.free(s);
+        if (self.epid_ready) gpa.free(self.epid_overrides);
+        if (self.data_ready) self.data.deinit(gpa);
+        if (self.kmd_owned) |raw| gpa.free(raw);
+        if (self.fhs) |*f| {
+            gpa.free(f.path);
+            gpa.free(f.data);
+        }
+        // The last borrow of the option lists is a connection task, and those
+        // have all ended above.
+        self.backing.deinit(gpa);
+
+        if (self.log_started) {
+            self.log.shutdown(io);
+            self.log_group.cancel(io);
+            self.log.deinit(gpa);
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+/// Report a configuration error and exit. One wording per `resolveOptions`
+/// failure, so `main` stays a sequence of phases.
+fn reportOptionError(io: Io, diag: *const cli_helper.Diag, err: anyerror) noreturn {
+    switch (err) {
+        error.UnexpectedPositional => cli_helper.fatalStderr(io, "vlmzsd", "takes no positional arguments", .{}),
+        error.LcidOutOfRange => cli_helper.fatalStderr(io, "vlmzsd", "--lcid must be 0..{d} (0 = random)", .{kms.max_lcid}),
+        error.BuildOutOfRange => cli_helper.fatalStderr(io, "vlmzsd", "--build must be 0..{d} (0 = random)", .{kms.max_build}),
+        error.TimeoutOutOfRange => cli_helper.fatalStderr(io, "vlmzsd", "--timeout must be at most {d} seconds", .{std.math.maxInt(u32)}),
+        error.IntervalOutOfRange => cli_helper.fatalStderr(io, "vlmzsd", "policy interval must be at most {d} minutes", .{std.math.maxInt(u32)}),
+        error.InvalidListenAddress => cli_helper.fatalStderr(io, "vlmzsd", "{s}: \"{s}\" is not an IP address (the port comes from --port)", .{ diag.spelling, diag.value }),
+        else => {
+            var vbuf: [128]u8 = undefined;
+            if (diag.spelling.len > 0) {
+                const text = std.fmt.bufPrint(&vbuf, "{s}: invalid value \"{s}\"", .{ diag.spelling, diag.value }) catch @errorName(err);
+                cli_helper.fatalStderr(io, "vlmzsd", "{s}", .{text});
+            }
+            // Not about one value (e.g. an unknown .kmd field): name the error.
+            cli_helper.fatalStderr(io, "vlmzsd", "{s}", .{@errorName(err)});
+        },
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
-    // Collect the raw arguments (skip argv[0]).
     var args_list: std.ArrayList([]const u8) = .empty;
     defer args_list.deinit(init.gpa);
     var args_iter: std.process.Args.Iterator = .init(init.minimal.args);
+    // Collect the raw arguments (skip argv[0]).
     _ = args_iter.skip();
     while (args_iter.next()) |arg| {
         try args_list.append(init.gpa, arg);
@@ -1152,7 +1611,7 @@ pub fn main(init: std.process.Init) !void {
     defer res.deinit();
 
     if (res.hasFlag("help")) {
-        var hbuf: [4096]u8 = undefined;
+        var hbuf: [io_buffer_size]u8 = undefined;
         var hw = std.Io.File.writer(std.Io.File.stdout(), init.io, &hbuf);
         try cli_helper.writeHelp(&hw.interface, "vlmzsd", &vlmzsd_opts, "");
         try hw.interface.flush();
@@ -1166,224 +1625,18 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var out_buf: [4096]u8 = undefined;
-    var err_buf: [4096]u8 = undefined;
-    var log: cli_helper.Logger = try cli_helper.Logger.init(init.gpa, init.io, &out_buf, &err_buf);
-    defer log.deinit(init.gpa);
-
-    // Start the log writer before anything can log: `fatal` drains the queue on
-    // the way out, and a queue with no consumer would block that drain. The
-    // separate group lets shutdown drain it *after* the connection tasks have
-    // stopped, so lines they logged on the way out still reach the sink.
-    var tally: ThreadTally = .{};
-    var log_group: Io.Group = .init;
-    defer log_group.cancel(init.io);
-    defer log.shutdown(init.io);
-    log_group.concurrent(init.io, logWriterTask, .{ &log, &tally }) catch |e| {
-        // No writer task means no consumer for the queue, so `fatal` would
-        // block in `shutdown`: report without the logger and exit.
-        cli_helper.fatalStderr(init.io, "vlmzsd", "failed to start log writer task: {s}", .{@errorName(e)});
-    };
-
-    const resolver: Resolver = .{ .gpa = init.gpa, .env = init.environ_map, .res = &res, .diag = &diag };
-    var opts = resolveOptions(resolver) catch |e| switch (e) {
-        error.UnexpectedPositional => cli_helper.fatalStderr(init.io, "vlmzsd", "takes no positional arguments", .{}),
-        error.LcidOutOfRange => cli_helper.fatalStderr(init.io, "vlmzsd", "--lcid must be 0..{d} (0 = random)", .{kms.max_lcid}),
-        error.BuildOutOfRange => cli_helper.fatalStderr(init.io, "vlmzsd", "--build must be 0..{d} (0 = random)", .{kms.max_build}),
-        error.TimeoutOutOfRange => cli_helper.fatalStderr(init.io, "vlmzsd", "--timeout must be at most {d} seconds", .{std.math.maxInt(u32)}),
-        error.IntervalOutOfRange => cli_helper.fatalStderr(init.io, "vlmzsd", "policy interval must be at most {d} minutes", .{std.math.maxInt(u32)}),
-        error.InvalidListenAddress => cli_helper.fatalStderr(init.io, "vlmzsd", "{s}: \"{s}\" is not an IP address (the port comes from --port)", .{ diag.spelling, diag.value }),
-        else => blk: {
-            var vbuf: [128]u8 = undefined;
-            if (diag.spelling.len > 0) {
-                const text = std.fmt.bufPrint(&vbuf, "{s}: invalid value \"{s}\"", .{ diag.spelling, diag.value }) catch @errorName(e);
-                cli_helper.fatalStderr(init.io, "vlmzsd", "{s}", .{text});
-            }
-            // Not about one value (e.g. an unknown .kmd field): name the error.
-            cli_helper.fatalStderr(init.io, "vlmzsd", "{s}", .{@errorName(e)});
-            break :blk {};
-        },
-    };
-    defer opts.deinit(init.gpa);
-
-    log.min_level = opts.log_level;
-    // The log writer is the one pool task that started before the level was
-    // known, so its own start line was filtered by the default; announce the
-    // role here instead, keeping the thread census complete for a `-v` reader.
-    log.debug("log writer task started", .{});
-    // Configuration notices are ordinary `warn` lines and obey the resolved
-    // level: `-q` (warn) shows them, `-qq` (err) silences them.
-    if (opts.invalid_log_level) |value| log.warn("ignoring invalid {s} \"{s}\" (expected trace, debug, info, warn, or err)", .{ log_level_env, value });
-    if (opts.legacy_verbose_present) log.warn("{s} is deprecated; use {s} instead", .{ deprecated_verbose_env, log_level_env });
-    if (opts.legacy_quiet_present) log.warn("{s} is deprecated; use {s} instead", .{ deprecated_quiet_env, log_level_env });
-
-    // Load the KMS data: explicit path (--data / VLMZSD_DATA) → FHS/XDG search
-    // → embedded default.
-    var kmd_owned = false;
-    var kmd_raw: []const u8 = undefined;
-    var loaded_from: ?[]const u8 = null; // null = embedded
-    var fhs_loaded: ?cli_helper.FhsKmd = null;
-    defer if (fhs_loaded) |*f| {
-        init.gpa.free(f.path);
-        init.gpa.free(f.data);
-    };
-    if (opts.data_file) |path| {
-        kmd_raw = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, path, init.gpa, .unlimited) catch |e| {
-            fatal(&log, init.io, "failed to read data file {s}: {s}", .{ path, @errorName(e) });
-        };
-        kmd_owned = true;
-        loaded_from = path;
-    } else {
-        fhs_loaded = cli_helper.loadFhsKmd(init.io, init.gpa, init.minimal.environ) catch |e| {
-            fatal(&log, init.io, "failed to read FHS data file: {s}", .{@errorName(e)});
-        };
-        if (fhs_loaded) |*f| {
-            kmd_raw = f.data;
-            loaded_from = f.path;
-        } else if (embedded_kmd.len > 0) {
-            kmd_raw = embedded_kmd;
-        } else {
-            fatal(&log, init.io, "no KMS data found; specify --data <file>", .{});
-        }
-    }
-    defer if (kmd_owned) init.gpa.free(@constCast(kmd_raw));
-
-    var data = kmsdata.parse(init.gpa, kmd_raw) catch |e| {
-        fatal(&log, init.io, "invalid KMS data: {s}", .{@errorName(e)});
-    };
-    defer data.deinit(init.gpa);
-
-    if (loaded_from) |path| {
-        log.info("loaded KMS data from {s}", .{path});
-    } else {
-        log.debug("using embedded KMS data", .{});
-    }
-
-    var prng: std.Random.DefaultPrng = .init(cli_helper.makeSeed(init.io));
-    const rng = prng.random();
-
-    const epid_overrides = buildEpidOverrides(init.gpa, &data, &opts, rng, cli_helper.nowUnix(init.io), &log) catch |e| {
-        fatal(&log, init.io, "cannot initialize randomized ePIDs: {s}", .{@errorName(e)});
-    };
-    defer {
-        for (epid_overrides) |slot| {
-            if (slot) |s| init.gpa.free(s);
-        }
-        init.gpa.free(epid_overrides);
-    }
-
-    // Level 2 generates each ePID at request time. Reject a data file that
-    // cannot supply a host build for the negotiated transfer syntax now,
-    // instead of rejecting every request later.
-    if (opts.randomize == 2) {
-        var needs_random_pid = false;
-        for (epid_overrides) |slot| if (slot == null) {
-            needs_random_pid = true;
-            break;
-        };
-        if (needs_random_pid and opts.build == 0 and !kms.hasHostBuildForNdr64(&data, opts.ndr64)) {
-            fatal(&log, init.io, "no host build matches the NDR64 setting for randomized ePIDs", .{});
-        }
-    }
-
-    // Client lists (strict mode): one per app, pre-filled unless --start-empty.
-    var client_lists: kms.ClientLists = undefined;
-    var client_lists_storage: ?[]kms.ClientList = null;
-    if (opts.maintain_clients) {
-        client_lists_storage = try init.gpa.alloc(kms.ClientList, data.apps().len);
-        client_lists = .{ .lists = client_lists_storage.? };
-        kms.initClientLists(&client_lists, &data, opts.start_empty, rng);
-    }
-    defer if (client_lists_storage) |s| init.gpa.free(s);
-
-    const cfg = kms.ServerConfig{
-        .data = &data,
-        .vl_activation_interval = opts.activation_interval_minutes,
-        .vl_renewal_interval = opts.renewal_interval_minutes,
-        .check_client_time = opts.check_client_time,
-        .whitelisting_level = opts.whitelist,
-        .randomization_level = opts.randomize,
-        .lcid = @truncate(opts.lcid),
-        .build = opts.build,
-        .epid_overrides = epid_overrides,
-        .use_ndr64 = opts.ndr64,
-        .maintain_clients = opts.maintain_clients,
-        .client_lists = if (client_lists_storage != null) &client_lists else null,
-    };
-
-    // Create the listening sockets. ip-protection level 1 listens only on the
-    // host's private addresses; otherwise `--listen` (default ::, a dual-stack
-    // socket covering both IPv4 and IPv6).
-    var servers: std.ArrayList(Io.net.Server) = .empty;
-    defer {
-        for (servers.items) |*s| s.deinit(init.io);
-        servers.deinit(init.gpa);
-    }
-    try createListenSockets(init.gpa, init.io, &opts, &log, &servers);
-
-    // With `--port 0` the kernel picks the port, so report the one actually
-    // bound instead of echoing "0".
-    const bound_port: u16 = if (opts.port != 0) opts.port else servers.items[0].socket.address.getPort();
-    log.info("vlmzsd {s} listening on port {d}", .{ version, bound_port });
-    if (opts.max_clients == 0) {
-        log.warn("client cap disabled: concurrent client tasks are unbounded", .{});
-    } else {
-        log.info("client cap: {d} concurrent clients", .{opts.max_clients});
-    }
-
-    // Write the PID file (best effort; mirrors the C `writePidFile`, which
-    // only logs on failure).
-    if (opts.pid_file) |path| {
-        var pid_buf: [pid_str_buffer_size]u8 = undefined;
-        const pid_str = try std.fmt.bufPrint(&pid_buf, "{d}", .{std.c.getpid()});
-        std.Io.Dir.writeFile(std.Io.Dir.cwd(), init.io, .{
-            .sub_path = path,
-            .data = pid_str,
-        }) catch |e| log.warn("failed to write pid file {s}: {s}", .{ path, @errorName(e) });
-    }
-
-    // The client cap is enforced by `ServerContext.in_flight`, an admission
-    // gate checked *before* an accept task is armed. It is not delegated to the
-    // pool: `std.Io.Threaded` never reclaims an idle worker (they live until
-    // `deinit`), and `std.process.Init` does not expose its options, so the
-    // bound has to be our own invariant.
-
-    if (servers.items.len > max_listen_sockets) {
-        fatal(&log, init.io, "too many listen sockets (max {d})", .{max_listen_sockets});
-    }
-
-    // Signals first, so the shutdown pipe outlives its waiters and its close
-    // runs after the connection group joins (defers run in reverse). The
-    // accept loop's shutdown task reads the pipe as an `Io` operation, and
-    // `run` cancels that task before it returns, so keeping this order rules
-    // out a close-before-join bug.
-    installSignalHandlers(init.io, &log);
-    defer {
-        shutdownPipeFile(.read).close(init.io);
-        shutdownPipeFile(.write).close(init.io);
-    }
-
-    // Long-lived group for the connection tasks. Each task's resources are
-    // released when it returns; canceling the group on shutdown asks in-flight
-    // tasks to stop and waits for their cleanup, which is also what lets the
-    // log queue drain afterwards (see the `log_group` defers above).
-    var conn_group: Io.Group = .init;
-    defer conn_group.cancel(init.io);
-
-    var server: ServerContext = .{
+    const resolved = resolveOptions(.{
         .gpa = init.gpa,
-        .io = init.io,
-        .opts = &opts,
-        .log = &log,
-        .cfg = &cfg,
-        .servers = servers.items,
-        .in_flight = .{ .cap = opts.max_clients },
-        .tally = &tally,
-        .conn_group = &conn_group,
-        .prng = rng,
-        .assoc_group = rng.int(u32) | 1,
-    };
-    try server.run();
+        .env = init.environ_map,
+        .res = &res,
+        .diag = &diag,
+    }) catch |e| reportOptionError(init.io, &diag, e);
+
+    var run: Run = .new(init, resolved);
+    defer run.deinit();
+
+    try run.start();
+    try run.serve();
 }
 
 // ---------------------------------------------------------------------------
@@ -1523,38 +1776,45 @@ test "resolveLogLevel: CLI flags, VLMZSD_LOG_LEVEL, and invalid values" {
     const plain: Resolver = .{ .gpa = gpa, .env = &env, .res = &no_flags, .diag = &diag };
     const verbose: Resolver = .{ .gpa = gpa, .env = &env, .res = &two_v, .diag = &diag };
     const mixed: Resolver = .{ .gpa = gpa, .env = &env, .res = &both, .diag = &diag };
-    var opts = ServerOptions{};
 
-    // Default is info, with nothing recorded.
-    try std.testing.expectEqual(cli_helper.Level.info, try resolveLogLevel(plain, &opts));
-    try std.testing.expectEqual(@as(?[]const u8, null), opts.invalid_log_level);
+    // Default is info, with nothing reported.
+    {
+        const got = try resolveLogLevel(plain);
+        try std.testing.expectEqual(cli_helper.Level.info, got.level);
+        try std.testing.expectEqual(@as(?[]const u8, null), got.report.invalid_log_level);
+    }
 
     // A valid env value is used, case-insensitively.
     try env.put("VLMZSD_LOG_LEVEL", "WaRn");
-    try std.testing.expectEqual(cli_helper.Level.warn, try resolveLogLevel(plain, &opts));
+    try std.testing.expectEqual(cli_helper.Level.warn, (try resolveLogLevel(plain)).level);
 
-    // An invalid env value is recorded (not fatal) and falls back to info.
+    // An invalid env value is reported (not fatal) and falls back to info.
     try env.put("VLMZSD_LOG_LEVEL", "loud");
-    opts.invalid_log_level = null;
-    try std.testing.expectEqual(cli_helper.Level.info, try resolveLogLevel(plain, &opts));
-    try std.testing.expectEqualStrings("loud", opts.invalid_log_level.?);
+    {
+        const got = try resolveLogLevel(plain);
+        try std.testing.expectEqual(cli_helper.Level.info, got.level);
+        try std.testing.expectEqualStrings("loud", got.report.invalid_log_level.?);
+    }
 
-    // The CLI overrides the env value, but the typo is still recorded.
-    opts.invalid_log_level = null;
-    try std.testing.expectEqual(cli_helper.Level.trace, try resolveLogLevel(verbose, &opts));
-    try std.testing.expectEqualStrings("loud", opts.invalid_log_level.?);
+    // The CLI overrides the env value, but the typo is still reported.
+    {
+        const got = try resolveLogLevel(verbose);
+        try std.testing.expectEqual(cli_helper.Level.trace, got.level);
+        try std.testing.expectEqualStrings("loud", got.report.invalid_log_level.?);
+    }
 
     // Any `-q` beats `-v`.
-    opts.invalid_log_level = null;
-    try std.testing.expectEqual(cli_helper.Level.warn, try resolveLogLevel(mixed, &opts));
+    try std.testing.expectEqual(cli_helper.Level.warn, (try resolveLogLevel(mixed)).level);
 
     // Deprecated booleans are the lowest-priority fallback; quiet beats verbose.
     _ = env.swapRemove("VLMZSD_LOG_LEVEL");
     try env.put("VLMZSD_VERBOSE", "true");
-    opts.invalid_log_level = null;
-    try std.testing.expectEqual(cli_helper.Level.debug, try resolveLogLevel(plain, &opts));
-    try std.testing.expect(opts.legacy_verbose_present);
-    try std.testing.expect(!opts.legacy_quiet_present);
+    {
+        const got = try resolveLogLevel(plain);
+        try std.testing.expectEqual(cli_helper.Level.debug, got.level);
+        try std.testing.expect(got.report.legacy_verbose_present);
+        try std.testing.expect(!got.report.legacy_quiet_present);
+    }
 }
 
 test "splitList returns an exactly-sized list and skips empty segments" {
@@ -1581,47 +1841,84 @@ test "splitList returns an exactly-sized list and skips empty segments" {
     try std.testing.expectEqualStrings("::", single[0]);
 }
 
+/// Parse `args` and resolve them against a private environment map, keeping the
+/// parsed result alive for the fixture's lifetime: the option strings may point
+/// into it.
+const ConfigFixture = struct {
+    gpa: Allocator,
+    env: EnvironMap,
+    res: cli_helper.Result,
+    diag: cli_helper.Diag = .{},
+
+    fn init(gpa: Allocator) !ConfigFixture {
+        return .{
+            .gpa = gpa,
+            .env = .init(gpa),
+            .res = try cli_helper.parse(gpa, &vlmzsd_opts, &.{}),
+        };
+    }
+
+    fn deinit(self: *ConfigFixture) void {
+        self.res.deinit();
+        self.env.deinit();
+    }
+
+    fn setEnv(self: *ConfigFixture, name: []const u8, value: []const u8) !void {
+        try self.env.put(name, value);
+    }
+
+    /// Replace the parsed arguments and return a resolver over them.
+    fn parse(self: *ConfigFixture, args: []const []const u8) !Resolver {
+        const fresh = try cli_helper.parse(self.gpa, &vlmzsd_opts, args);
+        self.res.deinit();
+        self.res = fresh;
+        return self.resolver();
+    }
+
+    fn resolver(self: *ConfigFixture) Resolver {
+        return .{ .gpa = self.gpa, .env = &self.env, .res = &self.res, .diag = &self.diag };
+    }
+
+    /// Parse and resolve in one step; the caller frees the result.
+    fn resolve(self: *ConfigFixture, args: []const []const u8) !Resolved {
+        return resolveOptions(try self.parse(args));
+    }
+};
+
 test "resolveOptions: env lists, numeric limits, and positional arguments" {
-    const gpa = std.testing.allocator;
-    var env: EnvironMap = .init(gpa);
-    defer env.deinit();
+    var fx = try ConfigFixture.init(std.testing.allocator);
+    defer fx.deinit();
 
     // A list with no address leaves the default in place.
-    try env.put("VLMZSD_LISTEN", " , ");
-    var default_listen = try cli_helper.parse(gpa, &vlmzsd_opts, &.{});
-    defer default_listen.deinit();
+    try fx.setEnv("VLMZSD_LISTEN", " , ");
     {
-        var diag: cli_helper.Diag = .{};
-        var opts = try resolveOptions(.{ .gpa = gpa, .env = &env, .res = &default_listen, .diag = &diag });
-        defer opts.deinit(gpa);
-        try std.testing.expectEqual(@as(usize, 1), opts.listen.len);
-        try std.testing.expectEqualStrings("::", opts.listen[0]);
+        var resolved = try fx.resolve(&.{});
+        defer resolved.deinit(fx.gpa);
+        try std.testing.expectEqual(@as(usize, 1), resolved.options.listen.len);
+        try std.testing.expectEqualStrings("::", resolved.options.listen[0]);
     }
 
     // Gaps and padding are trimmed away, and the result owns its allocation.
-    try env.put("VLMZSD_LISTEN", "127.0.0.1,, ::1");
+    try fx.setEnv("VLMZSD_LISTEN", "127.0.0.1,, ::1");
     {
-        var diag: cli_helper.Diag = .{};
-        var opts = try resolveOptions(.{ .gpa = gpa, .env = &env, .res = &default_listen, .diag = &diag });
-        defer opts.deinit(gpa);
-        try std.testing.expectEqual(@as(usize, 2), opts.listen.len);
-        try std.testing.expectEqualStrings("127.0.0.1", opts.listen[0]);
-        try std.testing.expectEqualStrings("::1", opts.listen[1]);
+        var resolved = try fx.resolve(&.{});
+        defer resolved.deinit(fx.gpa);
+        try std.testing.expectEqual(@as(usize, 2), resolved.options.listen.len);
+        try std.testing.expectEqualStrings("127.0.0.1", resolved.options.listen[0]);
+        try std.testing.expectEqualStrings("::1", resolved.options.listen[1]);
     }
-    _ = env.swapRemove("VLMZSD_LISTEN");
+    _ = fx.env.swapRemove("VLMZSD_LISTEN");
 
     // The documented limits are accepted ...
-    var limits = try cli_helper.parse(gpa, &vlmzsd_opts, &.{
-        "--lcid",                "32767",
-        "--build",               "65535",
-        "--timeout",             "4294967295s",
-        "--activation-interval", "4294967295m",
-    });
-    defer limits.deinit();
     {
-        var diag: cli_helper.Diag = .{};
-        var opts = try resolveOptions(.{ .gpa = gpa, .env = &env, .res = &limits, .diag = &diag });
-        defer opts.deinit(gpa);
+        var resolved = try fx.resolve(&.{
+            "--lcid",                "32767",
+            "--build",               "65535",
+            "--timeout",             "4294967295s",
+            "--activation-interval", "4294967295m",
+        });
+        defer resolved.deinit(fx.gpa);
+        const opts = resolved.options;
         try std.testing.expectEqual(kms.max_lcid, opts.lcid);
         try std.testing.expectEqual(kms.max_build, opts.build);
         try std.testing.expectEqual(std.math.maxInt(u32), opts.timeout_seconds);
@@ -1639,17 +1936,58 @@ test "resolveOptions: env lists, numeric limits, and positional arguments" {
         .{ .args = &.{"stray"}, .expected = error.UnexpectedPositional },
     };
     for (cases) |case| {
-        var res = try cli_helper.parse(gpa, &vlmzsd_opts, case.args);
-        defer res.deinit();
-        var diag: cli_helper.Diag = .{};
-        try std.testing.expectError(case.expected, resolveOptions(.{ .gpa = gpa, .env = &env, .res = &res, .diag = &diag }));
+        try std.testing.expectError(case.expected, resolveOptions(try fx.parse(case.args)));
     }
 }
 
+test "CLI list occurrences are copied, not borrowed from the parsed result" {
+    var fx = try ConfigFixture.init(std.testing.allocator);
+    defer fx.deinit();
+
+    // The parsed result is freed before the options are used, so a borrowed
+    // slice would dangle; the resolver copies the occurrences instead.
+    const resolver = try fx.parse(&.{ "--listen", "127.0.0.1", "--listen", "::1" });
+    const parsed_ptr = resolver.res.getAll("listen").ptr;
+    var resolved = try resolveOptions(resolver);
+    defer resolved.deinit(fx.gpa);
+    try std.testing.expectEqual(@as(usize, 2), resolved.options.listen.len);
+    try std.testing.expect(resolved.options.listen.ptr != parsed_ptr);
+    try std.testing.expectEqualStrings("::1", resolved.options.listen[1]);
+}
+
+test "the inverted flags read the positive environment variable" {
+    var fx = try ConfigFixture.init(std.testing.allocator);
+    defer fx.deinit();
+
+    // `--no-ndr64` and `--no-btfn` are fed by `VLMZSD_NDR64`/`VLMZSD_BTFN`,
+    // whose `false` turns the feature off.
+    try fx.setEnv("VLMZSD_NDR64", "false");
+    {
+        var resolved = try fx.resolve(&.{});
+        defer resolved.deinit(fx.gpa);
+        try std.testing.expect(!resolved.options.ndr64);
+        try std.testing.expect(resolved.options.btfn);
+    }
+    _ = fx.env.swapRemove("VLMZSD_NDR64");
+
+    // A bare `VLMZSD_BTFN` (empty value) is not a boolean: it is rejected and
+    // attributed to the variable, not to `--no-btfn`.
+    try fx.setEnv("VLMZSD_BTFN", "0");
+    {
+        var resolved = try fx.resolve(&.{"--no-ndr64"});
+        defer resolved.deinit(fx.gpa);
+        try std.testing.expect(!resolved.options.btfn);
+        try std.testing.expect(!resolved.options.ndr64);
+    }
+    try fx.setEnv("VLMZSD_BTFN", "nope");
+    try std.testing.expectError(error.InvalidBool, resolveOptions(try fx.parse(&.{})));
+    try std.testing.expectEqualStrings("VLMZSD_BTFN", fx.diag.spelling);
+    try std.testing.expectEqualStrings("nope", fx.diag.value);
+}
+
 test "--listen must be an IP literal, and a bad value names the option" {
-    const gpa = std.testing.allocator;
-    var env = EnvironMap.init(gpa);
-    defer env.deinit();
+    var fx = try ConfigFixture.init(std.testing.allocator);
+    defer fx.deinit();
 
     // An address with a port is the mistake the message is written for: the
     // port has its own option, and `ip:port` would otherwise fail at bind time
@@ -1660,50 +1998,33 @@ test "--listen must be an IP literal, and a bad value names the option" {
         .{ .args = &.{ "--listen", "::1", "--listen", "300.1.1.1" }, .spelling = "--listen", .value = "300.1.1.1" },
     };
     for (bad) |case| {
-        var res = try cli_helper.parse(gpa, &vlmzsd_opts, case.args);
-        defer res.deinit();
-        var diag: cli_helper.Diag = .{};
-        try std.testing.expectError(error.InvalidListenAddress, resolveOptions(.{ .gpa = gpa, .env = &env, .res = &res, .diag = &diag }));
-        try std.testing.expectEqualStrings(case.spelling, diag.spelling);
-        try std.testing.expectEqualStrings(case.value, diag.value);
+        try std.testing.expectError(error.InvalidListenAddress, resolveOptions(try fx.parse(case.args)));
+        try std.testing.expectEqualStrings(case.spelling, fx.diag.spelling);
+        try std.testing.expectEqualStrings(case.value, fx.diag.value);
     }
 
     // Literals the protocol uses are accepted, including a bare IPv6 address
     // whose colons are not a port separator.
-    var ok = try cli_helper.parse(gpa, &vlmzsd_opts, &.{ "--listen", "127.0.0.1", "--listen", "::1", "--listen", "::" });
-    defer ok.deinit();
-    var diag: cli_helper.Diag = .{};
-    var opts = try resolveOptions(.{ .gpa = gpa, .env = &env, .res = &ok, .diag = &diag });
-    defer opts.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 3), opts.listen.len);
+    var resolved = try fx.resolve(&.{ "--listen", "127.0.0.1", "--listen", "::1", "--listen", "::" });
+    defer resolved.deinit(fx.gpa);
+    try std.testing.expectEqual(@as(usize, 3), resolved.options.listen.len);
 }
 
 test "--port: a bad value names the CLI spelling or the environment variable" {
-    const gpa = std.testing.allocator;
-    var env = EnvironMap.init(gpa);
-    defer env.deinit();
+    var fx = try ConfigFixture.init(std.testing.allocator);
+    defer fx.deinit();
 
     // From the CLI: the flag as typed.
-    {
-        var res = try cli_helper.parse(gpa, &vlmzsd_opts, &.{ "--port", "abc" });
-        defer res.deinit();
-        var diag: cli_helper.Diag = .{};
-        try std.testing.expectError(error.InvalidCharacter, resolveOptions(.{ .gpa = gpa, .env = &env, .res = &res, .diag = &diag }));
-        try std.testing.expectEqualStrings("--port", diag.spelling);
-        try std.testing.expectEqualStrings("abc", diag.value);
-    }
+    try std.testing.expectError(error.InvalidCharacter, resolveOptions(try fx.parse(&.{ "--port", "abc" })));
+    try std.testing.expectEqualStrings("--port", fx.diag.spelling);
+    try std.testing.expectEqualStrings("abc", fx.diag.value);
 
     // From the environment: the variable name, so a supervisor's typo is
     // traceable to the file that set it.
-    try env.put("VLMZSD_PORT", "70000");
-    {
-        var res = try cli_helper.parse(gpa, &vlmzsd_opts, &.{});
-        defer res.deinit();
-        var diag: cli_helper.Diag = .{};
-        try std.testing.expectError(error.Overflow, resolveOptions(.{ .gpa = gpa, .env = &env, .res = &res, .diag = &diag }));
-        try std.testing.expectEqualStrings("VLMZSD_PORT", diag.spelling);
-        try std.testing.expectEqualStrings("70000", diag.value);
-    }
+    try fx.setEnv("VLMZSD_PORT", "70000");
+    try std.testing.expectError(error.Overflow, resolveOptions(try fx.parse(&.{})));
+    try std.testing.expectEqualStrings("VLMZSD_PORT", fx.diag.spelling);
+    try std.testing.expectEqualStrings("70000", fx.diag.value);
 }
 
 test "a repeated --epid name replaces the earlier override without leaking" {
@@ -1798,4 +2119,72 @@ test "an --epid entry with an empty ePID is ignored" {
         "03612-00000-000-000000-03-1033-19045.0000-0002023",
         overrides[0].?,
     );
+}
+
+// `createListenSockets` reports failures as a value, so the listen path is
+// testable without exiting the test runner: a loopback literal binds, and a
+// host name (not an IP literal) comes back with the address and the cause.
+test "createListenSockets binds a literal and reports a bad one" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var out_buf: [256]u8 = undefined;
+    var err_buf: [256]u8 = undefined;
+    var log = try cli_helper.Logger.init(gpa, io, &out_buf, &err_buf);
+    defer log.deinit(gpa);
+    const services: Services = .{ .gpa = gpa, .io = io, .log = &log };
+
+    var servers: std.ArrayList(Io.net.Server) = .empty;
+    defer {
+        for (servers.items) |*s| s.deinit(io);
+        servers.deinit(gpa);
+    }
+
+    const ok = ServerOptions{ .listen = &.{"127.0.0.1"}, .port = 0 };
+    try std.testing.expect((try createListenSockets(services, &ok, &servers)) == null);
+    try std.testing.expectEqual(@as(usize, 1), servers.items.len);
+
+    const bad = ServerOptions{ .listen = &.{"localhost"}, .port = 0 };
+    const failure = try createListenSockets(services, &bad, &servers);
+    try std.testing.expect(failure != null);
+    try std.testing.expectEqualStrings("localhost", failure.?.address.addr);
+}
+
+test "a dual-stack `::` listen falls back to IPv4 only for a missing IPv6 stack" {
+    // The one case a fallback helps: the host has no IPv6, so the default
+    // dual-stack socket cannot be created and IPv4-only is what is left.
+    try std.testing.expectEqualStrings("0.0.0.0", ipv4Fallback("::", error.AddressFamilyUnsupported).?);
+
+    // Everything else must be reported against the address that failed: a port
+    // already in use is not a stack problem, and an explicit IPv6 address is the
+    // operator's choice, not a default to second-guess.
+    try std.testing.expectEqual(@as(?[]const u8, null), ipv4Fallback("::", error.AddressInUse));
+    try std.testing.expectEqual(@as(?[]const u8, null), ipv4Fallback("::1", error.AddressFamilyUnsupported));
+    try std.testing.expectEqual(@as(?[]const u8, null), ipv4Fallback("127.0.0.1", error.AddressFamilyUnsupported));
+}
+
+test "--ip-protection levels select the two documented behaviours" {
+    // docs/cli.md §5 Activation policy: 1 listens on private addresses only, 2
+    // rejects public peers, 3 both — the levels are a bit set, not an enum.
+    try std.testing.expect(!listensOnPrivateOnly(0) and !rejectsPublicPeers(0));
+    try std.testing.expect(listensOnPrivateOnly(1) and !rejectsPublicPeers(1));
+    try std.testing.expect(!listensOnPrivateOnly(2) and rejectsPublicPeers(2));
+    try std.testing.expect(listensOnPrivateOnly(3) and rejectsPublicPeers(3));
+}
+
+test "an --epid list that resolves to nothing keeps the default and frees its backing" {
+    var fx = try ConfigFixture.init(std.testing.allocator);
+    defer fx.deinit();
+
+    // The variable is set but has no segment, so a zero-length list is
+    // allocated and then found empty: the default (no overrides) wins, and the
+    // allocation is still the backing's to free — the testing allocator fails
+    // the test if it is dropped.
+    try fx.setEnv("VLMZSD_EPID", " , ");
+    var resolved = try fx.resolve(&.{});
+    defer resolved.deinit(fx.gpa);
+    try std.testing.expectEqual(@as(usize, 0), resolved.options.epids.len);
+    try std.testing.expectEqual(@as(usize, 0), resolved.backing.epid.?.len);
 }
