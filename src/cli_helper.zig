@@ -1337,3 +1337,34 @@ test "loss is reported as an idle delta and as a final total" {
     try std.testing.expectEqual(@as(u64, 2), log.reported.truncated);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, err_writer.buffered(), "since the last report"));
 }
+
+test "loadKmsData names the step that failed" {
+    const gpa = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+
+    // An explicit path that cannot be read reports the path and the cause; there
+    // is nothing to free, so nothing can leak.
+    switch (loadKmsData(std.testing.io, gpa, &env, "/nonexistent/vlmcsd.kmd", "")) {
+        .loaded => return error.TestUnexpectedResult,
+        .failed => |why| switch (why) {
+            .data_file => |d| {
+                try std.testing.expectEqualStrings("/nonexistent/vlmcsd.kmd", d.path);
+                try std.testing.expectEqual(@as(anyerror, error.FileNotFound), d.err);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+    }
+}
+
+test "a loaded .kmd frees the buffer it read" {
+    const gpa = std.testing.allocator;
+
+    // `LoadedKmsData.deinit` is the only release point for `--data`; the testing
+    // allocator fails the test if it misses the buffer.
+    const bytes = try gpa.dupe(u8, "kms data");
+    var loaded: LoadedKmsData = .{ .raw = bytes, .owned = bytes, .source_path = "x.kmd" };
+    loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(?[]u8, null), loaded.owned);
+    try std.testing.expectEqual(@as([]const u8, &.{}), loaded.raw);
+}
