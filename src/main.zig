@@ -101,16 +101,68 @@ const vlmzsd_opts = [_]cli_helper.Opt{
 // Option resolution
 // ---------------------------------------------------------------------------
 
-/// Resolved server configuration (post three-tier precedence merge). Pure
-/// values: the list options point into the config arena (or at the process's
-/// own `argv`), which the owner of the arena keeps alive.
+/// A repeatable option's value, kept in the shape its source has it: the built-in
+/// default, the CLI occurrences, or the environment value as one comma-separated
+/// string. Nothing is copied and nothing is owned, so there is nothing to free.
+const ListSource = union(enum) {
+    default: []const []const u8,
+    /// Borrowed from the parsed `cli_helper.Result`.
+    cli: []const []const u8,
+    /// Borrowed from the environment map, split on commas as it is read.
+    env: []const u8,
+
+    /// The three shapes are unified here because Zig has no iterator interface:
+    /// std's iterators are concrete per-type `Iterator` structs with `next()`, so
+    /// runtime polymorphism is a tagged union of them.
+    fn iterator(self: ListSource) Iterator {
+        return switch (self) {
+            .default, .cli => |items| .{ .slice = .{ .items = items } },
+            .env => |text| .{ .env = std.mem.splitScalar(u8, text, ',') },
+        };
+    }
+
+    /// Yields the option's values in order. The environment shape is std's
+    /// `SplitIterator`; the slice shape needs its own cursor because std has no
+    /// iterator over a `[]const []const u8`. An environment value is trimmed
+    /// here, so its empty segments are skipped rather than stored.
+    const Iterator = union(enum) {
+        slice: Slice,
+        env: std.mem.SplitIterator(u8, .scalar),
+
+        const Slice = struct {
+            items: []const []const u8,
+            index: usize = 0,
+        };
+
+        fn next(self: *Iterator) ?[]const u8 {
+            switch (self.*) {
+                .slice => |*s| {
+                    if (s.index == s.items.len) return null;
+                    defer s.index += 1;
+                    return s.items[s.index];
+                },
+                .env => |*split| {
+                    while (split.next()) |segment| {
+                        const trimmed = std.mem.trim(u8, segment, " \t");
+                        if (trimmed.len > 0) return trimmed;
+                    }
+                    return null;
+                },
+            }
+        }
+    };
+};
+
+/// Resolved server configuration (post three-tier precedence merge). A plain
+/// value: the list options borrow the process's `argv`, the environment map and
+/// the parsed CLI result, all of which outlive it.
 const ServerOptions = struct {
     port: u16 = default_port,
-    listen: []const []const u8 = &.{"::"},
+    listen: ListSource = .{ .default = &.{"::"} },
     timeout_seconds: u32 = 30,
     max_clients: u32 = default_client_cap,
     data_file: ?[]const u8 = null,
-    epids: []const []const u8 = &.{},
+    epids: ListSource = .{ .default = &.{} },
     randomize: u8 = 1,
     lcid: u32 = 0,
     build: u32 = 0,
@@ -139,9 +191,8 @@ const ResolveReport = struct {
     legacy_quiet_present: bool = false,
 };
 
-/// What resolution produces. A plain value: the list options point into the
-/// resolver's allocator (the `Run`'s config arena), which the caller owns, so
-/// nothing here needs freeing.
+/// What resolution produces: the options and the notices for the logger. Both are
+/// plain values, so this needs no cleanup.
 const Resolution = struct {
     options: ServerOptions = .{},
     report: ResolveReport = .{},
@@ -157,7 +208,6 @@ const Resolution = struct {
 /// `docs/cli.md` documents) rather than written twice and drifting apart. The
 /// two "disable" flags invert the meaning and pass their variable explicitly.
 const Resolver = struct {
-    gpa: Allocator,
     env: *const EnvironMap,
     res: *const cli_helper.Result,
     diag: *cli_helper.Diag,
@@ -248,30 +298,17 @@ const Resolver = struct {
         };
     }
 
-    /// A repeatable option: CLI occurrences win, else the environment variable
-    /// split on commas, else `default`. `from_env` says which, so a rejected
-    /// value can be attributed to the right spelling.
-    fn list(self: Resolver, comptime name: []const u8, default: []const []const u8) !List {
+    /// A repeatable option: the CLI occurrences win, else the environment value
+    /// as one comma-separated string, else `default`. The chosen value is returned
+    /// as the source it came from, so nothing is copied.
+    fn list(self: Resolver, comptime name: []const u8, default: []const []const u8) ListSource {
         const cli = self.res.getAll(name);
-        if (cli.len > 0) {
-            // Copy the occurrences so the options never borrow the parsed
-            // result: resolution can then finish, and the result be freed, while
-            // the options stay valid. (The strings themselves are `argv`, which
-            // outlives everything here.)
-            return .{ .items = try self.gpa.dupe([]const u8, cli), .from_env = false };
-        }
-        const text = self.env.get(envSpelling(name)) orelse
-            return .{ .items = default, .from_env = false };
-        const items = try splitList(self.gpa, text);
+        if (cli.len > 0) return .{ .cli = cli };
+        const text = self.env.get(envSpelling(name)) orelse return .{ .default = default };
         // A value with no non-empty segment leaves the default in place.
-        if (items.len == 0) return .{ .items = default, .from_env = false };
-        return .{ .items = items, .from_env = true };
+        if (!hasSegment(text)) return .{ .default = default };
+        return .{ .env = text };
     }
-
-    const List = struct {
-        items: []const []const u8,
-        from_env: bool,
-    };
 };
 
 /// The log level is the one setting with no flag to derive an environment
@@ -328,32 +365,18 @@ fn resolveLogLevel(r: Resolver) !LogSetting {
     return .{ .level = .info, .report = report };
 }
 
-/// Split a comma-separated env-var value into a trimmed list. The returned
-/// slice is the whole allocation, so the caller can free it with the length it
-/// received. Empty and whitespace-only segments are skipped.
-fn splitList(gpa: Allocator, s: []const u8) ![]const []const u8 {
-    var count: usize = 0;
-    var scan = std.mem.splitScalar(u8, s, ',');
-    while (scan.next()) |item| {
-        if (std.mem.trim(u8, item, " \t").len > 0) count += 1;
-    }
-
-    const out = try gpa.alloc([]const u8, count);
-    var it = std.mem.splitScalar(u8, s, ',');
-    var i: usize = 0;
+/// True when a comma-separated value has at least one non-empty segment, i.e.
+/// when it says anything at all.
+fn hasSegment(text: []const u8) bool {
+    var it = std.mem.splitScalar(u8, text, ',');
     while (it.next()) |item| {
-        const trimmed = std.mem.trim(u8, item, " \t");
-        if (trimmed.len == 0) continue;
-        out[i] = trimmed;
-        i += 1;
+        if (std.mem.trim(u8, item, " \t").len > 0) return true;
     }
-    std.debug.assert(i == count);
-    return out;
+    return false;
 }
 
 /// Resolve every option into a `ServerOptions`. The whole configuration surface
-/// is the list below: one name and one default per option. List options are
-/// allocated with the resolver's allocator, which the caller owns.
+/// is the list below: one name and one default per option.
 fn resolveOptions(r: Resolver) !Resolution {
     // `vlmzsd` takes options only; a stray word is a mistyped flag value, not
     // something to ignore.
@@ -363,17 +386,20 @@ fn resolveOptions(r: Resolver) !Resolution {
     const opts = &out.options;
     opts.port = try r.int(u16, "port", default_port);
 
-    const listen = try r.list("listen", &.{"::"});
-    opts.listen = listen.items;
+    opts.listen = r.list("listen", &.{"::"});
     // Each entry must be an IP literal: the port has its own option, so a
     // value that parses only as `address:port` is a mistake to report here
     // rather than at bind time.
-    for (opts.listen) |addr| {
+    var listen_it = opts.listen.iterator();
+    while (listen_it.next()) |addr| {
         _ = Io.net.IpAddress.parse(addr, opts.port) catch {
-            r.reject(if (listen.from_env)
-                Resolver.envSpelling("listen")
-            else
-                Resolver.flagSpelling("listen"), addr);
+            // Name the source that supplied the bad value; the built-in default
+            // is a literal, so it can never land here.
+            r.reject(switch (opts.listen) {
+                .env => Resolver.envSpelling("listen"),
+                .cli => Resolver.flagSpelling("listen"),
+                .default => unreachable,
+            }, addr);
             return error.InvalidListenAddress;
         };
     }
@@ -382,8 +408,7 @@ fn resolveOptions(r: Resolver) !Resolution {
     opts.max_clients = try r.int(u32, "max-clients", default_client_cap);
     opts.data_file = r.str("data", null);
 
-    const epids = try r.list("epid", &.{});
-    opts.epids = epids.items;
+    opts.epids = r.list("epid", &.{});
 
     opts.randomize = try r.int(u8, "randomize", 1);
     opts.lcid = try r.int(u32, "lcid", 0);
@@ -454,7 +479,8 @@ fn buildEpidOverrides(
     @memset(overrides, null);
 
     // 1. `--epid <name>=<epid>` overrides.
-    for (opts.epids) |entry| {
+    var epid_it = opts.epids.iterator();
+    while (epid_it.next()) |entry| {
         const eq = std.mem.indexOfScalar(u8, entry, '=') orelse {
             log.warn("ignoring malformed --epid entry (expected name=epid): {s}", .{entry});
             continue;
@@ -923,7 +949,8 @@ fn createListenSockets(
             try servers.append(services.gpa, s);
         }
     } else {
-        for (opts.listen) |addr| {
+        var listen_it = opts.listen.iterator();
+        while (listen_it.next()) |addr| {
             const s = network.listen(services.io, addr, opts.port) catch |e| {
                 // A dual-stack listen on a host without IPv6 cannot work; the
                 // IPv4-only retry still serves every client.
@@ -1244,12 +1271,9 @@ const Run = struct {
     /// data-file search reads `HOME` from it.
     environ_map: *EnvironMap,
 
-    /// Storage for the resolved options' list values, released in `deinit` once
-    /// the connection group has joined. One owner for every allocation the
-    /// configuration needs, so no option field is freed on its own.
-    arena: std.heap.ArenaAllocator,
-    /// Resolved configuration; its list values point into `arena`. `ServerContext`
-    /// and every connection borrow it, so it outlives `conn_group`.
+    /// Resolved configuration; its list values borrow the parsed CLI result, the
+    /// environment map and `argv`. `ServerContext` and every connection borrow it,
+    /// so it outlives `conn_group`.
     opts: ServerOptions = .{},
     /// Configuration notices, logged by `startLogger` once the level is known.
     report: ResolveReport = .{},
@@ -1284,14 +1308,9 @@ const Run = struct {
     out_buf: [io_buffer_size]u8 = undefined,
     err_buf: [io_buffer_size]u8 = undefined,
 
-    /// Borrow the process handles and create the arena the options live in.
+    /// Borrow the process handles.
     fn new(gpa: Allocator, io: Io, environ_map: *EnvironMap) Run {
-        return .{
-            .gpa = gpa,
-            .io = io,
-            .environ_map = environ_map,
-            .arena = .init(gpa),
-        };
+        return .{ .gpa = gpa, .io = io, .environ_map = environ_map };
     }
 
     /// Build the process in startup order. A configuration error exits through
@@ -1317,15 +1336,10 @@ const Run = struct {
     }
 
     /// Resolve the option tiers into `opts`. A configuration error happens before
-    /// the logger exists, so it goes straight to stderr; the list values are
-    /// allocated in `arena`, which is why `opts` has no `deinit` of its own.
+    /// the logger exists, so it goes straight to stderr. `opts` keeps borrowing
+    /// `res` and `environ_map`, which `main` keeps alive past `deinit`.
     fn resolveConfig(self: *Run, res: *const cli_helper.Result, diag: *cli_helper.Diag) void {
-        const resolver: Resolver = .{
-            .gpa = self.arena.allocator(),
-            .env = self.environ_map,
-            .res = res,
-            .diag = diag,
-        };
+        const resolver: Resolver = .{ .env = self.environ_map, .res = res, .diag = diag };
         const resolution = resolveOptions(resolver) catch |e| reportOptionError(self.io, diag, e);
         self.opts = resolution.options;
         self.report = resolution.report;
@@ -1544,10 +1558,6 @@ const Run = struct {
             self.gpa.free(f.path);
             self.gpa.free(f.data);
         }
-        // The last borrow of the option lists is a connection task, and those
-        // have all ended above.
-        self.arena.deinit();
-
         if (self.log_started) {
             self.log.shutdown(self.io);
             self.log_group.cancel(self.io);
@@ -1757,9 +1767,9 @@ test "resolveLogLevel: CLI flags, VLMZSD_LOG_LEVEL, and invalid values" {
     var both = try cli_helper.parse(gpa, &vlmzsd_opts, &.{ "-vv", "-q" });
     defer both.deinit();
 
-    const plain: Resolver = .{ .gpa = gpa, .env = &env, .res = &no_flags, .diag = &diag };
-    const verbose: Resolver = .{ .gpa = gpa, .env = &env, .res = &two_v, .diag = &diag };
-    const mixed: Resolver = .{ .gpa = gpa, .env = &env, .res = &both, .diag = &diag };
+    const plain: Resolver = .{ .env = &env, .res = &no_flags, .diag = &diag };
+    const verbose: Resolver = .{ .env = &env, .res = &two_v, .diag = &diag };
+    const mixed: Resolver = .{ .env = &env, .res = &both, .diag = &diag };
 
     // Default is info, with nothing reported.
     {
@@ -1801,38 +1811,38 @@ test "resolveLogLevel: CLI flags, VLMZSD_LOG_LEVEL, and invalid values" {
     }
 }
 
-test "splitList returns an exactly-sized list and skips empty segments" {
-    const gpa = std.testing.allocator;
+test "ListSource yields a default, CLI occurrences, or split env segments" {
+    // The default and the CLI's already-split occurrences are yielded as given.
+    const defaults = ListSource{ .default = &.{ "::", "127.0.0.1" } };
+    var default_it = defaults.iterator();
+    try std.testing.expectEqualStrings("::", default_it.next().?);
+    try std.testing.expectEqualStrings("127.0.0.1", default_it.next().?);
+    try std.testing.expectEqual(@as(?[]const u8, null), default_it.next());
 
-    // The returned slice must be the whole allocation: `ServerOptions.deinit`
-    // frees it at the length it received, so a shorter sub-slice would free the
-    // wrong size. Empty segments make the two lengths differ.
-    const list = try splitList(gpa, " 127.0.0.1, ,::1 ,");
-    defer gpa.free(list);
-    try std.testing.expectEqual(@as(usize, 2), list.len);
-    try std.testing.expectEqualStrings("127.0.0.1", list[0]);
-    try std.testing.expectEqualStrings("::1", list[1]);
+    const cli = ListSource{ .cli = &.{"0.0.0.0"} };
+    var cli_it = cli.iterator();
+    try std.testing.expectEqualStrings("0.0.0.0", cli_it.next().?);
+    try std.testing.expectEqual(@as(?[]const u8, null), cli_it.next());
 
-    // A value with no address at all allocates nothing, so freeing it is a
-    // no-op instead of a leak.
-    const empty = try splitList(gpa, " , ");
-    defer gpa.free(empty);
-    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    // An environment value is split here: padding is trimmed and empty segments
+    // are skipped, so a reader only ever sees addresses.
+    const env = ListSource{ .env = " 127.0.0.1, ,::1 ," };
+    var env_it = env.iterator();
+    try std.testing.expectEqualStrings("127.0.0.1", env_it.next().?);
+    try std.testing.expectEqualStrings("::1", env_it.next().?);
+    try std.testing.expectEqual(@as(?[]const u8, null), env_it.next());
 
-    const single = try splitList(gpa, " :: ");
-    defer gpa.free(single);
-    try std.testing.expectEqual(@as(usize, 1), single.len);
-    try std.testing.expectEqualStrings("::", single[0]);
+    // A value with no segment says nothing, which is why `Resolver.list` keeps
+    // the built-in default instead of taking it.
+    try std.testing.expect(!hasSegment(" , "));
+    try std.testing.expect(hasSegment(" :: "));
 }
 
-/// Parse `args` and resolve them against a private environment map and arena,
-/// keeping the parsed result alive for the fixture's lifetime: the option strings
-/// may point into it.
+/// Parse `args` and resolve them against a private environment map, keeping the
+/// parsed result alive for the fixture's lifetime: the option values borrow it.
 const ConfigFixture = struct {
     gpa: Allocator,
     env: EnvironMap,
-    /// Where `resolve` allocates the list options, as `Run` does.
-    arena: std.heap.ArenaAllocator,
     res: cli_helper.Result,
     diag: cli_helper.Diag = .{},
 
@@ -1840,7 +1850,6 @@ const ConfigFixture = struct {
         return .{
             .gpa = gpa,
             .env = .init(gpa),
-            .arena = .init(gpa),
             .res = try cli_helper.parse(gpa, &vlmzsd_opts, &.{}),
         };
     }
@@ -1848,14 +1857,14 @@ const ConfigFixture = struct {
     fn deinit(self: *ConfigFixture) void {
         self.res.deinit();
         self.env.deinit();
-        self.arena.deinit();
     }
 
     fn setEnv(self: *ConfigFixture, name: []const u8, value: []const u8) !void {
         try self.env.put(name, value);
     }
 
-    /// Replace the parsed arguments and return a resolver over them.
+    /// Replace the parsed arguments and return a resolver over them. A value
+    /// resolved earlier borrows the previous result, so resolve after parsing.
     fn parse(self: *ConfigFixture, args: []const []const u8) !Resolver {
         const fresh = try cli_helper.parse(self.gpa, &vlmzsd_opts, args);
         self.res.deinit();
@@ -1864,14 +1873,23 @@ const ConfigFixture = struct {
     }
 
     fn resolver(self: *ConfigFixture) Resolver {
-        return .{ .gpa = self.arena.allocator(), .env = &self.env, .res = &self.res, .diag = &self.diag };
+        return .{ .env = &self.env, .res = &self.res, .diag = &self.diag };
     }
 
-    /// Parse and resolve in one step; the fixture frees the storage.
+    /// Parse and resolve in one step.
     fn resolve(self: *ConfigFixture, args: []const []const u8) !Resolution {
         return resolveOptions(try self.parse(args));
     }
 };
+
+/// The values a `ListSource` yields, collected for an assertion.
+fn listValues(gpa: Allocator, source: ListSource) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(gpa);
+    var it = source.iterator();
+    while (it.next()) |value| try out.append(gpa, value);
+    return out.toOwnedSlice(gpa);
+}
 
 test "resolveOptions: env lists, numeric limits, and positional arguments" {
     var fx = try ConfigFixture.init(std.testing.allocator);
@@ -1881,17 +1899,22 @@ test "resolveOptions: env lists, numeric limits, and positional arguments" {
     try fx.setEnv("VLMZSD_LISTEN", " , ");
     {
         const resolved = try fx.resolve(&.{});
-        try std.testing.expectEqual(@as(usize, 1), resolved.options.listen.len);
-        try std.testing.expectEqualStrings("::", resolved.options.listen[0]);
+        const values = try listValues(fx.gpa, resolved.options.listen);
+        defer fx.gpa.free(values);
+        try std.testing.expectEqual(@as(usize, 1), values.len);
+        try std.testing.expectEqualStrings("::", values[0]);
     }
 
-    // Gaps and padding are trimmed away, and the result owns its allocation.
+    // Gaps and padding are trimmed away, and the value stays a borrowed string.
     try fx.setEnv("VLMZSD_LISTEN", "127.0.0.1,, ::1");
     {
         const resolved = try fx.resolve(&.{});
-        try std.testing.expectEqual(@as(usize, 2), resolved.options.listen.len);
-        try std.testing.expectEqualStrings("127.0.0.1", resolved.options.listen[0]);
-        try std.testing.expectEqualStrings("::1", resolved.options.listen[1]);
+        try std.testing.expectEqualStrings("127.0.0.1,, ::1", resolved.options.listen.env);
+        const values = try listValues(fx.gpa, resolved.options.listen);
+        defer fx.gpa.free(values);
+        try std.testing.expectEqual(@as(usize, 2), values.len);
+        try std.testing.expectEqualStrings("127.0.0.1", values[0]);
+        try std.testing.expectEqualStrings("::1", values[1]);
     }
     _ = fx.env.swapRemove("VLMZSD_LISTEN");
 
@@ -1925,18 +1948,19 @@ test "resolveOptions: env lists, numeric limits, and positional arguments" {
     }
 }
 
-test "CLI list occurrences are copied, not borrowed from the parsed result" {
+test "a CLI list value borrows the parsed occurrences instead of copying them" {
     var fx = try ConfigFixture.init(std.testing.allocator);
     defer fx.deinit();
 
-    // The parsed result is freed before the options are used, so a borrowed
-    // slice would dangle; the resolver copies the occurrences instead.
+    // No copy and no allocation: the value points at the parsed result's own
+    // array, which is why the result must outlive the options.
     const resolver = try fx.parse(&.{ "--listen", "127.0.0.1", "--listen", "::1" });
-    const parsed_ptr = resolver.res.getAll("listen").ptr;
+    const parsed = resolver.res.getAll("listen");
     const resolved = try resolveOptions(resolver);
-    try std.testing.expectEqual(@as(usize, 2), resolved.options.listen.len);
-    try std.testing.expect(resolved.options.listen.ptr != parsed_ptr);
-    try std.testing.expectEqualStrings("::1", resolved.options.listen[1]);
+    try std.testing.expectEqualStrings("cli", @tagName(resolved.options.listen));
+    try std.testing.expectEqual(parsed.ptr, resolved.options.listen.cli.ptr);
+    try std.testing.expectEqual(@as(usize, 2), parsed.len);
+    try std.testing.expectEqualStrings("::1", parsed[1]);
 }
 
 test "the inverted flags read the positive environment variable" {
@@ -1988,7 +2012,9 @@ test "--listen must be an IP literal, and a bad value names the option" {
     // Literals the protocol uses are accepted, including a bare IPv6 address
     // whose colons are not a port separator.
     const resolved = try fx.resolve(&.{ "--listen", "127.0.0.1", "--listen", "::1", "--listen", "::" });
-    try std.testing.expectEqual(@as(usize, 3), resolved.options.listen.len);
+    const values = try listValues(fx.gpa, resolved.options.listen);
+    defer fx.gpa.free(values);
+    try std.testing.expectEqual(@as(usize, 3), values.len);
 }
 
 test "--port: a bad value names the CLI spelling or the environment variable" {
@@ -2085,7 +2111,7 @@ test "an --epid entry with an empty ePID is ignored" {
 
     var opts = ServerOptions{};
     opts.randomize = 0;
-    opts.epids = &.{ "Windows=", "Windows=03612-00000-000-000000-03-1033-19045.0000-0002023" };
+    opts.epids = .{ .default = &.{ "Windows=", "Windows=03612-00000-000-000000-03-1033-19045.0000-0002023" } };
 
     var prng: std.Random.DefaultPrng = .init(0x5eed);
     const overrides = try buildEpidOverrides(gpa, &data, &opts, prng.random(), 1_700_000_000, &log);
@@ -2110,9 +2136,6 @@ test "a Run that never started can be deinited" {
     defer environ_map.deinit();
 
     var run: Run = .new(std.testing.allocator, std.testing.io, &environ_map);
-    // The arena is the one resource `new` creates, so give it something to free:
-    // the testing allocator fails the test if `deinit` misses it.
-    _ = try run.arena.allocator().alloc(u8, 16);
     run.deinit();
 }
 
@@ -2134,11 +2157,11 @@ test "createListenSockets binds a literal and reports a bad one" {
         servers.deinit(gpa);
     }
 
-    const ok = ServerOptions{ .listen = &.{"127.0.0.1"}, .port = 0 };
+    const ok = ServerOptions{ .listen = .{ .default = &.{"127.0.0.1"} }, .port = 0 };
     try std.testing.expect((try createListenSockets(services, &ok, &servers)) == null);
     try std.testing.expectEqual(@as(usize, 1), servers.items.len);
 
-    const bad = ServerOptions{ .listen = &.{"localhost"}, .port = 0 };
+    const bad = ServerOptions{ .listen = .{ .default = &.{"localhost"} }, .port = 0 };
     const failure = try createListenSockets(services, &bad, &servers);
     try std.testing.expect(failure != null);
     try std.testing.expectEqualStrings("localhost", failure.?.address.addr);
@@ -2170,9 +2193,10 @@ test "an --epid list that resolves to nothing keeps the default" {
     var fx = try ConfigFixture.init(std.testing.allocator);
     defer fx.deinit();
 
-    // The variable is set but has no segment, so the split yields nothing and
-    // the default (no overrides) wins.
+    // The variable is set but says nothing, so the default (no overrides) wins
+    // and nothing is allocated to hold it.
     try fx.setEnv("VLMZSD_EPID", " , ");
     const resolved = try fx.resolve(&.{});
-    try std.testing.expectEqual(@as(usize, 0), resolved.options.epids.len);
+    try std.testing.expectEqualStrings("default", @tagName(resolved.options.epids));
+    try std.testing.expectEqual(@as(usize, 0), resolved.options.epids.default.len);
 }
