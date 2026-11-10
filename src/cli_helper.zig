@@ -285,6 +285,63 @@ pub fn writeHelp(writer: *std.Io.Writer, prog: []const u8, opts: []const Opt, po
     }
 }
 
+/// The program-specific parts of the shared CLI preamble. Everything else —
+/// argv collection, parsing, `--help`, `--version` — is identical in the three
+/// binaries, so it lives in `parseProcess`.
+pub const Program = struct {
+    /// Name in the usage line and in `error:` lines.
+    name: []const u8,
+    /// Version string printed by `--version` (from `build_options`).
+    version_display: []const u8,
+    /// Positional shown in the usage line, e.g. `[HOST[:PORT]]`; may be empty.
+    positional_hint: []const u8 = "",
+    /// Text appended after the option table in `--help`: the notes a program has
+    /// beyond its options (`kmdconv` documents its input/output rules there).
+    extra_help: []const u8 = "",
+};
+
+/// The `--help` rendering is the one place the preamble writes more than a line;
+/// one page covers every program's table plus its notes.
+const help_buffer_size = 4096;
+
+/// Collect the process arguments, parse them against `opts`, and handle
+/// `--help`/`--version`. Returns null when `main` should return immediately: the
+/// requested text is written and flushed. Otherwise the parsed result, which the
+/// caller must `deinit`.
+pub fn parseProcess(init: std.process.Init, opts: []const Opt, prog: Program) !?Result {
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(init.gpa);
+    var it: std.process.Args.Iterator = .init(init.minimal.args);
+    _ = it.skip(); // argv[0]
+    while (it.next()) |arg| try args.append(init.gpa, arg);
+
+    var diag: Diag = .{};
+    var res = parseWithDiag(init.gpa, opts, args.items, &diag) catch |err| {
+        // Short diagnostic naming the argument; the full help is one `--help` away.
+        var ebuf: [128]u8 = undefined;
+        fatalStderrOf(init.io, prog.name, "{s}", .{parseErrorMessage(err, diag, &ebuf)});
+    };
+
+    if (res.hasFlag("help")) {
+        defer res.deinit();
+        var buf: [help_buffer_size]u8 = undefined;
+        var w = std.Io.File.writer(std.Io.File.stdout(), init.io, &buf);
+        try writeHelp(&w.interface, prog.name, opts, prog.positional_hint);
+        try w.interface.writeAll(prog.extra_help);
+        try w.interface.flush();
+        return null;
+    }
+    if (res.hasFlag("version")) {
+        defer res.deinit();
+        var buf: [64]u8 = undefined;
+        var w = std.Io.File.writer(std.Io.File.stdout(), init.io, &buf);
+        try w.interface.print("{s} {s}\n", .{ prog.name, prog.version_display });
+        try w.interface.flush();
+        return null;
+    }
+    return res;
+}
+
 /// Parse `<n><unit>` into seconds. Units: `s`/`m`/`h`/`d`/`w`.
 /// Examples: `30s`, `2h`, `7d`, `90m`. A bare `0` is accepted as "disabled",
 /// which is how `--timeout 0` is documented for both binaries.
@@ -655,9 +712,15 @@ pub const Logger = struct {
 /// `Logger`: the line would be queued with nobody to drain it, since the queue's
 /// only consumer is the writer task that is missing.
 pub fn fatalStderr(io: Io, comptime program: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
+    fatalStderrOf(io, program, fmt, args);
+}
+
+/// `fatalStderr` for a program name that is only known at runtime (`parseProcess`
+/// takes it from its `Program`).
+pub fn fatalStderrOf(io: Io, program: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
     var buf: [256]u8 = undefined;
     var w = std.Io.File.writer(std.Io.File.stderr(), io, &buf);
-    w.interface.print(program ++ ": error: " ++ fmt ++ "\n", args) catch {};
+    w.interface.print("{s}: error: " ++ fmt ++ "\n", .{program} ++ args) catch {};
     w.interface.flush() catch {};
     std.process.exit(1);
 }
@@ -775,6 +838,65 @@ pub fn loadFhsKmd(io: Io, gpa: Allocator, environ_map: *const std.process.Enviro
         }
     }
     return null;
+}
+
+/// The `.kmd` bytes a program will use, plus ownership of whatever had to be
+/// read to get them.
+pub const LoadedKmsData = struct {
+    /// The bytes; the embedded default is borrowed from the binary.
+    raw: []const u8 = &.{},
+    /// The `--data` file's contents, when that is where `raw` came from.
+    owned: ?[]u8 = null,
+    /// The FHS file, when that is where `raw` came from.
+    fhs: ?FhsKmd = null,
+    /// Where `raw` came from, for the "loaded from" line; null = embedded.
+    source_path: ?[]const u8 = null,
+
+    pub fn deinit(self: *LoadedKmsData, gpa: Allocator) void {
+        if (self.owned) |bytes| gpa.free(bytes);
+        if (self.fhs) |*f| {
+            gpa.free(f.path);
+            gpa.free(f.data);
+        }
+        self.* = .{};
+    }
+};
+
+/// Which step of the search failed, so each program keeps its own wording.
+pub const LoadFailure = union(enum) {
+    /// `--data` was given and could not be read.
+    data_file: struct { path: []const u8, err: anyerror },
+    /// The FHS/XDG search errored (a missing file is `null`, not an error).
+    fhs: anyerror,
+    /// No `--data`, nothing on disk, and this binary has no embedded data.
+    no_data,
+};
+
+pub const LoadResult = union(enum) {
+    loaded: LoadedKmsData,
+    failed: LoadFailure,
+};
+
+/// The `.kmd` bytes to use: the explicit path, else the FHS/XDG search, else
+/// `embedded`. Every failure is a value, so the caller decides the message and
+/// the exit status; the search order itself exists here once.
+pub fn loadKmsData(
+    io: Io,
+    gpa: Allocator,
+    environ_map: *const std.process.Environ.Map,
+    explicit: ?[]const u8,
+    embedded: []const u8,
+) LoadResult {
+    if (explicit) |path| {
+        const bytes = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, gpa, .unlimited) catch |e|
+            return .{ .failed = .{ .data_file = .{ .path = path, .err = e } } };
+        return .{ .loaded = .{ .raw = bytes, .owned = bytes, .source_path = path } };
+    }
+    const fhs = loadFhsKmd(io, gpa, environ_map) catch |e|
+        return .{ .failed = .{ .fhs = e } };
+    if (fhs) |f| return .{ .loaded = .{ .raw = f.data, .fhs = f, .source_path = f.path } };
+    if (embedded.len == 0) return .{ .failed = .no_data };
+    return .{ .loaded = .{ .raw = embedded } };
 }
 
 /// Return the alphabetically greatest `*.kmd` file name in `dir`, or null when

@@ -966,37 +966,14 @@ fn listProducts(data: *const kmsdata.KmsData, out: *Output) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    // Collect the raw arguments (skip argv[0]).
-    var args_list: std.ArrayList([]const u8) = .empty;
-    defer args_list.deinit(init.gpa);
-    var args_iter: std.process.Args.Iterator = .init(init.minimal.args);
-    _ = args_iter.skip();
-    while (args_iter.next()) |arg| {
-        try args_list.append(init.gpa, arg);
-    }
-
-    var diag: cli_helper.Diag = .{};
-    var res = cli_helper.parseWithDiag(init.gpa, &vlmzs_opts, args_list.items, &diag) catch |err| {
-        // Short diagnostic naming the argument; the full help is one `--help` away.
-        var ebuf: [128]u8 = undefined;
-        cli_helper.fatalStderr(init.io, "vlmzs", "{s}", .{cli_helper.parseErrorMessage(err, diag, &ebuf)});
+    const prog: cli_helper.Program = .{
+        .name = "vlmzs",
+        .version_display = version_display,
+        .positional_hint = "[HOST[:PORT]]",
     };
+    var res = (try cli_helper.parseProcess(init, &vlmzs_opts, prog)) orelse return;
     defer res.deinit();
-
-    if (res.hasFlag("help")) {
-        var hbuf: [4096]u8 = undefined;
-        var hw = std.Io.File.writer(std.Io.File.stdout(), init.io, &hbuf);
-        try cli_helper.writeHelp(&hw.interface, "vlmzs", &vlmzs_opts, "[HOST[:PORT]]");
-        try hw.interface.flush();
-        return;
-    }
-    if (res.hasFlag("version")) {
-        var buf: [64]u8 = undefined;
-        var fw = std.Io.File.writer(std.Io.File.stdout(), init.io, &buf);
-        try fw.interface.print("vlmzs {s}\n", .{version_display});
-        try fw.interface.flush();
-        return;
-    }
+    var diag: cli_helper.Diag = .{};
 
     var out_buf: [4096]u8 = undefined;
     var err_buf: [4096]u8 = undefined;
@@ -1019,38 +996,19 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
-    // Load the KMS data: explicit path (--data) → FHS/XDG search → embedded
-    // default.
-    var kmd_owned = false;
-    var kmd_raw: []const u8 = undefined;
-    var fhs_loaded: ?cli_helper.FhsKmd = null;
-    defer if (fhs_loaded) |*f| {
-        init.gpa.free(f.path);
-        init.gpa.free(f.data);
+    // `--data` → FHS/XDG search → embedded default; the order is the helper's,
+    // the wording and the exit are this binary's.
+    var loaded = switch (cli_helper.loadKmsData(init.io, init.gpa, init.environ_map, opts.data_file, embedded_kmd)) {
+        .loaded => |l| l,
+        .failed => |why| switch (why) {
+            .data_file => |d| fatal(&out, "error: failed to read data file {s}: {s}\n", .{ d.path, @errorName(d.err) }),
+            .fhs => |e| fatal(&out, "error: failed to read FHS data file: {s}\n", .{@errorName(e)}),
+            .no_data => fatal(&out, "error: no KMS data found; specify --data <file>\n", .{}),
+        },
     };
-    if (opts.data_file) |path| {
-        kmd_raw = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, path, init.gpa, .unlimited) catch |e| {
-            out.eprint("error: failed to read data file {s}: {s}\n", .{ path, @errorName(e) });
-            std.process.exit(1);
-        };
-        kmd_owned = true;
-    } else {
-        fhs_loaded = cli_helper.loadFhsKmd(init.io, init.gpa, init.environ_map) catch |e| {
-            out.eprint("error: failed to read FHS data file: {s}\n", .{@errorName(e)});
-            std.process.exit(1);
-        };
-        if (fhs_loaded) |*f| {
-            kmd_raw = f.data;
-        } else if (embedded_kmd.len > 0) {
-            kmd_raw = embedded_kmd;
-        } else {
-            out.eprint("error: no KMS data found; specify --data <file>\n", .{});
-            std.process.exit(1);
-        }
-    }
-    defer if (kmd_owned) init.gpa.free(@constCast(kmd_raw));
+    defer loaded.deinit(init.gpa);
 
-    var data = kmsdata.parse(init.gpa, kmd_raw) catch |e| {
+    var data = kmsdata.parse(init.gpa, loaded.raw) catch |e| {
         out.eprint("error: invalid KMS data: {s}\n", .{@errorName(e)});
         std.process.exit(1);
     };

@@ -1300,9 +1300,9 @@ const Run = struct {
     conn_group: Io.Group = .init,
     signals_installed: bool = false,
 
-    /// Allocator-owned resources that outlive the phase that created them.
-    fhs: ?cli_helper.FhsKmd = null,
-    kmd_owned: ?[]u8 = null,
+    /// The `.kmd` bytes and whatever had to be read to get them; released in
+    /// `deinit` once the data parsed from them is gone.
+    kms: cli_helper.LoadedKmsData = .{},
 
     /// Backing for `log`, owned here so the pointers stay with the struct.
     out_buf: [io_buffer_size]u8 = undefined,
@@ -1373,32 +1373,26 @@ const Run = struct {
         if (self.report.legacy_quiet_present) self.log.warn("{s} is deprecated; use {s} instead", .{ deprecated_quiet_env, log_level_env });
     }
 
-    /// Load the KMS data: explicit path (`--data` / `VLMZSD_DATA`) → FHS/XDG
-    /// search → embedded default.
+    /// Load the KMS data: `--data` / `VLMZSD_DATA` → FHS/XDG search → embedded
+    /// default (the order is `cli_helper.loadKmsData`'s; only the wording and the
+    /// exit are this binary's).
     fn loadKmsData(self: *Run) void {
-        var loaded_from: ?[]const u8 = null; // null = embedded
-        if (self.opts.data_file) |path| {
-            self.kmd_owned = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), self.io, path, self.gpa, .unlimited) catch |e| {
-                fatal(&self.log, self.io, "failed to read data file {s}: {s}", .{ path, @errorName(e) });
-            };
-            loaded_from = path;
-        } else {
-            self.fhs = cli_helper.loadFhsKmd(self.io, self.gpa, self.environ_map) catch |e| {
-                fatal(&self.log, self.io, "failed to read FHS data file: {s}", .{@errorName(e)});
-            };
-            if (self.fhs) |*f| loaded_from = f.path;
-        }
-        const kmd_raw: []const u8 = if (self.kmd_owned) |raw| raw else if (self.fhs) |f| f.data else blk: {
-            if (embedded_kmd.len == 0) fatal(&self.log, self.io, "no KMS data found; specify --data <file>", .{});
-            break :blk embedded_kmd;
+        const kms_data = cli_helper.loadKmsData(self.io, self.gpa, self.environ_map, self.opts.data_file, embedded_kmd);
+        self.kms = switch (kms_data) {
+            .loaded => |loaded| loaded,
+            .failed => |why| switch (why) {
+                .data_file => |d| fatal(&self.log, self.io, "failed to read data file {s}: {s}", .{ d.path, @errorName(d.err) }),
+                .fhs => |e| fatal(&self.log, self.io, "failed to read FHS data file: {s}", .{@errorName(e)}),
+                .no_data => fatal(&self.log, self.io, "no KMS data found; specify --data <file>", .{}),
+            },
         };
 
-        self.data = kmsdata.parse(self.gpa, kmd_raw) catch |e| {
+        self.data = kmsdata.parse(self.gpa, self.kms.raw) catch |e| {
             fatal(&self.log, self.io, "invalid KMS data: {s}", .{@errorName(e)});
         };
         self.data_ready = true;
 
-        if (loaded_from) |path| {
+        if (self.kms.source_path) |path| {
             self.log.info("loaded KMS data from {s}", .{path});
         } else {
             self.log.debug("using embedded KMS data", .{});
@@ -1553,11 +1547,7 @@ const Run = struct {
         for (self.epid_overrides) |slot| if (slot) |s| self.gpa.free(s);
         if (self.epid_ready) self.gpa.free(self.epid_overrides);
         if (self.data_ready) self.data.deinit(self.gpa);
-        if (self.kmd_owned) |raw| self.gpa.free(raw);
-        if (self.fhs) |*f| {
-            self.gpa.free(f.path);
-            self.gpa.free(f.data);
-        }
+        self.kms.deinit(self.gpa);
         if (self.log_started) {
             self.log.shutdown(self.io);
             self.log_group.cancel(self.io);
@@ -1593,37 +1583,10 @@ fn reportOptionError(io: Io, diag: *const cli_helper.Diag, err: anyerror) noretu
 }
 
 pub fn main(init: std.process.Init) !void {
-    var args_list: std.ArrayList([]const u8) = .empty;
-    defer args_list.deinit(init.gpa);
-    var args_iter: std.process.Args.Iterator = .init(init.minimal.args);
-    // Collect the raw arguments (skip argv[0]).
-    _ = args_iter.skip();
-    while (args_iter.next()) |arg| {
-        try args_list.append(init.gpa, arg);
-    }
-
-    var diag: cli_helper.Diag = .{};
-    var res = cli_helper.parseWithDiag(init.gpa, &vlmzsd_opts, args_list.items, &diag) catch |err| {
-        // Short diagnostic naming the argument; the full help is one `--help` away.
-        var ebuf: [128]u8 = undefined;
-        cli_helper.fatalStderr(init.io, "vlmzsd", "{s}", .{cli_helper.parseErrorMessage(err, diag, &ebuf)});
-    };
+    const prog: cli_helper.Program = .{ .name = "vlmzsd", .version_display = version_display };
+    var res = (try cli_helper.parseProcess(init, &vlmzsd_opts, prog)) orelse return;
     defer res.deinit();
-
-    if (res.hasFlag("help")) {
-        var hbuf: [io_buffer_size]u8 = undefined;
-        var hw = std.Io.File.writer(std.Io.File.stdout(), init.io, &hbuf);
-        try cli_helper.writeHelp(&hw.interface, "vlmzsd", &vlmzsd_opts, "");
-        try hw.interface.flush();
-        return;
-    }
-    if (res.hasFlag("version")) {
-        var buf: [64]u8 = undefined;
-        var fw = std.Io.File.writer(std.Io.File.stdout(), init.io, &buf);
-        try fw.interface.print("vlmzsd {s}\n", .{version_display});
-        try fw.interface.flush();
-        return;
-    }
+    var diag: cli_helper.Diag = .{};
 
     var run: Run = .new(init.gpa, init.io, init.environ_map);
     defer run.deinit();

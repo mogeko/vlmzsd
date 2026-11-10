@@ -27,19 +27,18 @@ const opts_table = [_]cli_helper.Opt{
     .{ .name = "output", .short = 'o', .kind = .str, .hint = "file", .group = "Options", .desc = "write output to <file> (default: derived)" },
 };
 
-fn writeHelp(w: *std.Io.Writer) !void {
-    try cli_helper.writeHelp(w, "kmdconv", &opts_table, "<file>");
-    try w.print(
-        \\
-        \\Convert between the `.kmd` binary data format and JSON.
-        \\
-        \\Notes:
-        \\  <file>       input JSON file (or a `.kmd` file with -r); `-` reads stdin
-        \\  no -o        written in the current directory as <stem>.<suffix>:
-        \\               `data.json` -> `data.kmd`, `data.kmd` -> `data.json`
-        \\
-    , .{});
-}
+/// The notes printed under the shared option table: `kmdconv` inputs and outputs
+/// need more explanation than an option's one-line description.
+const help_notes =
+    \\
+    \\Convert between the `.kmd` binary data format and JSON.
+    \\
+    \\Notes:
+    \\  <file>       input JSON file (or a `.kmd` file with -r); `-` reads stdin
+    \\  no -o        written in the current directory as <stem>.<suffix>:
+    \\               `data.json` -> `data.kmd`, `data.kmd` -> `data.json`
+    \\
+;
 
 /// Report a fatal error on stderr and exit with status 1.
 fn fatal(io: Io, comptime fmt: []const u8, args: anytype) noreturn {
@@ -74,33 +73,14 @@ fn readStdin(io: Io, gpa: Allocator) ![]u8 {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var args: std.ArrayList([]const u8) = .empty;
-    defer args.deinit(init.gpa);
-    var it: std.process.Args.Iterator = .init(init.minimal.args);
-    _ = it.skip();
-    while (it.next()) |a| try args.append(init.gpa, a);
-
-    var diag: cli_helper.Diag = .{};
-    var res = cli_helper.parseWithDiag(init.gpa, &opts_table, args.items, &diag) catch |err| {
-        var ebuf: [128]u8 = undefined;
-        fatal(init.io, "kmdconv: error: {s}\n", .{cli_helper.parseErrorMessage(err, diag, &ebuf)});
+    const prog: cli_helper.Program = .{
+        .name = "kmdconv",
+        .version_display = version_display,
+        .positional_hint = "<file>",
+        .extra_help = help_notes,
     };
+    var res = (try cli_helper.parseProcess(init, &opts_table, prog)) orelse return;
     defer res.deinit();
-
-    if (res.hasFlag("help")) {
-        var hbuf: [2048]u8 = undefined;
-        var hw = std.Io.File.writer(std.Io.File.stdout(), init.io, &hbuf);
-        try writeHelp(&hw.interface);
-        try hw.interface.flush();
-        return;
-    }
-    if (res.hasFlag("version")) {
-        var vbuf: [64]u8 = undefined;
-        var vw = std.Io.File.writer(std.Io.File.stdout(), init.io, &vbuf);
-        try vw.interface.print("kmdconv {s}\n", .{version_display});
-        try vw.interface.flush();
-        return;
-    }
 
     // Exactly one positional: the input file, or `-` for stdin.
     if (res.positionals.items.len == 0) {

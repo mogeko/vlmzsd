@@ -37,7 +37,7 @@ repo. See `docs/migration.md` for the protocol byte layouts and algorithm consta
 | Network | `src/network.zig` | `std.Io` sockets: server loop, client connect (DNS), private-IP detection |
 | Server | `src/main.zig` | `vlmzsd` CLI, `Run` (startup → serve → `deinit`, owning the resolved options and the loaded data), and the accept loop that dispatches `Io.Group` tasks onto the `std.Io.Threaded` pool |
 | Client | `src/vlmzs.zig` | `vlmzs` activation client |
-| Shared | `src/cli_helper.zig` | data-driven CLI parser (Opt table → parse/help/validate), value parsers (duration/bool/GUID), timestamped logger |
+| Shared | `src/cli_helper.zig` | data-driven CLI parser (Opt table → parse/help/validate) and the shared process preamble (`parseProcess`: argv → parse → `--help`/`--version`), `.kmd` resolution (`loadKmsData`: `--data` → FHS search → embedded), value parsers (duration/bool/GUID), timestamped logger |
 | Log queue | `src/mpsc_queue.zig` | lock-free bounded lossy MPSC ring after Vyukov (`Queue(T, capacity)`): reserve/publish on a per-cell sequence, a monotonic drop total, and a counter-based `awaitWork`/`close`. The logger instantiates it with its own slot type and depth. |
 | Tests | `src/testutil.zig` | byte-compare / hex-diff helpers |
 
