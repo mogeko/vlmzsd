@@ -48,8 +48,8 @@ const max_listen_sockets = 64;
 const select_slots = max_listen_sockets + 2;
 
 /// One page, the buffer size of every long-lived stream in the process: the log
-/// sinks, the serve read-ahead and write buffers, and the `--help` rendering.
-const io_buffer_size = 4096;
+/// sinks, the serve read-ahead and write buffers. Shared with the other binaries.
+const io_buffer_size = cli_helper.io_buffer_size;
 
 /// Longest decimal PID string (generous upper bound).
 const pid_str_buffer_size = 16;
@@ -73,11 +73,11 @@ const vlmzsd_opts = [_]cli_helper.Opt{
     .{ .name = "help", .short = 'h', .group = "General", .desc = "Display this help and exit" },
     .{ .name = "version", .short = 'V', .group = "General", .desc = "Output version information and exit" },
     .{ .name = "port", .short = 'p', .kind = .int, .hint = "u16", .group = "Network", .desc = "TCP listen port (default 1688)" },
-    .{ .name = "listen", .short = 'L', .kind = .str, .hint = "addr", .group = "Network", .desc = "Listen address, repeatable (default ::, dual-stack)", .repeatable = true },
+    .{ .name = "listen", .short = 'L', .kind = .str, .hint = "addr", .group = "Network", .desc = "Listen address, repeatable (default ::, dual-stack)" },
     .{ .name = "timeout", .kind = .str, .hint = "dur", .group = "Network", .desc = "Idle timeout (default 30s, 0 disables)" },
     .{ .name = "max-clients", .short = 'm', .kind = .int, .hint = "u32", .group = "Network", .desc = "Concurrent client cap (default 1024, 0 = unlimited)" },
     .{ .name = "data", .kind = .str, .hint = "file", .group = "Data", .desc = "External .kmd data file (default embedded)" },
-    .{ .name = "epid", .kind = .str, .hint = "name=epid", .group = "ePID", .desc = "ePID override name=epid, repeatable", .repeatable = true },
+    .{ .name = "epid", .kind = .str, .hint = "name=epid", .group = "ePID", .desc = "ePID override name=epid, repeatable" },
     .{ .name = "randomize", .kind = .int, .hint = "u8", .group = "ePID", .desc = "ePID randomization level 0/1/2 (default 1)" },
     .{ .name = "lcid", .kind = .int, .hint = "u32", .group = "ePID", .desc = "Fixed LCID for randomized ePIDs, 0-32767 (0 = random)" },
     .{ .name = "build", .kind = .int, .hint = "u32", .group = "ePID", .desc = "Fixed build number for randomized ePIDs, 0-65535 (0 = random)" },
@@ -92,8 +92,8 @@ const vlmzsd_opts = [_]cli_helper.Opt{
     .{ .name = "no-btfn", .group = "Protocol", .desc = "Disable bind-time feature negotiation (default on)" },
     .{ .name = "disconnect-per-request", .group = "Protocol", .desc = "Disconnect after each request" },
     .{ .name = "pid-file", .kind = .str, .hint = "file", .group = "Process", .desc = "Write PID to file" },
-    .{ .name = "verbose", .short = 'v', .group = "Process", .desc = "Increase log verbosity, repeatable (-v debug, -vv trace)", .repeatable = true },
-    .{ .name = "quiet", .short = 'q', .group = "Process", .desc = "Decrease log verbosity, repeatable (-q warn, -qq err)", .repeatable = true },
+    .{ .name = "verbose", .short = 'v', .group = "Process", .desc = "Increase log verbosity, repeatable (-v debug, -vv trace)" },
+    .{ .name = "quiet", .short = 'q', .group = "Process", .desc = "Decrease log verbosity, repeatable (-q warn, -qq err)" },
     .{ .name = "quiet-loopback", .group = "Process", .desc = "Suppress debug logs for loopback (localhost) clients" },
 };
 
@@ -121,26 +121,17 @@ const ListSource = union(enum) {
         };
     }
 
-    /// Yields the option's values in order. The environment shape is std's
-    /// `SplitIterator`; the slice shape needs its own cursor because std has no
-    /// iterator over a `[]const []const u8`. An environment value is trimmed
-    /// here, so its empty segments are skipped rather than stored.
+    /// Yields the option's values in order. Both shapes are concrete iterators
+    /// (`std.mem.SplitIterator` and `cli_helper.SliceIterator`). An environment
+    /// value is trimmed here, so its empty segments are skipped rather than
+    /// stored.
     const Iterator = union(enum) {
-        slice: Slice,
+        slice: cli_helper.SliceIterator([]const u8),
         env: std.mem.SplitIterator(u8, .scalar),
-
-        const Slice = struct {
-            items: []const []const u8,
-            index: usize = 0,
-        };
 
         fn next(self: *Iterator) ?[]const u8 {
             switch (self.*) {
-                .slice => |*s| {
-                    if (s.index == s.items.len) return null;
-                    defer s.index += 1;
-                    return s.items[s.index];
-                },
+                .slice => |*it| return it.next(),
                 .env => |*split| {
                     while (split.next()) |segment| {
                         const trimmed = std.mem.trim(u8, segment, " \t");
@@ -1556,10 +1547,6 @@ const Run = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
 /// Report a configuration error and exit. One wording per `resolveOptions`
 /// failure, so `main` stays a sequence of phases.
 fn reportOptionError(io: Io, diag: *const cli_helper.Diag, err: anyerror) noreturn {
@@ -1571,20 +1558,19 @@ fn reportOptionError(io: Io, diag: *const cli_helper.Diag, err: anyerror) noretu
         error.IntervalOutOfRange => cli_helper.fatalStderr(io, "vlmzsd", "policy interval must be at most {d} minutes", .{std.math.maxInt(u32)}),
         error.InvalidListenAddress => cli_helper.fatalStderr(io, "vlmzsd", "{s}: \"{s}\" is not an IP address (the port comes from --port)", .{ diag.spelling, diag.value }),
         else => {
-            var vbuf: [128]u8 = undefined;
-            if (diag.spelling.len > 0) {
-                const text = std.fmt.bufPrint(&vbuf, "{s}: invalid value \"{s}\"", .{ diag.spelling, diag.value }) catch @errorName(err);
-                cli_helper.fatalStderr(io, "vlmzsd", "{s}", .{text});
-            }
-            // Not about one value (e.g. an unknown .kmd field): name the error.
-            cli_helper.fatalStderr(io, "vlmzsd", "{s}", .{@errorName(err)});
+            var vbuf: [cli_helper.diag_buffer_size]u8 = undefined;
+            cli_helper.fatalStderr(io, "vlmzsd", "{s}", .{cli_helper.describeValueError(diag.*, err, &vbuf)});
         },
     }
 }
 
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
 pub fn main(init: std.process.Init) !void {
     const prog: cli_helper.Program = .{ .name = "vlmzsd", .version_display = version_display };
-    var res = (try cli_helper.parseProcess(init, &vlmzsd_opts, prog)) orelse return;
+    var res = (try cli_helper.parseProcess(init, &vlmzsd_opts, prog, null)) orelse return;
     defer res.deinit();
     var diag: cli_helper.Diag = .{};
 

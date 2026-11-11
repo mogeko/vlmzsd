@@ -32,10 +32,8 @@ const embedded_kmd: []const u8 = if (build_options.embedded_data) @embedFile("vl
 /// The largest report is a `--verbose` request+response dump (~1.5 KiB), so this
 /// leaves more than 2x headroom; `Report` also has a spill path so that no text
 /// is dropped.
-const io_buffer_size = 4096;
+const io_buffer_size = cli_helper.io_buffer_size;
 const report_buffer_size = io_buffer_size;
-/// Buffer for a diagnostic that formats one value (`--port: invalid "abc"`).
-const diag_buffer_size = 128;
 
 // ---------------------------------------------------------------------------
 // Output and report
@@ -435,12 +433,8 @@ fn reportOptionError(out: *Output, diag: *const cli_helper.Diag, err: anyerror) 
         error.InvalidAddressFamily => fatal(out, "error: --address-family must be 4 or 6\n", .{}),
         error.InvalidTimeout => fatal(out, "error: --timeout must be at most {d} seconds\n", .{std.math.maxInt(u32)}),
         else => {
-            var vbuf: [diag_buffer_size]u8 = undefined;
-            if (diag.spelling.len > 0) {
-                const text = std.fmt.bufPrint(&vbuf, "{s}: invalid value \"{s}\"", .{ diag.spelling, diag.value }) catch @errorName(err);
-                fatal(out, "error: {s}\n", .{text});
-            }
-            fatal(out, "error: {s}\n", .{@errorName(err)});
+            var vbuf: [cli_helper.diag_buffer_size]u8 = undefined;
+            fatal(out, "error: {s}\n", .{cli_helper.describeValueError(diag.*, err, &vbuf)});
         },
     }
 }
@@ -1027,7 +1021,7 @@ pub fn main(init: std.process.Init) !void {
         .version_display = version_display,
         .positional_hint = "[HOST[:PORT]]",
     };
-    var res = (try cli_helper.parseProcess(init, &vlmzs_opts, prog)) orelse return;
+    var res = (try cli_helper.parseProcess(init, &vlmzs_opts, prog, null)) orelse return;
     defer res.deinit();
     var diag: cli_helper.Diag = .{};
 

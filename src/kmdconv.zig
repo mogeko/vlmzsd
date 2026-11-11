@@ -27,8 +27,8 @@ const opts_table = [_]cli_helper.Opt{
     .{ .name = "output", .short = 'o', .kind = .str, .hint = "file", .group = "Options", .desc = "write output to <file> (default: derived)" },
 };
 
-/// One page for a stream, the size the standard streams were each spelled with.
-const io_buffer_size = 8192;
+/// Two pages for stdin/stdout: they carry whole documents, not lines.
+const io_buffer_size = 2 * cli_helper.io_buffer_size;
 /// The tool's messages are one sentence plus an error name.
 const error_buffer_size = 512;
 
@@ -93,7 +93,7 @@ pub fn main(init: std.process.Init) !void {
         .positional_hint = "<file>",
         .extra_help = help_notes,
     };
-    var res = (try cli_helper.parseProcess(init, &opts_table, prog)) orelse return;
+    var res = (try cli_helper.parseProcess(init, &opts_table, prog, null)) orelse return;
     defer res.deinit();
 
     // Exactly one positional: the input file, or `-` for stdin.

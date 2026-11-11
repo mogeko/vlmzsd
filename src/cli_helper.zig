@@ -11,6 +11,10 @@ pub const Io = std.Io;
 
 const Allocator = std.mem.Allocator;
 
+// ---------------------------------------------------------------------------
+// Option table, parser and its errors
+// ---------------------------------------------------------------------------
+
 /// What a string value means (drives caller-side validation).
 pub const ValueKind = enum {
     flag, // no value
@@ -20,6 +24,10 @@ pub const ValueKind = enum {
 };
 
 /// One option. `name` is the long name without `--`; `short` without `-`.
+///
+/// There is no "repeatable" attribute: repeating a value option keeps the last
+/// occurrence (`Result.get`), and repeating a flag counts occurrences
+/// (`Result.flagCount`), so every option may appear more than once.
 pub const Opt = struct {
     name: []const u8,
     short: ?u8 = null,
@@ -28,7 +36,6 @@ pub const Opt = struct {
     desc: []const u8 = "",
     /// Value placeholder shown in `--help` (e.g. "u16", "guid"). Flags ignore it.
     hint: []const u8 = "",
-    repeatable: bool = false,
 };
 
 pub const ParseError = error{
@@ -55,8 +62,8 @@ pub const Diag = struct {
 /// with its own semantic parsers (duration / GUID / integer width).
 pub const Result = struct {
     allocator: Allocator,
-    /// Flag occurrences, not just presence, so a repeatable flag (`-vv`) can
-    /// select a level. `hasFlag` is `count > 0`.
+    /// Flag occurrences, not just presence, so a cluster like `-vv` can select a
+    /// level. `hasFlag` is `count > 0`.
     flags: std.StringHashMap(u32),
     values: std.StringHashMap([][]const u8),
     positionals: std.ArrayList([]const u8),
@@ -145,73 +152,91 @@ pub fn parseWithDiag(allocator: Allocator, opts: []const Opt, args: []const []co
         const arg = args[i];
 
         if (std.mem.eql(u8, arg, "--")) {
+            // Everything after the terminator is positional, including `-x`.
             i += 1;
             while (i < args.len) : (i += 1) try res.positionals.append(res.allocator, args[i]);
             break;
         }
 
-        if (arg.len > 2 and arg[0] == '-' and arg[1] == '-') {
-            const body = arg[2..];
-            if (std.mem.indexOfScalar(u8, body, '=')) |eq| {
-                const opt = findLong(opts, body[0..eq]) orelse {
-                    diag.* = .{ .spelling = arg };
-                    return error.UnknownOption;
-                };
-                if (opt.kind == .flag) {
-                    diag.* = .{ .spelling = arg[0 .. eq + 2] };
-                    return error.FlagTakesNoValue;
-                }
-                try appendValue(&res, opt, body[eq + 1 ..]);
-            } else {
-                const opt = findLong(opts, body) orelse {
-                    diag.* = .{ .spelling = arg };
-                    return error.UnknownOption;
-                };
-                if (opt.kind == .flag) {
-                    try bumpFlag(&res, opt.name);
-                } else {
-                    i += 1;
-                    if (i >= args.len) {
-                        diag.* = .{ .spelling = arg };
-                        return error.MissingValue;
-                    }
-                    try appendValue(&res, opt, args[i]);
-                }
-            }
+        if (arg.len > 2 and std.mem.startsWith(u8, arg, "--")) {
+            try parseLong(&res, opts, args, &i, diag);
         } else if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
-            // Short flags may be clustered (`-vv`, `-vq`), so count every flag
-            // in the cluster. A value option ends it, taking the rest of the arg
-            // (`-n3`) or, when the cluster ends there, the next argument.
-            var j: usize = 1;
-            while (j < arg.len) : (j += 1) {
-                if (findShort(opts, arg[j]) == null) {
-                    // The whole token, cluster included: a slice cannot spell
-                    // "the dash plus this character" when it is mid-cluster.
-                    diag.* = .{ .spelling = arg };
-                    return error.UnknownOption;
-                }
-                const opt = findShort(opts, arg[j]).?;
-                if (opt.kind == .flag) {
-                    try bumpFlag(&res, opt.name);
-                    continue;
-                }
-                if (j + 1 < arg.len) {
-                    try appendValue(&res, opt, arg[j + 1 ..]);
-                } else {
-                    i += 1;
-                    if (i >= args.len) {
-                        diag.* = .{ .spelling = arg };
-                        return error.MissingValue;
-                    }
-                    try appendValue(&res, opt, args[i]);
-                }
-                break;
-            }
+            try parseShortCluster(&res, opts, args, &i, diag);
         } else {
             try res.positionals.append(res.allocator, arg);
         }
     }
     return res;
+}
+
+/// `--long`, `--long=value`, or `--long value`. `i` is the argument's index and
+/// is advanced past a separate value.
+fn parseLong(res: *Result, opts: []const Opt, args: []const []const u8, i: *usize, diag: *Diag) ParseError!void {
+    const arg = args[i.*];
+    const body = arg[2..];
+    if (std.mem.indexOfScalar(u8, body, '=')) |eq| {
+        const opt = findLong(opts, body[0..eq]) orelse {
+            diag.* = .{ .spelling = arg };
+            return error.UnknownOption;
+        };
+        if (opt.kind == .flag) {
+            // Report the flag alone: `--verbose=x` is "takes no value", and the
+            // reader does not need the value it was given.
+            diag.* = .{ .spelling = arg[0 .. eq + 2] };
+            return error.FlagTakesNoValue;
+        }
+        return appendValue(res, opt, body[eq + 1 ..]);
+    }
+
+    const opt = findLong(opts, body) orelse {
+        diag.* = .{ .spelling = arg };
+        return error.UnknownOption;
+    };
+    if (opt.kind == .flag) return bumpFlag(res, opt.name);
+
+    i.* += 1;
+    if (i.* >= args.len) {
+        diag.* = .{ .spelling = arg };
+        return error.MissingValue;
+    }
+    return appendValue(res, opt, args[i.*]);
+}
+
+/// A cluster of short flags (`-vv`, `-vq`). A value option ends the cluster,
+/// taking the rest of the argument (`-n3`) or, when the cluster ends there, the
+/// next argument.
+fn parseShortCluster(res: *Result, opts: []const Opt, args: []const []const u8, i: *usize, diag: *Diag) ParseError!void {
+    const arg = args[i.*];
+    var j: usize = 1;
+    while (j < arg.len) : (j += 1) {
+        // The whole token, cluster included: a slice cannot spell "the dash plus
+        // this character" when the unknown one is mid-cluster.
+        const opt = findShort(opts, arg[j]) orelse {
+            diag.* = .{ .spelling = arg };
+            return error.UnknownOption;
+        };
+        if (opt.kind == .flag) {
+            try bumpFlag(res, opt.name);
+            continue;
+        }
+        if (j + 1 < arg.len) return appendValue(res, opt, arg[j + 1 ..]);
+
+        i.* += 1;
+        if (i.* >= args.len) {
+            diag.* = .{ .spelling = arg };
+            return error.MissingValue;
+        }
+        return appendValue(res, opt, args[i.*]);
+    }
+}
+
+/// One line for a value a binary's own resolver rejected:
+/// `<spelling>: invalid value "<value>"`, or the bare error name when the failure
+/// is not about one value (an unknown `.kmd` field, say). Both binaries report
+/// option errors this way, so the wording lives here.
+pub fn describeValueError(diag: Diag, err: anyerror, buf: []u8) []const u8 {
+    if (diag.spelling.len == 0) return @errorName(err);
+    return std.fmt.bufPrint(buf, "{s}: invalid value \"{s}\"", .{ diag.spelling, diag.value }) catch @errorName(err);
 }
 
 /// One line describing a parse failure, e.g. `unknown option "--bogus"`, for
@@ -226,6 +251,10 @@ pub fn parseErrorMessage(err: ParseError, diag: Diag, buf: []u8) []const u8 {
     };
     return text catch "invalid arguments";
 }
+
+// ---------------------------------------------------------------------------
+// Help and the process preamble
+// ---------------------------------------------------------------------------
 
 /// Placeholder shown for a value-taking option when no explicit `hint` is set.
 fn defaultHint(kind: ValueKind) []const u8 {
@@ -300,15 +329,28 @@ pub const Program = struct {
     extra_help: []const u8 = "",
 };
 
-/// The `--help` rendering is the one place the preamble writes more than a line;
-/// one page covers every program's table plus its notes.
-const help_buffer_size = 4096;
+/// One page: the buffer for a program's long-lived streams (`--help` rendering,
+/// log sinks, socket read-ahead). Programs use it rather than each spelling 4096.
+pub const io_buffer_size = 4096;
+/// A diagnostic about one option fits in a few dozen bytes.
+pub const diag_buffer_size = 128;
+/// `"<program> error: …"` and the `.kmd` messages fit in one short line.
+const error_buffer_size = 512;
+/// The `--help` rendering batches writes through this.
+const help_buffer_size = io_buffer_size;
+/// `"<program> <version>\n"` needs a dozen bytes plus the version string.
+const version_buffer_size = 64;
 
 /// Collect the process arguments, parse them against `opts`, and handle
 /// `--help`/`--version`. Returns null when `main` should return immediately: the
 /// requested text is written and flushed. Otherwise the parsed result, which the
 /// caller must `deinit`.
-pub fn parseProcess(init: std.process.Init, opts: []const Opt, prog: Program) !?Result {
+///
+/// `sink` receives the help/version text; null means the process's stdout, which
+/// is what every binary passes. A test passes a memory writer, so this path —
+/// shared by all three binaries — can be exercised without touching the real
+/// descriptors (see AGENTS.md → Pitfalls).
+pub fn parseProcess(init: std.process.Init, opts: []const Opt, prog: Program, sink: ?*std.Io.Writer) !?Result {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(init.gpa);
     var it: std.process.Args.Iterator = .init(init.minimal.args);
@@ -318,30 +360,46 @@ pub fn parseProcess(init: std.process.Init, opts: []const Opt, prog: Program) !?
     var diag: Diag = .{};
     var res = parseWithDiag(init.gpa, opts, args.items, &diag) catch |err| {
         // Short diagnostic naming the argument; the full help is one `--help` away.
-        var ebuf: [128]u8 = undefined;
-        fatalStderrOf(init.io, prog.name, "{s}", .{parseErrorMessage(err, diag, &ebuf)});
+        var ebuf: [diag_buffer_size]u8 = undefined;
+        fatalStderr(init.io, prog.name, "{s}", .{parseErrorMessage(err, diag, &ebuf)});
     };
 
     if (res.hasFlag("help")) {
         defer res.deinit();
-        var buf: [help_buffer_size]u8 = undefined;
-        var w = std.Io.File.writer(std.Io.File.stdout(), init.io, &buf);
-        try writeHelp(&w.interface, prog.name, opts, prog.positional_hint);
-        try w.interface.writeAll(prog.extra_help);
-        try w.interface.flush();
+        var file_buf: [help_buffer_size]u8 = undefined;
+        var file_writer = std.Io.File.writer(std.Io.File.stdout(), init.io, &file_buf);
+        const w = sink orelse &file_writer.interface;
+        try writeHelp(w, prog.name, opts, prog.positional_hint);
+        try w.writeAll(prog.extra_help);
+        try w.flush();
         return null;
     }
     if (res.hasFlag("version")) {
         defer res.deinit();
-        var buf: [64]u8 = undefined;
-        var w = std.Io.File.writer(std.Io.File.stdout(), init.io, &buf);
-        try w.interface.print("{s} {s}\n", .{ prog.name, prog.version_display });
-        try w.interface.flush();
+        var file_buf: [version_buffer_size]u8 = undefined;
+        var file_writer = std.Io.File.writer(std.Io.File.stdout(), init.io, &file_buf);
+        const w = sink orelse &file_writer.interface;
+        try w.print("{s} {s}\n", .{ prog.name, prog.version_display });
+        try w.flush();
         return null;
     }
     return res;
 }
 
+// ---------------------------------------------------------------------------
+// Value parsers
+// ---------------------------------------------------------------------------
+
+/// Log level, from most to least verbose.
+pub const Level = enum {
+    trace,
+    debug,
+    info,
+    warn,
+    err,
+};
+
+/// Maximum line length in bytes, including the trailing newline.
 /// Parse `<n><unit>` into seconds. Units: `s`/`m`/`h`/`d`/`w`.
 /// Examples: `30s`, `2h`, `7d`, `90m`. A bare `0` is accepted as "disabled",
 /// which is how `--timeout 0` is documented for both binaries.
@@ -430,35 +488,29 @@ pub fn parseGuid(str: []const u8) error{InvalidGuid}![16]u8 {
     return out;
 }
 
-/// Log level, from most to least verbose.
-pub const Level = enum {
-    trace,
-    debug,
-    info,
-    warn,
-    err,
-};
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
 
-/// Maximum line length in bytes, including the trailing newline.
-const slot_size = 256;
+const log_slot_size = 256;
 
 /// Length of the `YYYY-MM-DDTHH:MM:SSZ ` prefix every line starts with.
 const timestamp_len = 21;
 
 /// Ring depth. A power of two, which is what `mpsc_queue` requires.
-const capacity = 1024;
+const log_capacity = 1024;
 
 /// One queued line. `err` selects the destination stream (stderr when set,
 /// stdout otherwise), which keeps the queue ignorant of log levels and streams.
 const Slot = struct {
     err: bool,
-    /// Length of the valid prefix of `bytes`; at most `slot_size`.
+    /// Length of the valid prefix of `bytes`; at most `log_slot_size`.
     len: u16,
-    bytes: [slot_size]u8,
+    bytes: [log_slot_size]u8,
 };
 
 /// The log queue: a bounded, lossy MPSC ring, sized once at startup.
-const LogQueue = mpsc_queue.Queue(Slot, capacity);
+const LogQueue = mpsc_queue.Queue(Slot, log_capacity);
 
 /// Lines that never reached the sink: refused by the queue, or shortened to fit
 /// a slot. A report covers either one period (the delta between two totals) or
@@ -534,38 +586,15 @@ pub const Logger = struct {
     fn emit(self: *Logger, level: Level, comptime fmt: []const u8, args: anytype) void {
         if (@backingInt(level) < @backingInt(self.min_level)) return;
 
-        // Format straight into the slot that gets queued, so a log call copies
-        // nothing after formatting. The timestamp is taken here, at call time: it
-        // records when the event happened, not when the writer got to it.
         var slot: Slot = .{ .err = level == .warn or level == .err, .len = 0, .bytes = undefined };
-        writeTimestampPrefix(slot.bytes[0..timestamp_len], self.io);
-        var line: std.Io.Writer = .fixed(slot.bytes[timestamp_len..]);
-        line.writeAll(levelLabel(level)) catch {};
-        var full = false;
-        line.print(fmt, args) catch {
-            full = true;
-        };
-        if (!full) line.writeAll("\n") catch {
-            full = true;
-        };
-        if (full) {
-            // A fixed writer only fails when the buffer is full, and it fills
-            // the buffer before failing, so the line holds exactly `slot_size`
-            // bytes. Overwrite the last byte with the newline to keep it a
-            // single, greppable line.
-            std.debug.assert(line.buffered().len == slot_size - timestamp_len);
-            slot.bytes[slot_size - 1] = '\n';
-            slot.len = slot_size;
-        } else {
-            slot.len = @intCast(timestamp_len + line.buffered().len);
-        }
+        const truncated = formatSlot(&slot, level, self.io, fmt, args);
 
         // The queue counts refusals itself, as a monotonic total the writer
         // turns into period deltas. Truncation is counted only for a line the
         // ring accepted: a refused line is already reported as dropped, and
         // counting it twice would make one long line read as two lost ones.
         switch (self.queue.tryPush(self.io, slot)) {
-            .accepted => if (full) {
+            .accepted => if (truncated) {
                 _ = self.truncated.fetchAdd(1, .monotonic);
             },
             .full, .closed => {},
@@ -711,14 +740,8 @@ pub const Logger = struct {
 /// or a writer task the pool refused to start — and exit. It cannot go through
 /// `Logger`: the line would be queued with nobody to drain it, since the queue's
 /// only consumer is the writer task that is missing.
-pub fn fatalStderr(io: Io, comptime program: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
-    fatalStderrOf(io, program, fmt, args);
-}
-
-/// `fatalStderr` for a program name that is only known at runtime (`parseProcess`
-/// takes it from its `Program`).
-pub fn fatalStderrOf(io: Io, program: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
-    var buf: [256]u8 = undefined;
+pub fn fatalStderr(io: Io, program: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
+    var buf: [error_buffer_size]u8 = undefined;
     var w = std.Io.File.writer(std.Io.File.stderr(), io, &buf);
     w.interface.print("{s}: error: " ++ fmt ++ "\n", .{program} ++ args) catch {};
     w.interface.flush() catch {};
@@ -750,6 +773,36 @@ fn writeCounterLine(w: *std.Io.Writer, io: Io, loss: Loss, scope: []const u8) vo
     w.flush() catch {};
 }
 
+/// Format one log line straight into `slot`, so a log call copies nothing after
+/// formatting. The timestamp is taken here, at call time: it records when the
+/// event happened, not when the writer got to it. Returns true when the text did
+/// not fit, in which case the slot holds exactly `log_slot_size` bytes ending in
+/// a newline.
+fn formatSlot(slot: *Slot, level: Level, io: Io, comptime fmt: []const u8, args: anytype) bool {
+    writeTimestampPrefix(slot.bytes[0..timestamp_len], io);
+    var line: std.Io.Writer = .fixed(slot.bytes[timestamp_len..]);
+    line.writeAll(levelLabel(level)) catch {};
+    var full = false;
+    line.print(fmt, args) catch {
+        full = true;
+    };
+    if (!full) line.writeAll("\n") catch {
+        full = true;
+    };
+    if (full) {
+        // A fixed writer only fails when the buffer is full, and it fills the
+        // buffer before failing, so the line holds exactly `log_slot_size` bytes.
+        // Overwrite the last byte with the newline to keep it a single,
+        // greppable line.
+        std.debug.assert(line.buffered().len == log_slot_size - timestamp_len);
+        slot.bytes[log_slot_size - 1] = '\n';
+        slot.len = log_slot_size;
+        return true;
+    }
+    slot.len = @intCast(timestamp_len + line.buffered().len);
+    return false;
+}
+
 /// Write a UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp followed by a space. Its length
 /// is fixed, so it can be formatted straight into the line it belongs to.
 fn writeTimestampPrefix(buf: *[timestamp_len]u8, io: Io) void {
@@ -776,6 +829,10 @@ fn writeTimestampPrefix(buf: *[timestamp_len]u8, io: Io) void {
     std.debug.assert(written.len == timestamp_len);
 }
 
+// ---------------------------------------------------------------------------
+// Process services
+// ---------------------------------------------------------------------------
+
 /// Current Unix time in seconds (via the `realtime` clock).
 pub fn nowUnix(io: Io) i64 {
     const now = Io.Clock.now(.real, io);
@@ -796,6 +853,10 @@ pub fn makeSeed(io: Io) u64 {
     io.random(&bytes);
     return std.mem.readInt(u64, &bytes, .little);
 }
+
+// ---------------------------------------------------------------------------
+// KMS data location
+// ---------------------------------------------------------------------------
 
 /// FHS/XDG system search directories for external `.kmd` data files, highest
 /// priority first. The user-level `$HOME/.local/share/vlmzsd` directory is
@@ -900,7 +961,8 @@ pub fn loadKmsData(
 }
 
 /// Return the alphabetically greatest `*.kmd` file name in `dir`, or null when
-/// the directory has none (or does not exist).
+/// the directory has none (or does not exist). `dir_path` must be absolute: every
+/// caller passes either the FHS list or `$HOME/.local/share/vlmzsd`.
 fn findLastKmd(io: Io, gpa: Allocator, dir_path: []const u8) !?[]u8 {
     var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
         error.FileNotFound, error.NotDir => return null,
@@ -928,6 +990,25 @@ fn loadKmdFrom(io: Io, gpa: Allocator, dir_path: []const u8, name: []const u8) !
     errdefer gpa.free(full_path);
     const data = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, full_path, gpa, .unlimited);
     return .{ .path = full_path, .data = data };
+}
+
+/// Iterate a slice: `next()` yields each element in order, then null. This is the
+/// slice counterpart of `std.mem.SplitIterator` — Zig has no iterator interface,
+/// and std 0.17 has no iterator over a `[]const T`, so each consumer would
+/// otherwise hand-roll the same cursor.
+pub fn SliceIterator(comptime T: type) type {
+    return struct {
+        items: []const T,
+        index: usize = 0,
+
+        const Self = @This();
+
+        pub fn next(self: *Self) ?T {
+            if (self.index == self.items.len) return null;
+            defer self.index += 1;
+            return self.items[self.index];
+        }
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,7 +1093,7 @@ test "parse --opt=value and short glued value" {
 test "parse repeatable and -- terminator" {
     const alloc = std.testing.allocator;
     const opts = [_]Opt{
-        .{ .name = "listen", .short = 'L', .kind = .str, .repeatable = true },
+        .{ .name = "listen", .short = 'L', .kind = .str },
     };
     var res = try parse(alloc, &opts, &.{ "-L", "0.0.0.0", "-L", "::", "--", "--listen", "x" });
     defer res.deinit();
@@ -1074,8 +1155,8 @@ test "a parse error names the argument that failed" {
 test "short flags cluster and count" {
     const alloc = std.testing.allocator;
     const opts = [_]Opt{
-        .{ .name = "verbose", .short = 'v', .repeatable = true },
-        .{ .name = "quiet", .short = 'q', .repeatable = true },
+        .{ .name = "verbose", .short = 'v' },
+        .{ .name = "quiet", .short = 'q' },
         .{ .name = "count", .short = 'n', .kind = .int, .hint = "u32" },
     };
 
@@ -1202,7 +1283,7 @@ test "a full queue drops and counts instead of blocking" {
 
     const overflow = 8;
     var i: usize = 0;
-    while (i < capacity + overflow) : (i += 1) log.info("line {d}", .{i});
+    while (i < log_capacity + overflow) : (i += 1) log.info("line {d}", .{i});
     try std.testing.expectEqual(@as(u64, overflow), log.queue.droppedCount());
 
     // Every accepted line is intact (newline-terminated), and none is lost.
@@ -1216,7 +1297,7 @@ test "a full queue drops and counts instead of blocking" {
             drained += 1;
         }
     }
-    try std.testing.expectEqual(@as(usize, capacity), drained);
+    try std.testing.expectEqual(@as(usize, log_capacity), drained);
 }
 
 test "an overlong line becomes one truncated line" {
@@ -1232,8 +1313,8 @@ test "an overlong line becomes one truncated line" {
 
     var batch: [4]Slot = undefined;
     try std.testing.expectEqual(@as(usize, 1), log.queue.popBatch(&batch));
-    try std.testing.expectEqual(@as(u16, slot_size), batch[0].len);
-    try std.testing.expectEqual(@as(u8, '\n'), batch[0].bytes[slot_size - 1]);
+    try std.testing.expectEqual(@as(u16, log_slot_size), batch[0].len);
+    try std.testing.expectEqual(@as(u8, '\n'), batch[0].bytes[log_slot_size - 1]);
     try std.testing.expectEqual(@as(u64, 1), log.truncated.load(.monotonic));
 }
 
@@ -1250,7 +1331,7 @@ test "a truncated line is counted as truncated only when the ring takes it" {
     // loss the operator should hear about is the drop. Counting it as truncated
     // too would report two lost lines for one.
     var i: usize = 0;
-    while (i < capacity) : (i += 1) log.info("line {d}", .{i});
+    while (i < log_capacity) : (i += 1) log.info("line {d}", .{i});
     try std.testing.expectEqual(@as(u64, 0), log.queue.droppedCount());
 
     log.info("{d:>300}", .{1});
@@ -1367,4 +1448,197 @@ test "a loaded .kmd frees the buffer it read" {
     loaded.deinit(gpa);
     try std.testing.expectEqual(@as(?[]u8, null), loaded.owned);
     try std.testing.expectEqual(@as([]const u8, &.{}), loaded.raw);
+}
+
+test "SliceIterator yields every element, then null" {
+    const values = [_][]const u8{ "::", "127.0.0.1", "::1" };
+
+    var it = SliceIterator([]const u8){ .items = &values };
+    for (values) |want| try std.testing.expectEqualStrings(want, it.next().?);
+    // Past the end it keeps returning null rather than reading out of bounds.
+    try std.testing.expectEqual(@as(?[]const u8, null), it.next());
+    try std.testing.expectEqual(@as(?[]const u8, null), it.next());
+
+    // An empty slice is a no-op, which is what the built-in defaults rely on.
+    var empty = SliceIterator([]const u8){ .items = &.{} };
+    try std.testing.expectEqual(@as(?[]const u8, null), empty.next());
+}
+
+/// A `std.process.Init` for `parseProcess` tests: the function reads only
+/// `gpa`, `io`, `minimal.args` and the environment map.
+const ProcessFixture = struct {
+    arena: std.heap.ArenaAllocator,
+    environ_map: std.process.Environ.Map,
+    args: [8][*:0]const u8 = undefined,
+    /// The filled part of `args`; `Args.Vector` is a slice, so it needs no
+    /// terminator.
+    argv: []const [*:0]const u8 = &.{},
+
+    fn init(gpa: Allocator, argv: []const [:0]const u8) !ProcessFixture {
+        var fixture: ProcessFixture = .{
+            .arena = .init(gpa),
+            .environ_map = .init(gpa),
+        };
+        std.debug.assert(argv.len <= fixture.args.len);
+        for (argv, 0..) |arg, i| fixture.args[i] = arg.ptr;
+        fixture.argv = fixture.args[0..argv.len];
+        return fixture;
+    }
+
+    fn deinit(self: *ProcessFixture) void {
+        self.arena.deinit();
+        self.environ_map.deinit();
+    }
+
+    fn value(self: *ProcessFixture) std.process.Init {
+        return .{
+            .minimal = .{ .args = .{ .vector = self.argv }, .environ = .empty },
+            .arena = &self.arena,
+            .gpa = std.testing.allocator,
+            .io = std.testing.io,
+            .environ_map = &self.environ_map,
+            .preopens = .empty,
+        };
+    }
+};
+
+test "parseProcess renders help and version into the sink" {
+    // The preamble needs the two flags it acts on, so this table carries them.
+    const proc_opts = test_opts ++ [_]Opt{
+        .{ .name = "help", .short = 'h', .group = "General", .desc = "print this help and exit" },
+        .{ .name = "version", .short = 'V', .group = "General", .desc = "print version and exit" },
+    };
+    const prog: Program = .{
+        .name = "vlmzs",
+        .version_display = "1.2.3",
+        .positional_hint = "[HOST[:PORT]]",
+        .extra_help = "Notes:\n  <file>  input\n",
+    };
+
+    // `--help` wins over arguments it can parse, and returns null so `main` can
+    // simply return.
+    {
+        var fx = try ProcessFixture.init(std.testing.allocator, &.{ "vlmzs", "-h", "--protocol", "9" });
+        defer fx.deinit();
+        var buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&buf);
+        try std.testing.expectEqual(@as(?Result, null), try parseProcess(fx.value(), &proc_opts, prog, &sink));
+        const text = sink.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, text, "Usage: vlmzs [OPTIONS] [HOST[:PORT]]\n"));
+        try std.testing.expect(std.mem.indexOf(u8, text, "Output:") != null);
+        // The program's own notes come last, after the table.
+        try std.testing.expect(std.mem.endsWith(u8, text, "Notes:\n  <file>  input\n"));
+    }
+
+    // `--version` is one line, and needs no option table.
+    {
+        var fx = try ProcessFixture.init(std.testing.allocator, &.{ "vlmzs", "-V" });
+        defer fx.deinit();
+        var buf: [64]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&buf);
+        try std.testing.expectEqual(@as(?Result, null), try parseProcess(fx.value(), &proc_opts, prog, &sink));
+        try std.testing.expectEqualStrings("vlmzs 1.2.3\n", sink.buffered());
+    }
+
+    // Anything else comes back parsed, for the binary to resolve.
+    {
+        var fx = try ProcessFixture.init(std.testing.allocator, &.{ "vlmzs", "host", "-n", "3" });
+        defer fx.deinit();
+        var buf: [64]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&buf);
+        var res = (try parseProcess(fx.value(), &proc_opts, prog, &sink)) orelse return error.TestUnexpectedResult;
+        defer res.deinit();
+        try std.testing.expectEqualStrings("3", res.get("count").?);
+        try std.testing.expectEqualStrings("host", res.positionals.items[0]);
+        try std.testing.expectEqual(@as(usize, 0), sink.buffered().len);
+    }
+}
+
+test "a repeated value option keeps the last occurrence" {
+    const gpa = std.testing.allocator;
+    var res = try parse(gpa, &test_opts, &.{ "--count", "1", "--count", "7", "-n", "9" });
+    defer res.deinit();
+
+    // No option is declared "single": the last occurrence wins, and every one is
+    // still visible through `getAll`.
+    try std.testing.expectEqualStrings("9", res.get("count").?);
+    try std.testing.expectEqual(@as(usize, 3), res.getAll("count").len);
+    try std.testing.expectEqualStrings("1", res.getAll("count")[0]);
+}
+
+test "help renders an empty positional hint and a program's own notes" {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    // No positional: the usage line is just the program and `[OPTIONS]`.
+    try writeHelp(&w, "vlmzsd", &test_opts, "");
+    try std.testing.expect(std.mem.startsWith(u8, w.buffered(), "Usage: vlmzsd [OPTIONS]\n"));
+
+    // The notes are the caller's to append; `writeHelp` itself never writes them.
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Notes:") == null);
+}
+
+test "findLastKmd picks the alphabetically greatest .kmd and ignores the rest" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Two .kmd files and a decoy with another suffix.
+    for ([_][]const u8{ "a.kmd", "m.kmd", "z.kmd.bak" }) |name| {
+        var file = try tmp.dir.createFile(io, name, .{});
+        file.close(io);
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..len];
+
+    const best = try findLastKmd(io, gpa, dir_path);
+    defer if (best) |b| gpa.free(b);
+    try std.testing.expectEqualStrings("m.kmd", best.?);
+
+    // A directory with nothing to load is null, not an error.
+    try std.testing.expectEqual(@as(?[]u8, null), try findLastKmd(io, gpa, "/nonexistent/vlmzsd"));
+}
+
+test "loadFhsKmd searches $HOME/.local/share/vlmzsd first" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const sub = ".local/share/vlmzsd";
+    try tmp.dir.createDirPath(io, sub);
+    {
+        var file = try tmp.dir.createFile(io, sub ++ "/present.kmd", .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "kmd body");
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &path_buf);
+
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    try env.put("HOME", path_buf[0..len]);
+
+    const found = (try loadFhsKmd(io, gpa, &env)).?;
+    defer {
+        gpa.free(found.path);
+        gpa.free(found.data);
+    }
+    try std.testing.expect(std.mem.endsWith(u8, found.path, "/.local/share/vlmzsd/present.kmd"));
+    try std.testing.expectEqualStrings("kmd body", found.data);
+}
+
+test "Loss reports the growth since an earlier report" {
+    // The counters are monotonic, so a period delta is a plain difference.
+    const earlier: Loss = .{ .dropped = 2, .truncated = 1 };
+    const now: Loss = .{ .dropped = 5, .truncated = 1 };
+    const period = now.since(earlier);
+    try std.testing.expectEqual(@as(u64, 3), period.dropped);
+    try std.testing.expectEqual(@as(u64, 0), period.truncated);
+    try std.testing.expect(!period.isZero());
+
+    // Nothing new since the last report: the idle shape stays silent.
+    try std.testing.expect(now.since(now).isZero());
 }
