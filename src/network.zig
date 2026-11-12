@@ -778,13 +778,23 @@ fn sockaddrToIpAddress(addr: *const std.posix.sockaddr) Io.net.IpAddress {
     switch (addr.family) {
         std.posix.AF.INET => {
             const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(addr));
-            var ip4: Io.net.Ip4Address = .{ .bytes = undefined, .port = std.mem.bigToNative(u16, in.port) };
+            const port = std.mem.bigToNative(u16, in.port);
+            var ip4: Io.net.Ip4Address = .{ .bytes = undefined, .port = port };
             @memcpy(&ip4.bytes, std.mem.asBytes(&in.addr));
             return .{ .ip4 = ip4 };
         },
         std.posix.AF.INET6 => {
             const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
-            return .{ .ip6 = .{ .bytes = in6.addr, .port = std.mem.bigToNative(u16, in6.port) } };
+            const port = std.mem.bigToNative(u16, in6.port);
+            // A dual-stack socket reports IPv4 peers as ::ffff:a.b.c.d. Name
+            // the IPv4 address the client actually used, as the private and
+            // loopback checks already judge it.
+            if (isIpv4Mapped(in6.addr)) {
+                var ip4: Io.net.Ip4Address = .{ .bytes = undefined, .port = port };
+                @memcpy(&ip4.bytes, in6.addr[12..16]);
+                return .{ .ip4 = ip4 };
+            }
+            return .{ .ip6 = .{ .bytes = in6.addr, .port = port } };
         },
         else => unreachable,
     }
@@ -998,6 +1008,34 @@ test "isLoopbackAddress" {
     {
         var sa = ipv6.addr([_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 8, 8, 8, 8 });
         try std.testing.expect(!isLoopbackAddress(@ptrCast(&sa)));
+    }
+}
+
+test "sockaddrToIpAddress names an IPv4-mapped peer as IPv4" {
+    // A dual-stack socket reports an IPv4 peer in the mapped form
+    // ::ffff:a.b.c.d; the log then names the IPv4 address the client used. A
+    // genuine IPv6 peer keeps its bracketed form, ::1 included.
+    const cases = [_]struct { bytes: [16]u8, text: []const u8 }{
+        .{
+            .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 88, 247, 168, 74 },
+            .text = "88.247.168.74:58153",
+        },
+        .{
+            .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+            .text = "[::1]:58153",
+        },
+    };
+    for (cases) |case| {
+        var sa: std.posix.sockaddr.in6 = .{
+            .port = std.mem.nativeToBig(u16, 58153),
+            .flowinfo = 0,
+            .addr = case.bytes,
+            .scope_id = 0,
+        };
+        var buf: [64]u8 = undefined;
+        var w: Io.Writer = .fixed(&buf);
+        try sockaddrToIpAddress(@ptrCast(&sa)).format(&w);
+        try std.testing.expectEqualStrings(case.text, w.buffered());
     }
 }
 
