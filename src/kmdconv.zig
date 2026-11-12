@@ -27,25 +27,38 @@ const opts_table = [_]cli_helper.Opt{
     .{ .name = "output", .short = 'o', .kind = .str, .hint = "file", .group = "Options", .desc = "write output to <file> (default: derived)" },
 };
 
-fn writeHelp(w: *std.Io.Writer) !void {
-    try cli_helper.writeHelp(w, "kmdconv", &opts_table, "<file>");
-    try w.print(
-        \\
-        \\Convert between the `.kmd` binary data format and JSON.
-        \\
-        \\Notes:
-        \\  <file>       input JSON file (or a `.kmd` file with -r); `-` reads stdin
-        \\  no -o        written in the current directory as <stem>.<suffix>:
-        \\               `data.json` -> `data.kmd`, `data.kmd` -> `data.json`
-        \\
-    , .{});
-}
+/// Two pages for stdin/stdout: they carry whole documents, not lines.
+const io_buffer_size = 2 * cli_helper.io_buffer_size;
+/// The tool's messages are one sentence plus an error name.
+const error_buffer_size = 512;
+
+/// The notes printed under the shared option table: `kmdconv` inputs and outputs
+/// need more explanation than an option's one-line description.
+const help_notes =
+    \\
+    \\Convert between the `.kmd` binary data format and JSON.
+    \\
+    \\Notes:
+    \\  <file>       input JSON file (or a `.kmd` file with -r); `-` reads stdin
+    \\  no -o        written in the current directory as <stem>.<suffix>:
+    \\               `data.json` -> `data.kmd`, `data.kmd` -> `data.json`
+    \\
+;
 
 /// Report a fatal error on stderr and exit with status 1.
 fn fatal(io: Io, comptime fmt: []const u8, args: anytype) noreturn {
-    var ebuf: [512]u8 = undefined;
+    writeFatal(io, fmt, args);
+}
+
+/// `fatal` for a failure that carries an error value: `<what>: <error name>`.
+fn fatalError(io: Io, err: anyerror, comptime what: []const u8) noreturn {
+    writeFatal(io, what ++ ": {s}\n", .{@errorName(err)});
+}
+
+fn writeFatal(io: Io, comptime fmt: []const u8, args: anytype) noreturn {
+    var ebuf: [error_buffer_size]u8 = undefined;
     var ew = std.Io.File.writer(std.Io.File.stderr(), io, &ebuf);
-    ew.interface.print(fmt, args) catch {};
+    ew.interface.print("kmdconv: error: " ++ fmt, args) catch {};
     ew.interface.flush() catch {};
     std.process.exit(1);
 }
@@ -60,11 +73,11 @@ fn deriveOutputPath(gpa: Allocator, input: []const u8, reverse: bool) ![]u8 {
 }
 
 fn readStdin(io: Io, gpa: Allocator) ![]u8 {
-    var rbuf: [8192]u8 = undefined;
+    var rbuf: [io_buffer_size]u8 = undefined;
     var reader = std.Io.File.reader(std.Io.File.stdin(), io, &rbuf);
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
-    var chunk: [8192]u8 = undefined;
+    var chunk: [io_buffer_size]u8 = undefined;
     while (true) {
         const n = try reader.interface.readSliceShort(&chunk);
         if (n == 0) break;
@@ -74,40 +87,21 @@ fn readStdin(io: Io, gpa: Allocator) ![]u8 {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var args: std.ArrayList([]const u8) = .empty;
-    defer args.deinit(init.gpa);
-    var it: std.process.Args.Iterator = .init(init.minimal.args);
-    _ = it.skip();
-    while (it.next()) |a| try args.append(init.gpa, a);
-
-    var diag: cli_helper.Diag = .{};
-    var res = cli_helper.parseWithDiag(init.gpa, &opts_table, args.items, &diag) catch |err| {
-        var ebuf: [128]u8 = undefined;
-        fatal(init.io, "kmdconv: error: {s}\n", .{cli_helper.parseErrorMessage(err, diag, &ebuf)});
+    const prog: cli_helper.Program = .{
+        .name = "kmdconv",
+        .version_display = version_display,
+        .positional_hint = "<file>",
+        .extra_help = help_notes,
     };
+    var res = (try cli_helper.parseProcess(init, &opts_table, prog, null)) orelse return;
     defer res.deinit();
-
-    if (res.hasFlag("help")) {
-        var hbuf: [2048]u8 = undefined;
-        var hw = std.Io.File.writer(std.Io.File.stdout(), init.io, &hbuf);
-        try writeHelp(&hw.interface);
-        try hw.interface.flush();
-        return;
-    }
-    if (res.hasFlag("version")) {
-        var vbuf: [64]u8 = undefined;
-        var vw = std.Io.File.writer(std.Io.File.stdout(), init.io, &vbuf);
-        try vw.interface.print("kmdconv {s}\n", .{version_display});
-        try vw.interface.flush();
-        return;
-    }
 
     // Exactly one positional: the input file, or `-` for stdin.
     if (res.positionals.items.len == 0) {
-        fatal(init.io, "kmdconv: error: missing input file (use - for stdin)\n", .{});
+        fatal(init.io, "missing input file (use - for stdin)\n", .{});
     }
     if (res.positionals.items.len > 1) {
-        fatal(init.io, "kmdconv: error: too many positional arguments\n", .{});
+        fatal(init.io, "too many positional arguments\n", .{});
     }
     const input: []const u8 = res.positionals.items[0];
     const reverse = res.hasFlag("reverse");
@@ -122,37 +116,34 @@ pub fn main(init: std.process.Init) !void {
         input_owned = true;
     } else {
         input_data = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, input, init.gpa, .unlimited) catch |e|
-            fatal(init.io, "kmdconv: error: cannot read {s}: {s}\n", .{ input, @errorName(e) });
+            fatal(init.io, "cannot read {s}: {s}\n", .{ input, @errorName(e) });
         input_owned = true;
     }
 
-    // Convert.
+    // Convert. Both directions parse into an arena that dies with the run; the
+    // output is a gpa buffer the deferred free below releases.
+    var arena: std.heap.ArenaAllocator = .init(init.gpa);
+    defer arena.deinit();
     var output_data: []const u8 = undefined;
     var output_owned = false;
     defer if (output_owned) init.gpa.free(@constCast(output_data));
     if (reverse) {
-        var arena: std.heap.ArenaAllocator = .init(init.gpa);
-        defer arena.deinit();
         const data = kmsdata.parse(arena.allocator(), input_data) catch |e|
             fatal(
                 init.io,
-                "kmdconv: error: invalid .kmd data: {s} (is this a JSON file? remove -r to convert it to .kmd)\n",
+                "invalid .kmd data: {s} (is this a JSON file? remove -r to convert it to .kmd)\n",
                 .{@errorName(e)},
             );
-        output_data = kmsDataToJson(&data, init.gpa) catch |e|
-            fatal(init.io, "kmdconv: error: cannot serialize JSON: {s}\n", .{@errorName(e)});
+        output_data = kmsDataToJson(&data, init.gpa) catch |e| fatalError(init.io, e, "cannot serialize JSON");
         output_owned = true;
     } else {
-        var arena: std.heap.ArenaAllocator = .init(init.gpa);
-        defer arena.deinit();
         const data = jsonToKmsData(arena.allocator(), input_data) catch |e|
             fatal(
                 init.io,
-                "kmdconv: error: invalid JSON input: {s} (is this a .kmd file? use -r to convert it to JSON)\n",
+                "invalid JSON input: {s} (is this a .kmd file? use -r to convert it to JSON)\n",
                 .{@errorName(e)},
             );
-        output_data = kmsdata.write(init.gpa, &data) catch |e|
-            fatal(init.io, "kmdconv: error: cannot build .kmd data: {s}\n", .{@errorName(e)});
+        output_data = kmsdata.write(init.gpa, &data) catch |e| fatalError(init.io, e, "cannot build .kmd data");
         output_owned = true;
     }
 
@@ -162,17 +153,16 @@ pub fn main(init: std.process.Init) !void {
     var derived: ?[]u8 = null;
     defer if (derived) |p| init.gpa.free(p);
     if (output_path == null and !std.mem.eql(u8, input, "-")) {
-        derived = deriveOutputPath(init.gpa, input, reverse) catch |e|
-            fatal(init.io, "kmdconv: error: cannot derive output path: {s}\n", .{@errorName(e)});
+        derived = deriveOutputPath(init.gpa, input, reverse) catch |e| fatalError(init.io, e, "cannot derive output path");
     }
     const out_path: ?[]const u8 = output_path orelse derived;
 
     // Write output.
     if (out_path) |p| {
         std.Io.Dir.writeFile(std.Io.Dir.cwd(), init.io, .{ .sub_path = p, .data = output_data }) catch |e|
-            fatal(init.io, "kmdconv: error: cannot write {s}: {s}\n", .{ p, @errorName(e) });
+            fatal(init.io, "cannot write {s}: {s}\n", .{ p, @errorName(e) });
     } else {
-        var obuf: [8192]u8 = undefined;
+        var obuf: [io_buffer_size]u8 = undefined;
         var ow = std.Io.File.writer(std.Io.File.stdout(), init.io, &obuf);
         ow.interface.writeAll(output_data) catch {};
         ow.interface.flush() catch {};
@@ -617,6 +607,10 @@ test "the default output path keeps the stem and swaps the suffix" {
         .{ .input = "dir/sub/data.json", .reverse = false, .want = "data.kmd" },
         .{ .input = "data.kmd", .reverse = true, .want = "data.json" },
         .{ .input = "src/vlmcsd.kmd", .reverse = true, .want = "vlmcsd.json" },
+        // Only the last suffix is replaced, and a name without one keeps all of
+        // itself: the stem is the file name, not the extension-stripped prefix.
+        .{ .input = "archive.tar.gz", .reverse = false, .want = "archive.tar.kmd" },
+        .{ .input = "Makefile", .reverse = false, .want = "Makefile.kmd" },
     };
     for (cases) |case| {
         const got = try deriveOutputPath(gpa, case.input, case.reverse);

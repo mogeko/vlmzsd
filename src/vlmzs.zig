@@ -27,10 +27,17 @@ const default_timeout_seconds: u32 = 30;
 /// (then `--data <file>` is required at runtime).
 const embedded_kmd: []const u8 = if (build_options.embedded_data) @embedFile("vlmcsd.kmd") else &.{};
 
-/// Bytes staged per request and per stream. The largest report is a `--verbose`
-/// request+response dump (~1.5 KiB), so this leaves more than 2x headroom;
-/// `Report` also has a spill path so that text is never dropped.
-const report_buffer_size = 4096;
+/// One page, the buffer size of every stream and stage in the client: the stdout
+/// and stderr writers, a session's socket buffers, and one request's report.
+/// The largest report is a `--verbose` request+response dump (~1.5 KiB), so this
+/// leaves more than 2x headroom; `Report` also has a spill path so that no text
+/// is dropped.
+const io_buffer_size = cli_helper.io_buffer_size;
+const report_buffer_size = io_buffer_size;
+
+// ---------------------------------------------------------------------------
+// Output and report
+// ---------------------------------------------------------------------------
 
 /// Bare stdout/stderr writers for the client. The client is a CLI debugging
 /// tool, not a service: its answer (ePID) and `--verbose` protocol dumps go to
@@ -153,7 +160,7 @@ const Report = struct {
     /// vanished mid-exchange) returns after the `Sending activation request`
     /// prefix was staged but before the result completed that line; the caller
     /// then reports the failure on stderr, which would visually continue the
-    /// unterminated stdout line. Called from the `errdefer` in `sendRequestOn`
+    /// unterminated stdout line. Called from the `errdefer` in `Session.exchange`
     /// *before* the block is flushed, so even the failure path emits a
     /// complete line.
     fn endLine(self: *Report) void {
@@ -176,6 +183,10 @@ const Report = struct {
         self.err.print(fmt, args) catch {};
     }
 };
+
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
 
 /// Format a 16-byte GUID as the canonical `8-4-4-4-12` hex string. The first
 /// three fields are little-endian, the last eight bytes are big-endian — the
@@ -241,6 +252,10 @@ fn formatUtc(unix: i64, buf: []u8) []const u8 {
     }) catch unreachable;
 }
 
+// ---------------------------------------------------------------------------
+// CLI surface
+// ---------------------------------------------------------------------------
+
 /// Data-driven option table for `vlmzs` (docs/cli.md §6). Single source of
 /// truth: drives parsing, `--help` rendering, and validation alike.
 const vlmzs_opts = [_]cli_helper.Opt{
@@ -297,7 +312,17 @@ const ClientOptions = struct {
     verbose: bool = false,
 };
 
-fn parseHostPort(host_arg: []const u8) !struct { host: []const u8, port: u16 } {
+// ---------------------------------------------------------------------------
+// Option resolution
+// ---------------------------------------------------------------------------
+
+/// The `HOST[:PORT]` positional, split.
+const HostPort = struct {
+    host: []const u8,
+    port: u16,
+};
+
+fn parseHostPort(host_arg: []const u8) !HostPort {
     // "[addr]:port" form (IPv6 with an explicit port).
     if (host_arg.len > 0 and host_arg[0] == '[') {
         const close = std.mem.indexOfScalar(u8, host_arg, ']') orelse return error.InvalidHost;
@@ -359,11 +384,11 @@ fn resolveOptions(res: *const cli_helper.Result, diag: *cli_helper.Diag) !Client
         if (version != 4 and version != 5 and version != 6) return error.InvalidProtocol;
         break :blk version;
     } else 0;
-    if (try guidValue(res, "--app-id", diag)) |g| opts.app_id = g;
-    if (try guidValue(res, "--sku-id", diag)) |g| opts.sku_id = g;
-    if (try guidValue(res, "--kms-id", diag)) |g| opts.kms_id = g;
-    if (try guidValue(res, "--cmid", diag)) |g| opts.cmid = g;
-    if (try guidValue(res, "--prev-cmid", diag)) |g| opts.prev_cmid = g;
+    opts.app_id = try guidValue(res, "--app-id", diag);
+    opts.sku_id = try guidValue(res, "--sku-id", diag);
+    opts.kms_id = try guidValue(res, "--kms-id", diag);
+    opts.cmid = try guidValue(res, "--cmid", diag);
+    opts.prev_cmid = try guidValue(res, "--prev-cmid", diag);
     opts.workstation = res.get("workstation");
     if (opts.workstation) |name| {
         // The request field is UTF-16; the option is UTF-8. Reject a name that
@@ -397,6 +422,27 @@ fn resolveOptions(res: *const cli_helper.Result, diag: *cli_helper.Diag) !Client
     return opts;
 }
 
+/// Report a configuration error and exit. One wording per `resolveOptions`
+/// failure, so `main` stays a sequence of phases.
+fn reportOptionError(out: *Output, diag: *const cli_helper.Diag, err: anyerror) noreturn {
+    switch (err) {
+        error.UnexpectedPositional => fatal(out, "error: at most one HOST[:PORT] argument is accepted\n", .{}),
+        error.InvalidProtocol => fatal(out, "error: --protocol must be 4, 5, or 6\n", .{}),
+        error.InvalidLicenseStatus => fatal(out, "error: --license-status must be 0..{d}\n", .{max_license_status}),
+        error.InvalidWorkstation => fatal(out, "error: --workstation must be valid UTF-8\n", .{}),
+        error.InvalidAddressFamily => fatal(out, "error: --address-family must be 4 or 6\n", .{}),
+        error.InvalidTimeout => fatal(out, "error: --timeout must be at most {d} seconds\n", .{std.math.maxInt(u32)}),
+        else => {
+            var vbuf: [cli_helper.diag_buffer_size]u8 = undefined;
+            fatal(out, "error: {s}\n", .{cli_helper.describeValueError(diag.*, err, &vbuf)});
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Data selection
+// ---------------------------------------------------------------------------
+
 /// Resolve the product selector (name or 1-based number) to a SKU index.
 fn findSku(data: *const kmsdata.KmsData, product: ?[]const u8) !usize {
     const skus = data.skus();
@@ -422,6 +468,10 @@ fn validateKmsData(data: *const kmsdata.KmsData) error{IncompleteKmsData}!void {
         return error.IncompleteKmsData;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Request construction
+// ---------------------------------------------------------------------------
 
 fn randomCmid(rng: std.Random) [16]u8 {
     var g: [16]u8 = undefined;
@@ -519,6 +569,10 @@ fn utf16FieldToUtf8(field: *const [64]u16, out: []u8) []const u8 {
     return out[0..written];
 }
 
+// ---------------------------------------------------------------------------
+// Response reporting
+// ---------------------------------------------------------------------------
+
 /// Report each failed response-verification check to stderr (C `displayResponse`).
 fn reportVerificationErrors(result: kms.ResponseResult, out: *Report) void {
     out.print("\n", .{}); // end the in-progress "Sending ..." line on stdout
@@ -563,11 +617,12 @@ fn printResultSummary(base: *const kms.Response, hwid: ?*const [8]u8, out: *Repo
 }
 
 /// One aligned GUID line with the product name when the GUID is in `list`.
-fn printGuidLine(out: *Report, label: []const u8, guid: *const kms.Guid, list: []const kmsdata.VlmcsdData, buf: []u8) void {
+fn printGuidLine(out: *Report, label: []const u8, guid: *const kms.Guid, list: []const kmsdata.VlmcsdData) void {
+    var buf: [64]u8 = undefined;
     if (kms.getProductIndex(guid, list)) |idx| {
-        out.print("{s:<32}: {s} ({s})\n", .{ label, formatGuid(guid, buf), list[idx].name });
+        out.print("{s:<32}: {s} ({s})\n", .{ label, formatGuid(guid, &buf), list[idx].name });
     } else {
-        out.print("{s:<32}: {s}\n", .{ label, formatGuid(guid, buf) });
+        out.print("{s:<32}: {s}\n", .{ label, formatGuid(guid, &buf) });
     }
 }
 
@@ -585,9 +640,9 @@ fn printRequestVerbose(req: *const kms.Request, data: *const kmsdata.KmsData, ou
     out.print("Client is a virtual machine     : {s}\n", .{if (req.vm_info != 0) "Yes" else "No"});
     out.print("Licensing status                : {d} ({s})\n", .{ req.license_status, licenseStatusText(req.license_status) });
     out.print("Remaining time (0 = forever)    : {d} minutes\n", .{req.binding_expiration});
-    printGuidLine(out, "Application ID", &req.app_id, data.apps(), &guid_buf);
-    printGuidLine(out, "SKU ID (aka Activation ID)", &req.act_id, data.skus(), &guid_buf);
-    printGuidLine(out, "KMS ID (aka KMS counted ID)", &req.kms_id, data.kms(), &guid_buf);
+    printGuidLine(out, "Application ID", &req.app_id, data.apps());
+    printGuidLine(out, "SKU ID (aka Activation ID)", &req.act_id, data.skus());
+    printGuidLine(out, "KMS ID (aka KMS counted ID)", &req.kms_id, data.kms());
     out.print("Client machine ID               : {s}\n", .{formatGuid(&req.cmid, &guid_buf)});
     out.print("Previous client machine ID      : {s}\n", .{formatGuid(&req.cmid_prev, &guid_buf)});
     out.print("Client request timestamp (UTC)  : {s}\n", .{formatUtc(kms.fileTimeToUnixTime(kms.fileTimeToU64(req.client_time)), &time_buf)});
@@ -617,6 +672,20 @@ fn printResponseVerbose(base: *const kms.Response, hwid: ?*const [8]u8, result: 
     out.print("\n", .{});
 }
 
+/// The server's answer: the per-field dump under `--verbose`, else the one-line
+/// summary. `hwid` is present only for v6 responses.
+fn printResponse(out: *Report, base: *const kms.Response, hwid: ?*const [8]u8, result: kms.ResponseResult, verbose: bool) void {
+    if (verbose) {
+        printResponseVerbose(base, hwid, result, out);
+    } else {
+        printResultSummary(base, hwid, out);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transport
+// ---------------------------------------------------------------------------
+
 /// Transfer syntax for a request: the reference client sends the first request
 /// after BIND as NDR32 and later ones as NDR64 (`firstPacketSent` in
 /// `rpcSendRequest`) — the Windows KMS client behaves the same way. NDR64 is an
@@ -632,31 +701,69 @@ fn requestUseNdr64(bind: rpc.BindResult, first: bool, ndr64_allowed: bool) bool 
 /// The packet reader holds pointers into this struct, so a session must never be
 /// copied after `open` — it stays in the caller's frame as a single `var`, which
 /// is also what lets `reopen` re-address `conn` after a reconnection.
+/// Everything one run borrows: the allocator, the process handles, the resolved
+/// options and the loaded data. Grouped so the send path passes one pointer
+/// rather than five, and so a test can build one without a whole `main`.
+const Client = struct {
+    gpa: Allocator,
+    io: Io,
+    opts: *const ClientOptions,
+    out: *Output,
+    data: *const kmsdata.KmsData,
+};
+
+/// The window `--reconnect-per-request` runs in: one permit per pooled thread,
+/// and the failure counter the exit status is built from.
+const Window = struct {
+    permits: *Io.Semaphore,
+    failures: *std.atomic.Value(u32),
+};
+
+/// Whether a failed exchange may be resent on a fresh connection. A one-shot
+/// connection (`--reconnect-per-request`) has nothing to retry; a reused one
+/// meets a closed socket whenever the server disconnects per request.
+const Retry = enum { never, once };
+
+/// One client connection that outlives a single request: the socket, its
+/// buffers, and the negotiation outcome.
+///
+/// The packet reader holds pointers into this struct, so a session must never be
+/// copied after `open` — it stays in the caller's frame as a single `var`, which
+/// is also what lets `reopen` re-address `conn` after a reconnection.
 const Session = struct {
     io: Io,
-    stream: Io.net.Stream,
+    stream: Io.net.Stream = undefined,
     /// Fallback source for the packet reader; socket reads go through
     /// `conn.packet_reader`, so this stays empty.
-    reader: Io.Reader,
-    writer: Io.net.Stream.Writer,
-    conn: network.ClientSession,
+    reader: Io.Reader = undefined,
+    writer: Io.net.Stream.Writer = undefined,
+    conn: network.ClientSession = undefined,
     /// BIND/ALTER-CONTEXT outcome, kept so later requests can widen to NDR64.
-    bind: rpc.BindResult,
+    bind: rpc.BindResult = undefined,
+    /// True until the first REQUEST went out: the reference sends that one as
+    /// NDR32 when the server accepted both syntaxes (`firstPacketSent` in
+    /// `rpcSendRequest`).
+    first_packet: bool = true,
     /// Read-ahead for the packet reader: a header and its body arrive together.
-    rbuf: [4096]u8,
-    wbuf: [4096]u8,
+    rbuf: [io_buffer_size]u8 = undefined,
+    wbuf: [io_buffer_size]u8 = undefined,
     /// The owner reconnects and resends when the peer closed the connection, so
     /// this attempt's report is dropped instead of printing its header again.
     retry_on_close: bool = false,
 
+    fn init(io: Io) Session {
+        return .{ .io = io };
+    }
+
     /// Connect and BIND, leaving `conn` ready to carry one REQUEST.
-    fn open(self: *Session, gpa: Allocator, opts: *const ClientOptions) !void {
+    fn open(self: *Session, client: *const Client) !void {
         const io = self.io;
+        const opts = client.opts;
         self.stream = try network.connect(io, opts.host.?, opts.port, opts.address_family);
         self.reader = Io.Reader.fixed("");
         self.writer = self.stream.writer(io, &self.wbuf);
         self.conn = .{
-            .allocator = gpa,
+            .allocator = client.gpa,
             .packet_reader = .init(.{ .peer = .{
                 .io = io,
                 .handle = self.stream.socket.handle,
@@ -664,15 +771,16 @@ const Session = struct {
             } }, &self.reader, &self.rbuf),
             .writer = &self.writer.interface,
             .call_id = 2,
-            .use_ndr64 = opts.ndr64,
             .use_btfn = opts.btfn,
             .multiplexed = opts.multiplexed,
         };
         // A reused session reconnects when the peer closed; a one-shot
         // connection (`--reconnect-per-request`) has nothing to retry.
         self.retry_on_close = true;
+        self.first_packet = true;
         self.bind = try self.bindContexts();
-        self.conn.use_ndr64 = requestUseNdr64(self.bind, true, opts.ndr64);
+        // The transfer syntax is the request's, not the connection's: `exchange`
+        // picks it from `bind` and `first_packet` before every send.
     }
 
     /// BIND, plus the ALTER-CONTEXT that binds NDR32 when the server NACKed it.
@@ -698,36 +806,110 @@ const Session = struct {
 
     /// Replace a connection the peer closed (`--disconnect-per-request` on the
     /// server, or any keep-alive timeout) with a fresh one.
-    fn reopen(self: *Session, gpa: Allocator, opts: *const ClientOptions) !void {
+    fn reopen(self: *Session, client: *const Client) !void {
         self.close();
-        try self.open(gpa, opts);
+        try self.open(client);
+    }
+
+    /// True when this send failure means "the peer closed, the owner will resend
+    /// on a fresh connection", so this attempt's staged report is dropped instead
+    /// of printing a header the retry prints again.
+    fn willRetry(self: *const Session, err: anyerror) bool {
+        if (!self.retry_on_close) return false;
+        return switch (err) {
+            error.EndOfStream, error.ConnectionResetByPeer, error.SocketUnconnected => true,
+            else => false,
+        };
+    }
+
+    /// Send one KMS request, verify and report the answer. Everything is staged in
+    /// a `Report` and flushed as one block, so a concurrent request cannot splice
+    /// its output into this one's.
+    fn exchange(self: *Session, client: *const Client, base: kms.Request, rng: std.Random) !Outcome {
+        // One request = one lock acquisition: stage the report here and flush it
+        // on every exit path, including the early rejection/verification returns.
+        var report_out_buffer: [report_buffer_size]u8 = undefined;
+        var report_err_buffer: [report_buffer_size]u8 = undefined;
+        var report = Report.init(client.out, &report_out_buffer, &report_err_buffer);
+        // Set when the connection turns out to be closed and the caller will
+        // resend on a fresh one: the nothing-happened attempt leaves no output.
+        var discard_report = false;
+        defer if (!discard_report) client.out.writeBlock(report.out.buffered(), report.err.buffered());
+        // A network failure below returns with the request prefix still unline-
+        // terminated; close the line before the flush above, so the caller's
+        // stderr diagnostic does not continue it.
+        errdefer if (!discard_report) report.endLine();
+
+        // The transfer syntax is this request's, and the first REQUEST after BIND
+        // is the one that goes out as NDR32 (see `requestUseNdr64`).
+        self.conn.use_ndr64 = requestUseNdr64(self.bind, self.first_packet, client.opts.ndr64);
+        self.first_packet = false;
+
+        const proto: u16 = @intCast(base.version >> 16);
+        if (client.opts.verbose) printRequestVerbose(&base, client.data, &report);
+        report.print("Sending activation request (KMS V{d}) ", .{proto});
+
+        if (proto == 4) {
+            var req: kms.RequestV4 = undefined;
+            kms.createRequestV4(&req, &base);
+            const sent = self.conn.sendRequest(std.mem.asBytes(&req)) catch |err| {
+                discard_report = self.willRetry(err);
+                return err;
+            };
+            defer client.gpa.free(sent.data);
+            if (sent.status != 0) {
+                printRejection(sent.status, &report);
+                return .failed;
+            }
+            var resp: kms.ResponseV4 = undefined;
+            const result = kms.decryptResponseV4(&resp, sent.data.len, sent.data, &req);
+            if (!result.ok()) {
+                reportVerificationErrors(result, &report);
+                return .failed;
+            }
+            printResponse(&report, &resp.base, null, result, client.opts.verbose);
+        } else {
+            var req: kms.RequestV6 = undefined;
+            kms.createRequestV6(&req, &base, rng);
+            const sent = self.conn.sendRequest(std.mem.asBytes(&req)) catch |err| {
+                discard_report = self.willRetry(err);
+                return err;
+            };
+            defer client.gpa.free(sent.data);
+            if (sent.status != 0) {
+                printRejection(sent.status, &report);
+                return .failed;
+            }
+            var resp: kms.ResponseV6 = undefined;
+            // Only a v6 response carries a HwId, and only then does the decrypt
+            // copy one out; a v5 response has no field to print.
+            const is_v6 = proto > 5;
+            var hwid: [8]u8 = @splat(0);
+            const result = kms.decryptResponseV6(&resp, sent.data.len, sent.data, &req, if (is_v6) &hwid else null);
+            if (!result.ok()) {
+                reportVerificationErrors(result, &report);
+                return .failed;
+            }
+            const hwid_or_null: ?*const [8]u8 = if (is_v6) &hwid else null;
+            printResponse(&report, &resp.base, hwid_or_null, result, client.opts.verbose);
+        }
+        return .activated;
+    }
+
+    /// `exchange`, plus the one reconnect-and-resend a reused connection needs.
+    /// The failed attempt never reached a live connection, so resending is safe:
+    /// one reopen per request, no retry loop.
+    fn transact(self: *Session, client: *const Client, base: kms.Request, rng: std.Random, retry: Retry) !Outcome {
+        return self.exchange(client, base, rng) catch |err| switch (err) {
+            error.EndOfStream, error.ConnectionResetByPeer, error.SocketUnconnected => {
+                if (retry == .never) return err;
+                try self.reopen(client);
+                return self.exchange(client, base, rng);
+            },
+            else => |e| return e,
+        };
     }
 };
-
-fn sendRequest(
-    gpa: Allocator,
-    io: Io,
-    opts: *const ClientOptions,
-    base: kms.Request,
-    rng: std.Random,
-    out: *Output,
-    data: *const kmsdata.KmsData,
-) !Outcome {
-    var session: Session = .{
-        .io = io,
-        .stream = undefined,
-        .reader = undefined,
-        .writer = undefined,
-        .conn = undefined,
-        .bind = undefined,
-        .rbuf = undefined,
-        .wbuf = undefined,
-    };
-    try session.open(gpa, opts);
-    defer session.close();
-
-    return sendRequestOn(gpa, &session, base, rng, out, data, opts.verbose);
-}
 
 /// What one activation attempt produced. A server rejection and a failed
 /// response verification are both `failed`: the client did reach the server, but
@@ -735,96 +917,12 @@ fn sendRequest(
 /// Transport failures stay Zig errors and propagate to the caller.
 const Outcome = enum { activated, failed };
 
-/// Flag a send failure the caller will retry on a fresh connection, so the
-/// attempt's staged report is dropped instead of printing a request header the
-/// retry would print again. Returns the error unchanged.
-fn markRetryableSend(session: *const Session, discard_report: *bool, err: anyerror) anyerror {
-    switch (err) {
-        error.EndOfStream, error.ConnectionResetByPeer, error.SocketUnconnected => {
-            if (session.retry_on_close) discard_report.* = true;
-        },
-        else => {},
-    }
-    return err;
-}
-
-/// Send one KMS request over an already-established connection (BIND done).
-fn sendRequestOn(
-    gpa: Allocator,
-    session: *Session,
-    base: kms.Request,
-    rng: std.Random,
-    out: *Output,
-    data: *const kmsdata.KmsData,
-    verbose: bool,
-) !Outcome {
-    // One request = one lock acquisition: stage the report here and flush it on
-    // every exit path, including the early rejection/verification returns.
-    var report_out_buffer: [report_buffer_size]u8 = undefined;
-    var report_err_buffer: [report_buffer_size]u8 = undefined;
-    var report = Report.init(out, &report_out_buffer, &report_err_buffer);
-    // Set when the connection turns out to be closed and the caller will resend
-    // on a fresh one: the nothing-happened attempt leaves no output behind.
-    var discard_report = false;
-    defer if (!discard_report) out.writeBlock(report.out.buffered(), report.err.buffered());
-    // A network failure below returns with the request prefix still unline-
-    // terminated; close the line before the flush above, so the caller's
-    // stderr diagnostic does not continue it.
-    errdefer if (!discard_report) report.endLine();
-
-    const proto: u16 = @intCast(base.version >> 16);
-    if (verbose) printRequestVerbose(&base, data, &report);
-    report.print("Sending activation request (KMS V{d}) ", .{proto});
-
-    if (proto == 4) {
-        var req: kms.RequestV4 = undefined;
-        kms.createRequestV4(&req, &base);
-        const sent = session.conn.sendRequest(std.mem.asBytes(&req)) catch |err|
-            return markRetryableSend(session, &discard_report, err);
-        defer gpa.free(sent.data);
-        if (sent.status != 0) {
-            printRejection(sent.status, &report);
-            return .failed;
-        }
-        var resp: kms.ResponseV4 = undefined;
-        const result = kms.decryptResponseV4(&resp, sent.data.len, sent.data, &req);
-        if (!result.ok()) {
-            reportVerificationErrors(result, &report);
-            return .failed;
-        }
-        if (verbose) {
-            printResponseVerbose(&resp.base, null, result, &report);
-        } else {
-            printResultSummary(&resp.base, null, &report);
-        }
-    } else {
-        var req: kms.RequestV6 = undefined;
-        kms.createRequestV6(&req, &base, rng);
-        const sent = session.conn.sendRequest(std.mem.asBytes(&req)) catch |err|
-            return markRetryableSend(session, &discard_report, err);
-        defer gpa.free(sent.data);
-        if (sent.status != 0) {
-            printRejection(sent.status, &report);
-            return .failed;
-        }
-        var resp: kms.ResponseV6 = undefined;
-        // Only a v6 response carries a HwId, and only then does the decrypt
-        // copy one out; a v5 response has no field to print.
-        const is_v6 = proto > 5;
-        var hwid: [8]u8 = @splat(0);
-        const result = kms.decryptResponseV6(&resp, sent.data.len, sent.data, &req, if (is_v6) &hwid else null);
-        if (!result.ok()) {
-            reportVerificationErrors(result, &report);
-            return .failed;
-        }
-        const hwid_or_null: ?*const [8]u8 = if (is_v6) &hwid else null;
-        if (verbose) {
-            printResponseVerbose(&resp.base, hwid_or_null, result, &report);
-        } else {
-            printResultSummary(&resp.base, hwid_or_null, &report);
-        }
-    }
-    return .activated;
+/// Send one request over its own connection (`--reconnect-per-request`).
+fn sendRequest(client: *const Client, base: kms.Request, rng: std.Random) !Outcome {
+    var session: Session = .init(client.io);
+    try session.open(client);
+    defer session.close();
+    return session.transact(client, base, rng, .never);
 }
 
 /// Exit non-zero when any request did not activate. The per-request diagnostics
@@ -846,35 +944,29 @@ fn dispatchFailed(out: *Output, io: Io, group: *Io.Group, err: anyerror) noretur
     std.process.exit(1);
 }
 
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
 /// One activation request dispatched as a pooled task (via `Group.concurrent`).
 /// Derives its own PRNG from `seed` so concurrent requests never share PRNG
 /// state; failures are reported here rather than propagated. `permits` is the
 /// dispatcher's window: the slot is returned on *every* exit path, so a task
 /// that fails or is dropped cannot starve later dispatches.
-fn sendRequestTask(
-    gpa: Allocator,
-    io: Io,
-    opts: *const ClientOptions,
-    base: kms.Request,
-    seed: u64,
-    out: *Output,
-    data: *const kmsdata.KmsData,
-    permits: *Io.Semaphore,
-    failures: *std.atomic.Value(u32),
-) void {
-    defer permits.post(io);
+fn sendRequestTask(client: *const Client, base: kms.Request, seed: u64, window: *const Window) void {
+    defer window.permits.post(client.io);
     var prng: std.Random.DefaultPrng = .init(seed);
-    const outcome = sendRequest(gpa, io, opts, base, prng.random(), out, data) catch |e| switch (e) {
+    const outcome = sendRequest(client, base, prng.random()) catch |e| switch (e) {
         // Aborted, not failed: this is `dispatchFailed`'s cancel, and the
         // dispatch error it is already reporting says why.
         error.Canceled => return,
         else => {
-            out.eprint("request failed: {s}\n", .{@errorName(e)});
-            _ = failures.fetchAdd(1, .monotonic);
+            client.out.eprint("request failed: {s}\n", .{@errorName(e)});
+            _ = window.failures.fetchAdd(1, .monotonic);
             return;
         },
     };
-    if (outcome == .failed) _ = failures.fetchAdd(1, .monotonic);
+    if (outcome == .failed) _ = window.failures.fetchAdd(1, .monotonic);
 }
 
 /// How many `--reconnect-per-request` requests may be in flight at once.
@@ -885,6 +977,9 @@ fn sendRequestTask(
 /// completes in waves instead of one thread per request. The rule is the one
 /// `Io.Threaded` uses to size its own `async_limit` (the logical CPU count) —
 /// `std.process.Init` does not expose that option, so the bound has to be ours.
+/// Window used when the platform cannot report a CPU count.
+const fallback_parallelism: usize = 8;
+
 fn parallelism() usize {
     const count = std.Thread.getCpuCount() catch fallback_parallelism;
     // A zero here would park the dispatcher on a semaphore nothing can post.
@@ -892,71 +987,26 @@ fn parallelism() usize {
     return count;
 }
 
-/// Window used when the platform cannot report a CPU count.
-const fallback_parallelism: usize = 8;
-
-/// Send one request over `session`, reconnecting once when the peer has closed
-/// the connection.
-///
-/// A server run with `--disconnect-per-request` closes after every RESPONSE, so
-/// the next request on a keep-alive connection meets a closed socket. The failed
-/// attempt never reached a live connection, so it is safe to send again: one
-/// reopen per request, no retry loop.
-fn sendOnSession(
-    gpa: Allocator,
-    opts: *const ClientOptions,
-    session: *Session,
-    base: kms.Request,
-    rng: std.Random,
-    out: *Output,
-    data: *const kmsdata.KmsData,
-) !Outcome {
-    return sendRequestOn(gpa, session, base, rng, out, data, opts.verbose) catch |err| switch (err) {
-        error.EndOfStream, error.ConnectionResetByPeer, error.SocketUnconnected => {
-            try session.reopen(gpa, opts);
-            return sendRequestOn(gpa, session, base, rng, out, data, opts.verbose);
-        },
-        else => |e| return e,
-    };
-}
-
 /// Send `--count` requests over a single reused connection (keep-alive).
 /// Requests are sequential because one connection carries one in-flight RPC.
 /// Returns how many of them did not activate.
-fn sendRequestsReused(
-    gpa: Allocator,
-    io: Io,
-    opts: *const ClientOptions,
-    data: *const kmsdata.KmsData,
-    sku_index: usize,
-    rng: std.Random,
-    out: *Output,
-) !u32 {
-    var session: Session = .{
-        .io = io,
-        .stream = undefined,
-        .reader = undefined,
-        .writer = undefined,
-        .conn = undefined,
-        .bind = undefined,
-        .rbuf = undefined,
-        .wbuf = undefined,
-    };
-    try session.open(gpa, opts);
+fn sendRequestsReused(client: *const Client, sku_index: usize, rng: std.Random) !u32 {
+    var session: Session = .init(client.io);
+    try session.open(client);
     defer session.close();
 
     var failures: u32 = 0;
     var i: usize = 0;
-    while (i < opts.count) : (i += 1) {
-        const base = buildRequestBase(opts, data, sku_index, rng, io);
-        const outcome = try sendOnSession(gpa, opts, &session, base, rng, out, data);
-        if (outcome == .failed) failures += 1;
-        // Later requests on the same association use NDR64 when the server
-        // supports it (C `firstPacketSent` in `rpcSendRequest`).
-        session.conn.use_ndr64 = requestUseNdr64(session.bind, false, opts.ndr64);
+    while (i < client.opts.count) : (i += 1) {
+        const base = buildRequestBase(client.opts, client.data, sku_index, rng, client.io);
+        if (try session.transact(client, base, rng, .once) == .failed) failures += 1;
     }
     return failures;
 }
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
 
 fn listProducts(data: *const kmsdata.KmsData, out: *Output) void {
     out.print("You may use these product names or numbers:\n", .{});
@@ -966,91 +1016,34 @@ fn listProducts(data: *const kmsdata.KmsData, out: *Output) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    // Collect the raw arguments (skip argv[0]).
-    var args_list: std.ArrayList([]const u8) = .empty;
-    defer args_list.deinit(init.gpa);
-    var args_iter: std.process.Args.Iterator = .init(init.minimal.args);
-    _ = args_iter.skip();
-    while (args_iter.next()) |arg| {
-        try args_list.append(init.gpa, arg);
-    }
-
-    var diag: cli_helper.Diag = .{};
-    var res = cli_helper.parseWithDiag(init.gpa, &vlmzs_opts, args_list.items, &diag) catch |err| {
-        // Short diagnostic naming the argument; the full help is one `--help` away.
-        var ebuf: [128]u8 = undefined;
-        cli_helper.fatalStderr(init.io, "vlmzs", "{s}", .{cli_helper.parseErrorMessage(err, diag, &ebuf)});
+    const prog: cli_helper.Program = .{
+        .name = "vlmzs",
+        .version_display = version_display,
+        .positional_hint = "[HOST[:PORT]]",
     };
+    var res = (try cli_helper.parseProcess(init, &vlmzs_opts, prog, null)) orelse return;
     defer res.deinit();
+    var diag: cli_helper.Diag = .{};
 
-    if (res.hasFlag("help")) {
-        var hbuf: [4096]u8 = undefined;
-        var hw = std.Io.File.writer(std.Io.File.stdout(), init.io, &hbuf);
-        try cli_helper.writeHelp(&hw.interface, "vlmzs", &vlmzs_opts, "[HOST[:PORT]]");
-        try hw.interface.flush();
-        return;
-    }
-    if (res.hasFlag("version")) {
-        var buf: [64]u8 = undefined;
-        var fw = std.Io.File.writer(std.Io.File.stdout(), init.io, &buf);
-        try fw.interface.print("vlmzs {s}\n", .{version_display});
-        try fw.interface.flush();
-        return;
-    }
-
-    var out_buf: [4096]u8 = undefined;
-    var err_buf: [4096]u8 = undefined;
+    var out_buf: [io_buffer_size]u8 = undefined;
+    var err_buf: [io_buffer_size]u8 = undefined;
     var out: Output = .init(init.io, &out_buf, &err_buf);
 
-    var opts = resolveOptions(&res, &diag) catch |e| switch (e) {
-        error.UnexpectedPositional => fatal(&out, "error: at most one HOST[:PORT] argument is accepted\n", .{}),
-        error.InvalidProtocol => fatal(&out, "error: --protocol must be 4, 5, or 6\n", .{}),
-        error.InvalidLicenseStatus => fatal(&out, "error: --license-status must be 0..{d}\n", .{max_license_status}),
-        error.InvalidWorkstation => fatal(&out, "error: --workstation must be valid UTF-8\n", .{}),
-        error.InvalidAddressFamily => fatal(&out, "error: --address-family must be 4 or 6\n", .{}),
-        error.InvalidTimeout => fatal(&out, "error: --timeout must be at most {d} seconds\n", .{std.math.maxInt(u32)}),
-        else => {
-            var vbuf: [128]u8 = undefined;
-            if (diag.spelling.len > 0) {
-                const text = std.fmt.bufPrint(&vbuf, "{s}: invalid value \"{s}\"", .{ diag.spelling, diag.value }) catch @errorName(e);
-                fatal(&out, "error: {s}\n", .{text});
-            }
-            fatal(&out, "error: {s}\n", .{@errorName(e)});
+    var opts = resolveOptions(&res, &diag) catch |e| reportOptionError(&out, &diag, e);
+
+    // `--data` → FHS/XDG search → embedded default; the order is the helper's,
+    // the wording and the exit are this binary's.
+    var loaded = switch (cli_helper.loadKmsData(init.io, init.gpa, init.environ_map, opts.data_file, embedded_kmd)) {
+        .loaded => |l| l,
+        .failed => |why| switch (why) {
+            .data_file => |d| fatal(&out, "error: failed to read data file {s}: {s}\n", .{ d.path, @errorName(d.err) }),
+            .fhs => |e| fatal(&out, "error: failed to read FHS data file: {s}\n", .{@errorName(e)}),
+            .no_data => fatal(&out, "error: no KMS data found; specify --data <file>\n", .{}),
         },
     };
+    defer loaded.deinit(init.gpa);
 
-    // Load the KMS data: explicit path (--data) → FHS/XDG search → embedded
-    // default.
-    var kmd_owned = false;
-    var kmd_raw: []const u8 = undefined;
-    var fhs_loaded: ?cli_helper.FhsKmd = null;
-    defer if (fhs_loaded) |*f| {
-        init.gpa.free(f.path);
-        init.gpa.free(f.data);
-    };
-    if (opts.data_file) |path| {
-        kmd_raw = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), init.io, path, init.gpa, .unlimited) catch |e| {
-            out.eprint("error: failed to read data file {s}: {s}\n", .{ path, @errorName(e) });
-            std.process.exit(1);
-        };
-        kmd_owned = true;
-    } else {
-        fhs_loaded = cli_helper.loadFhsKmd(init.io, init.gpa, init.minimal.environ) catch |e| {
-            out.eprint("error: failed to read FHS data file: {s}\n", .{@errorName(e)});
-            std.process.exit(1);
-        };
-        if (fhs_loaded) |*f| {
-            kmd_raw = f.data;
-        } else if (embedded_kmd.len > 0) {
-            kmd_raw = embedded_kmd;
-        } else {
-            out.eprint("error: no KMS data found; specify --data <file>\n", .{});
-            std.process.exit(1);
-        }
-    }
-    defer if (kmd_owned) init.gpa.free(@constCast(kmd_raw));
-
-    var data = kmsdata.parse(init.gpa, kmd_raw) catch |e| {
+    var data = kmsdata.parse(init.gpa, loaded.raw) catch |e| {
         out.eprint("error: invalid KMS data: {s}\n", .{@errorName(e)});
         std.process.exit(1);
     };
@@ -1077,6 +1070,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
+    const client: Client = .{ .gpa = init.gpa, .io = init.io, .opts = &opts, .out = &out, .data = &data };
     var prng: std.Random.DefaultPrng = .init(cli_helper.makeSeed(init.io));
 
     if (opts.reconnect_per_request) {
@@ -1093,6 +1087,7 @@ pub fn main(init: std.process.Init) !void {
         var group: Io.Group = .init;
         var permits: Io.Semaphore = .{ .permits = parallelism() };
         var failures: std.atomic.Value(u32) = .init(0);
+        const window: Window = .{ .permits = &permits, .failures = &failures };
         var i: usize = 0;
         while (i < opts.count) : (i += 1) {
             const seed = prng.random().int(u64);
@@ -1101,9 +1096,7 @@ pub fn main(init: std.process.Init) !void {
             permits.wait(init.io) catch |e| {
                 dispatchFailed(&out, init.io, &group, e);
             };
-            group.concurrent(init.io, sendRequestTask, .{
-                init.gpa, init.io, &opts, base, seed, &out, &data, &permits, &failures,
-            }) catch |e| {
+            group.concurrent(init.io, sendRequestTask, .{ &client, base, seed, &window }) catch |e| {
                 permits.post(init.io);
                 dispatchFailed(&out, init.io, &group, e);
             };
@@ -1115,7 +1108,7 @@ pub fn main(init: std.process.Init) !void {
         exitOnFailures(&out, failures.load(.monotonic), opts.count);
     } else {
         // Reuse one connection for all requests (keep-alive), sent sequentially.
-        const failures = sendRequestsReused(init.gpa, init.io, &opts, &data, sku_index, prng.random(), &out) catch |e| {
+        const failures = sendRequestsReused(&client, sku_index, prng.random()) catch |e| {
             out.eprint("request failed: {s}\n", .{@errorName(e)});
             std.process.exit(1);
         };
@@ -1258,7 +1251,7 @@ test "concurrent requests do not interleave inside a report" {
 // Pins the failure path: a request that dies on the wire returns after the
 // prefix was staged, and the staged line must still be terminated — otherwise
 // the caller's stderr diagnostic is written straight into the middle of that
-// stdout line. Exercises the real `sendRequestOn` with an at-EOF reader, which
+// stdout line. Exercises the real `Session.exchange` with an at-EOF reader, which
 // is what a peer that vanished mid-exchange looks like (see `expectError`).
 test "a request that fails on the wire still emits a complete line" {
     const alloc = std.testing.allocator;
@@ -1286,9 +1279,9 @@ test "a request that fails on the wire still emits a complete line" {
     var reader: std.Io.Reader = .fixed(&no_bytes);
     var sent: [4096]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&sent);
-    // Only `conn` and `retry_on_close` are touched by a send, so the socket
-    // fields of the session stay undefined here.
-    var session: Session = undefined;
+    // Only `conn` is touched by a send, so the socket fields of the session stay
+    // undefined here.
+    var session: Session = .init(io);
     session.conn = .{
         .allocator = alloc,
         .packet_reader = .init(.{}, &reader, &.{}),
@@ -1296,16 +1289,12 @@ test "a request that fails on the wire still emits a complete line" {
         .use_ndr64 = true,
         // No socket behind these buffers, so the timeout stays off.
     };
+    // The exchange asks the negotiation outcome which syntax to use; with both
+    // accepted and `first_packet` still set, it picks NDR32.
+    session.bind = .{ .has_ndr32 = true, .has_ndr64 = true };
+    const client: Client = .{ .gpa = alloc, .io = io, .opts = &opts, .out = &output, .data = &data };
 
-    try std.testing.expectError(error.EndOfStream, sendRequestOn(
-        alloc,
-        &session,
-        base,
-        prng.random(),
-        &output,
-        &data,
-        false,
-    ));
+    try std.testing.expectError(error.EndOfStream, session.exchange(&client, base, prng.random()));
 
     try std.testing.expectEqualStrings("Sending activation request (KMS V6) \n", sink.buffered());
 }
@@ -1536,7 +1525,8 @@ test "a server that closes after each request is reconnected" {
     output.test_out = &sink;
 
     var prng: std.Random.DefaultPrng = .init(0x1234_5678);
-    const failures = try sendRequestsReused(alloc, io, &opts, &data, 0, prng.random(), &output);
+    const client: Client = .{ .gpa = alloc, .io = io, .opts = &opts, .out = &output, .data = &data };
+    const failures = try sendRequestsReused(&client, 0, prng.random());
 
     // Every request activated, on its own connection: no failure, and one
     // answer line per request (the dropped attempt leaves no output behind).
@@ -1657,4 +1647,92 @@ test "a timestamp before the Unix epoch prints as the epoch" {
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("1970-01-01 00:00:00", formatUtc(-1, &buf));
     try std.testing.expectEqualStrings("1970-01-01 00:00:00", formatUtc(-11_644_473_600, &buf));
+}
+
+test "the transfer syntax follows the first-packet rule" {
+    // The reference client sends the first request after BIND as NDR32 whenever
+    // the server accepted both syntaxes; later ones use NDR64 when available.
+    const both: rpc.BindResult = .{ .has_ndr32 = true, .has_ndr64 = true };
+    const ndr64_only: rpc.BindResult = .{ .has_ndr64 = true };
+    const ndr32_only: rpc.BindResult = .{ .has_ndr32 = true };
+
+    try std.testing.expect(!requestUseNdr64(both, true, true));
+    try std.testing.expect(requestUseNdr64(both, false, true));
+    try std.testing.expect(requestUseNdr64(ndr64_only, true, true));
+    try std.testing.expect(requestUseNdr64(ndr64_only, false, true));
+    try std.testing.expect(!requestUseNdr64(ndr32_only, true, true));
+    try std.testing.expect(!requestUseNdr64(ndr32_only, false, true));
+
+    // `--no-ndr64` wins over whatever the server accepted.
+    try std.testing.expect(!requestUseNdr64(both, true, false));
+    try std.testing.expect(!requestUseNdr64(both, false, false));
+    try std.testing.expect(!requestUseNdr64(ndr64_only, false, false));
+}
+
+test "a closed connection is resendable only when the owner will reopen it" {
+    var session: Session = .init(std.testing.io);
+    session.retry_on_close = true;
+    try std.testing.expect(session.willRetry(error.EndOfStream));
+    try std.testing.expect(session.willRetry(error.ConnectionResetByPeer));
+    try std.testing.expect(session.willRetry(error.SocketUnconnected));
+    // A negotiation failure is not a closed socket: resending would repeat it.
+    try std.testing.expect(!session.willRetry(error.NoTransferSyntax));
+
+    // A one-shot connection has nothing to resend, so its report is kept.
+    session.retry_on_close = false;
+    try std.testing.expect(!session.willRetry(error.EndOfStream));
+}
+
+test "the dispatch window admits at least one request" {
+    // Zero would park the dispatcher on a semaphore nothing can post.
+    try std.testing.expect(parallelism() >= 1);
+}
+
+test "a report with nothing staged writes nothing" {
+    var out_buf: [64]u8 = undefined;
+    var err_buf: [64]u8 = undefined;
+    var output = Output.init(std.testing.io, &out_buf, &err_buf);
+    var out_sink: [64]u8 = undefined;
+    var err_sink: [64]u8 = undefined;
+    var out_writer: std.Io.Writer = .fixed(&out_sink);
+    var err_writer: std.Io.Writer = .fixed(&err_sink);
+    output.test_out = &out_writer;
+    output.test_err = &err_writer;
+
+    output.writeBlock(&.{}, &.{});
+    try std.testing.expectEqual(@as(usize, 0), out_writer.buffered().len);
+    try std.testing.expectEqual(@as(usize, 0), err_writer.buffered().len);
+
+    // Only the stream that has text is written.
+    output.writeBlock("answer", &.{});
+    try std.testing.expectEqualStrings("answer", out_writer.buffered());
+    try std.testing.expectEqual(@as(usize, 0), err_writer.buffered().len);
+}
+
+test "the HOST[:PORT] positional splits at one colon" {
+    {
+        const hp = try parseHostPort("127.0.0.1:1688");
+        try std.testing.expectEqualStrings("127.0.0.1", hp.host);
+        try std.testing.expectEqual(@as(u16, 1688), hp.port);
+    }
+    {
+        const hp = try parseHostPort("kms.example");
+        try std.testing.expectEqualStrings("kms.example", hp.host);
+        try std.testing.expectEqual(default_port, hp.port);
+    }
+    {
+        // IPv6 with an explicit port needs the bracket form.
+        const hp = try parseHostPort("[::1]:1688");
+        try std.testing.expectEqualStrings("::1", hp.host);
+        try std.testing.expectEqual(@as(u16, 1688), hp.port);
+    }
+    {
+        // A bare IPv6 literal has several colons, so it is host-only.
+        const hp = try parseHostPort("::1");
+        try std.testing.expectEqualStrings("::1", hp.host);
+        try std.testing.expectEqual(default_port, hp.port);
+    }
+
+    try std.testing.expectError(error.InvalidHost, parseHostPort("[::1"));
+    try std.testing.expectError(error.InvalidCharacter, parseHostPort("host:port"));
 }
