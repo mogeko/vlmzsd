@@ -277,7 +277,7 @@ and the message. Levels, most to least verbose: `trace`, `debug`, `info`
 
 ```
 2026-10-13T13:02:01Z vlmzsd 0.5.2 listening on port 1688
-2026-10-13T13:02:01Z debug: [::ffff:127.0.0.1]:54336: BIND: negotiated NDR64
+2026-10-13T13:02:01Z debug: 127.0.0.1:54336: BIND: negotiated NDR64
 2026-10-13T13:02:00Z warning: client cap reached (1024), deferring accept
 ```
 
